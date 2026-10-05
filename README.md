@@ -1,2 +1,2 @@
 # lunar-survey-hopper
-Where our ambitions jump to the moon
+Where our ambitions jumps to the moon
