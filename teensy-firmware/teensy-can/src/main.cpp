@@ -7,9 +7,12 @@
 
 
 /* Configuration of example sketch -------------------------------------------*/
+//Vars 
+
+bool direction = true;
 
 // CAN bus baudrate. Make sure this matches for every device on the bus
-#define CAN_BAUDRATE 250000
+#define CAN_BAUDRATE 1000000
 
 // ODrive node_id for odrv0
 #define ODRV0_NODE_ID 01
@@ -317,6 +320,8 @@ void setup() {
   }
 
   Serial.println("ODrive running!");
+  Serial.println("Setting ramped vel. control mode...");
+  odrv0.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
 }
 
 void loop() {
@@ -326,25 +331,31 @@ void loop() {
                         // This has been found to reduce the number of dropped messages, however it can be removed
                         // for applications requiring loop times over 100Hz.
 
-  float SINE_PERIOD = 2.0f; // Period of the position command sine wave in seconds
+  float currentMillis = millis();
+  static float previousMillis = 0;
+  static float interval = 1000;
+  float vel = 0.0;
 
-  float t = 0.001 * millis();
-  
-  float phase = t * (TWO_PI / SINE_PERIOD);
+  if (currentMillis - previousMillis > interval) {
+    previousMillis = currentMillis;
+    direction = !direction;
+  }
 
-  odrv0.setPosition(
-    sin(phase), // position
-    cos(phase) * (TWO_PI / SINE_PERIOD) // velocity feedforward (optional)
-  );
+  if (direction) {
+    vel = 5.0;
+  } else {
+    vel = -5.0;
+  }
+
+  odrv0.setVelocity(vel);
 
   // print position and velocity for Serial Plotter
   if (odrv0_user_data.received_feedback) {
     Get_Encoder_Estimates_msg_t feedback = odrv0_user_data.last_feedback;
     odrv0_user_data.received_feedback = false;
-    Serial.print("odrv0-pos:");
-    Serial.print(feedback.Pos_Estimate);
-    Serial.print(",");
-    Serial.print("odrv0-vel:");
+    Serial.print(">odrv0-pos:");
+    Serial.println(feedback.Pos_Estimate);
+    Serial.print(">odrv0-vel:");
     Serial.println(feedback.Vel_Estimate);
   }
 }
