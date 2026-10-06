@@ -58,13 +58,11 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 euler_pry[2] *= (180.0 / PI);
 
                 // Output to PC formatted for the Arduino Serial Plotter
-                Serial.print("Roll:");
-                Serial.print(euler_pry[0]);
-                Serial.print(",");
-                Serial.print("Pitch:");
-                Serial.print(euler_pry[1]);
-                Serial.print(",");
-                Serial.print("Yaw:");
+                Serial.print(">Roll:");
+                Serial.println(euler_pry[0]);
+                Serial.print(">Pitch:");
+                Serial.println(euler_pry[1]);
+                Serial.print(">Yaw:");
                 Serial.println(euler_pry[2]);
             }
             break;
@@ -72,9 +70,17 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
         case XSENS_EVT_ACCELERATION:
             if( mtdata->type == XSENS_EVT_TYPE_FLOAT3 )
             {
+
                 acceleration[0] = mtdata->data.f4x3[0];
                 acceleration[1] = mtdata->data.f4x3[1];
                 acceleration[2] = mtdata->data.f4x3[2];
+
+                Serial.print(">AccelX:");
+                Serial.println(acceleration[0]);
+                Serial.print(">AccelY:");
+                Serial.println(acceleration[1]);
+                Serial.print(">AccelZ:");
+                Serial.println(acceleration[2]);
             }
             break;
 
