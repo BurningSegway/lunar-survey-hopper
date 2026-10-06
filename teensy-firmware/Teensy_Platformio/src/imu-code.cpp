@@ -1,4 +1,4 @@
-#include <Arduino.h>
+/* #include <Arduino.h>
 #include "xsens_mti.h"      // Main library
 #include "xsens_utility.h"  // Needed for quaternion conversion function
 
@@ -102,4 +102,4 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
         default:
             break; 
     }
-}
+} */

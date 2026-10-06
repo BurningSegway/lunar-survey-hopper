@@ -6,12 +6,23 @@
 #include "xsens_mti.h"      // Main library
 #include "xsens_utility.h"  // Needed for quaternion conversion function
 
+//PID includes
+#include "PID_v1.h"         // PID library
+
 //MTI vars
 // Cache a copy of IMU data
 float    temperature     = 0;       // in degress celcius
 uint32_t pressure        = 0;       // in pascals
 float    euler_pry[3]    = { 0 };   // -180 to +180 degress
 float    acceleration[3] = { 0 };   // in m/s^2
+
+//PID vars
+//Define Variables we'll be connecting to
+double Setpoint, Input, Output;
+
+//Specify the links and initial tuning parameters
+double Kp=2, Ki=5, Kd=1;
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 //MTI Callback function used by the library and such
 // Callback function used by the library
@@ -283,6 +294,14 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(115200); //TTL to RS232 converter for MTI-3 IMU
 
+  //PID
+  //initialize the variables we're linked to
+  Input = 0;
+  Setpoint = 10;
+
+  //turn the PID on
+  myPID.SetMode(AUTOMATIC);
+
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
   for (int i = 0; i < 30 && !Serial; ++i) {
@@ -361,9 +380,9 @@ void loop() {
                         // This has been found to reduce the number of dropped messages, however it can be removed
                         // for applications requiring loop times over 100Hz.
 
-  float currentMillis = millis();
-  static float previousMillis = 0;
-  static float interval = 1000;
+  uint32_t currentMillis = millis();
+  static uint32_t previousMillis = 0;
+  static int interval = 1000;
   float vel = 0.0;
 
 
@@ -378,7 +397,14 @@ void loop() {
     vel = -5.0;
   }
 
-  odrv0.setVelocity(vel);
+  static uint32_t lastVelocityCommandMs = 0;
+  uint32_t now = millis();
+
+  //100 hz command rate
+  if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
+    lastVelocityCommandMs = now;
+    odrv0.setVelocity(vel);
+  }
 
   // print position and velocity for Serial Plotter
   if (odrv0_user_data.received_feedback) {
@@ -391,13 +417,16 @@ void loop() {
   }
 
   //MTI PART and PID
-  // Read from Hardware Serial1 instead of USB Serial
+  //Read IMU
     while( Serial1.available() > 0 )  
     {  
         xsens_mti_parse( &imu_interface, Serial1.read() );
     }
 
-  
+  Input = euler_pry[2];
+  myPID.Compute();
+  //Serial.print(">PID-Output:");
+  //Serial.println(Output);
 
 }
 
