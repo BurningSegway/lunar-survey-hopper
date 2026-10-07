@@ -21,7 +21,7 @@ float    acceleration[3] = { 0 };   // in m/s^2
 double Setpoint, Input, Output;
 
 //Specify the links and initial tuning parameters
-double Kp=2, Ki=5, Kd=1;
+double Kp=0.5, Ki=1, Kd=1;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 //MTI Callback function used by the library and such
@@ -385,7 +385,6 @@ void loop() {
   static int interval = 1000;
   float vel = 0.0;
 
-
   if (currentMillis - previousMillis > interval) {
     previousMillis = currentMillis;
     direction = !direction;
@@ -400,13 +399,27 @@ void loop() {
   static uint32_t lastVelocityCommandMs = 0;
   uint32_t now = millis();
 
-  //100 hz command rate
+  static uint32_t lastPrintMs = 0;
+  uint32_t nowPrint = millis();
+
+  //MTI PART
+  //Read IMU
+  while( Serial1.available() > 0 )  
+  {  
+      xsens_mti_parse( &imu_interface, Serial1.read() );
+  }
+
+  //100 hz command rate control loop
   if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
     lastVelocityCommandMs = now;
+
+    Input = euler_pry[2];
+    myPID.Compute();
+
     odrv0.setVelocity(vel);
   }
 
-  // print position and velocity for Serial Plotter
+  // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
   if (odrv0_user_data.received_feedback) {
     Get_Encoder_Estimates_msg_t feedback = odrv0_user_data.last_feedback;
     odrv0_user_data.received_feedback = false;
@@ -416,17 +429,22 @@ void loop() {
     Serial.println(feedback.Vel_Estimate);
   }
 
-  //MTI PART and PID
-  //Read IMU
-    while( Serial1.available() > 0 )  
-    {  
-        xsens_mti_parse( &imu_interface, Serial1.read() );
-    }
+  //50 hz print rate for serial plotter otherwise bogs system down, and the can line gets unhappy :(
+  if ((uint32_t)(nowPrint - lastPrintMs) >= 20) {
+    lastPrintMs = nowPrint;
 
-  Input = euler_pry[2];
-  myPID.Compute();
-  //Serial.print(">PID-Output:");
-  //Serial.println(Output);
+    Serial.print(">PID-Output:");
+    Serial.println(Output);
+
+    Serial.print(">Roll:");
+    Serial.println(euler_pry[0]);
+    Serial.print(">Pitch:");
+    Serial.println(euler_pry[1]);
+    Serial.print(">Yaw:");
+    Serial.println(euler_pry[2]);
+
+
+  }
 
 }
 
@@ -447,12 +465,12 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 euler_pry[2] *= (180.0 / PI);
 
                 // Output to PC formatted for the Arduino Serial Plotter
-                Serial.print(">Roll:");
+                /*Serial.print(">Roll:");
                 Serial.println(euler_pry[0]);
                 Serial.print(">Pitch:");
                 Serial.println(euler_pry[1]);
                 Serial.print(">Yaw:");
-                Serial.println(euler_pry[2]);
+                Serial.println(euler_pry[2]); */
             }
             break;
 
@@ -464,12 +482,12 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 acceleration[1] = mtdata->data.f4x3[1];
                 acceleration[2] = mtdata->data.f4x3[2];
 
-                Serial.print(">AccelX:");
+                /*Serial.print(">AccelX:");
                 Serial.println(acceleration[0]);
                 Serial.print(">AccelY:");
                 Serial.println(acceleration[1]);
                 Serial.print(">AccelZ:");
-                Serial.println(acceleration[2]);
+                Serial.println(acceleration[2]);*/
             }
             break;
 
