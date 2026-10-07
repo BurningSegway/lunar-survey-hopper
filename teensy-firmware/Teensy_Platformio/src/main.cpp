@@ -429,7 +429,7 @@ void loop() {
     Serial.println(feedback.Vel_Estimate);
   }
 
-  //50 hz print rate for serial plotter otherwise bogs system down, and the can line gets unhappy :(
+  //50 hz print rate for serial plotter otherwise bogs system down, and the CAN line gets unhappy :(
   if ((uint32_t)(nowPrint - lastPrintMs) >= 20) {
     lastPrintMs = nowPrint;
 
@@ -442,6 +442,9 @@ void loop() {
     Serial.println(euler_pry[1]);
     Serial.print(">Yaw:");
     Serial.println(euler_pry[2]);
+
+    Serial.print(">Yaw-reference:");
+    Serial.println(Setpoint);
 
 
   }
