@@ -21,8 +21,9 @@ float    acceleration[3] = { 0 };   // in m/s^2
 double Setpoint, Input, Output;
 
 //Specify the links and initial tuning parameters
-double Kp=0.5, Ki=1, Kd=1;
+double Kp=0.6, Ki=0.12, Kd=0.07;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+
 
 //MTI Callback function used by the library and such
 // Callback function used by the library
@@ -297,10 +298,11 @@ void setup() {
   //PID
   //initialize the variables we're linked to
   Input = 0;
-  Setpoint = 10;
+  Setpoint = 30;
 
   //turn the PID on
   myPID.SetMode(AUTOMATIC);
+  myPID.SetOutputLimits(-10.0, 10.0);
 
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
@@ -322,6 +324,11 @@ void setup() {
     Serial.println("CAN failed to initialize: reset required");
     while (true); // spin indefinitely
   }
+      
+  Serial.println("hej!!!!!!!!!!!!!!!!!!!!!!!1");
+  Serial.println(Kp);
+  Serial.println(Ki);
+  Serial.println(Kd);
 
   Serial.println("Waiting for ODrive...");
   while (!odrv0_user_data.received_heartbeat) {
@@ -396,11 +403,7 @@ void loop() {
     vel = -5.0;
   }
 
-  static uint32_t lastVelocityCommandMs = 0;
-  uint32_t now = millis();
 
-  static uint32_t lastPrintMs = 0;
-  uint32_t nowPrint = millis();
 
   //MTI PART
   //Read IMU
@@ -409,14 +412,21 @@ void loop() {
       xsens_mti_parse( &imu_interface, Serial1.read() );
   }
 
+  static uint32_t lastVelocityCommandMs = 0;
+  uint32_t now = millis();
+
+  static uint32_t lastPrintMs = 0;
+  uint32_t nowPrint = millis();
+
   //100 hz command rate control loop
   if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
     lastVelocityCommandMs = now;
 
+
     Input = euler_pry[2];
     myPID.Compute();
 
-    odrv0.setVelocity(vel);
+    odrv0.setVelocity(Output);
   }
 
   // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
