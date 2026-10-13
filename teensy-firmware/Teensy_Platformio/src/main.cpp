@@ -21,7 +21,7 @@ float    acceleration[3] = { 0 };   // in m/s^2
 double Setpoint, Input, Output;
 
 //Specify the links and initial tuning parameters
-double Kp=0.6, Ki=0.12, Kd=0.07;
+double Kp=1.1, Ki=0.15, Kd=0.13;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 
@@ -298,10 +298,11 @@ void setup() {
   //PID
   //initialize the variables we're linked to
   Input = 0;
-  Setpoint = 30;
+  Setpoint = 0;
 
   //turn the PID on
   myPID.SetMode(AUTOMATIC);
+  myPID.SetSampleTime(10);
   myPID.SetOutputLimits(-10.0, 10.0);
 
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
@@ -392,6 +393,15 @@ void loop() {
   static int interval = 1000;
   float vel = 0.0;
 
+  uint32_t setpointMillis = millis();
+  static uint32_t lastSetpoint = 0;
+
+  if ((uint32_t)(setpointMillis - lastSetpoint) >= 5000) {
+    lastSetpoint = setpointMillis;
+    Setpoint = -Setpoint;
+
+  }
+
   if (currentMillis - previousMillis > interval) {
     previousMillis = currentMillis;
     direction = !direction;
@@ -418,12 +428,24 @@ void loop() {
   static uint32_t lastPrintMs = 0;
   uint32_t nowPrint = millis();
 
+  double integralZoneThreshold = 5.0;
+
   //100 hz command rate control loop
   if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
     lastVelocityCommandMs = now;
-
-
     Input = euler_pry[2];
+
+      // Calculate the absolute distance to the setpoint
+    /*double error = abs(Setpoint - Input);
+
+    if (error > integralZoneThreshold) {
+      // Far from setpoint: Disable Ki to prevent windup and overshoot
+      myPID.SetTunings(Kp, 0.0, Kd); 
+    } else {
+      // Close to setpoint: Enable Ki to pull the error flat to zero
+      myPID.SetTunings(Kp, Ki, Kd); 
+    }*/
+
     myPID.Compute();
 
     odrv0.setVelocity(Output);
