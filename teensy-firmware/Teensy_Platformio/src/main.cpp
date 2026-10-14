@@ -18,11 +18,11 @@ float    acceleration[3] = { 0 };   // in m/s^2
 
 //PID vars
 //Define Variables we'll be connecting to
-double Setpoint, Input, Output;
+double z_Setpoint, z_Input, z_Output;
 
 //Specify the links and initial tuning parameters
-double Kp=1.1, Ki=0.15, Kd=0.13;
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+double z_Kp=1.1, z_Ki=0.15, z_Kd=0.13;
+PID z_PID(&z_Input, &z_Output, &z_Setpoint, z_Kp, z_Ki, z_Kd, DIRECT);
 
 
 //MTI Callback function used by the library and such
@@ -297,13 +297,13 @@ void setup() {
 
   //PID
   //initialize the variables we're linked to
-  Input = 0;
-  Setpoint = 0;
+  z_Input = 0;
+  z_Setpoint = 0;
 
   //turn the PID on
-  myPID.SetMode(AUTOMATIC);
-  myPID.SetSampleTime(10);
-  myPID.SetOutputLimits(-10.0, 10.0);
+  z_PID.SetMode(AUTOMATIC);
+  z_PID.SetSampleTime(10);
+  z_PID.SetOutputLimits(-10.0, 10.0);
 
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
@@ -325,11 +325,6 @@ void setup() {
     Serial.println("CAN failed to initialize: reset required");
     while (true); // spin indefinitely
   }
-      
-  Serial.println("hej!!!!!!!!!!!!!!!!!!!!!!!1");
-  Serial.println(Kp);
-  Serial.println(Ki);
-  Serial.println(Kd);
 
   Serial.println("Waiting for ODrive...");
   while (!odrv0_user_data.received_heartbeat) {
@@ -398,7 +393,7 @@ void loop() {
 
   if ((uint32_t)(setpointMillis - lastSetpoint) >= 5000) {
     lastSetpoint = setpointMillis;
-    Setpoint = -Setpoint;
+    z_Setpoint = -z_Setpoint;
 
   }
 
@@ -433,22 +428,22 @@ void loop() {
   //100 hz command rate control loop
   if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
     lastVelocityCommandMs = now;
-    Input = euler_pry[2];
+    z_Input = euler_pry[2];
 
       // Calculate the absolute distance to the setpoint
-    /*double error = abs(Setpoint - Input);
+    /*double error = abs(z_Setpoint - z_Input);
 
     if (error > integralZoneThreshold) {
       // Far from setpoint: Disable Ki to prevent windup and overshoot
-      myPID.SetTunings(Kp, 0.0, Kd); 
+      z_PID.SetTunings(z_Kp, 0.0, z_Kd); 
     } else {
       // Close to setpoint: Enable Ki to pull the error flat to zero
-      myPID.SetTunings(Kp, Ki, Kd); 
+      z_PID.SetTunings(z_Kp, z_Ki, z_Kd); 
     }*/
 
-    myPID.Compute();
+    z_PID.Compute();
 
-    odrv0.setVelocity(Output);
+    odrv0.setVelocity(z_Output);
   }
 
   // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
@@ -466,7 +461,7 @@ void loop() {
     lastPrintMs = nowPrint;
 
     Serial.print(">PID-Output:");
-    Serial.println(Output);
+    Serial.println(z_Output);
 
     Serial.print(">Roll:");
     Serial.println(euler_pry[0]);
@@ -476,7 +471,7 @@ void loop() {
     Serial.println(euler_pry[2]);
 
     Serial.print(">Yaw-reference:");
-    Serial.println(Setpoint);
+    Serial.println(z_Setpoint);
 
 
   }
