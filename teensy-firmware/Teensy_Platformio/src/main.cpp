@@ -24,6 +24,14 @@ double z_Setpoint, z_Input, z_Output;
 double z_Kp=1.1, z_Ki=0.15, z_Kd=0.13;
 PID z_PID(&z_Input, &z_Output, &z_Setpoint, z_Kp, z_Ki, z_Kd, DIRECT);
 
+double x_Setpoint, x_Input, x_Output;
+double x_Kp=1.1, x_Ki=0.15, x_Kd=0.13;
+PID x_PID(&x_Input, &x_Output, &x_Setpoint, x_Kp, x_Ki, x_Kd, DIRECT);
+
+double y_Setpoint, y_Input, y_Output;
+double y_Kp=1.1, y_Ki=0.15, y_Kd=0.13;
+PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
+
 
 //MTI Callback function used by the library and such
 // Callback function used by the library
@@ -47,6 +55,8 @@ bool direction = true;
 
 // ODrive node_id for odrv0
 #define ODRV0_NODE_ID 01
+#define ODRV1_NODE_ID 02
+#define ODRV2_NODE_ID 03
 
 // Uncomment below the line that corresponds to your hardware.
 // See also "Board-specific settings" to adapt the details for your hardware setup.
@@ -254,7 +264,9 @@ bool setupCan() {
 
 // Instantiate ODrive objects
 ODriveCAN odrv0(wrap_can_intf(can_intf), ODRV0_NODE_ID); // Standard CAN message ID
-ODriveCAN* odrives[] = {&odrv0}; // Make sure all ODriveCAN instances are accounted for here
+ODriveCAN odrv1(wrap_can_intf(can_intf), ODRV1_NODE_ID);
+ODriveCAN odrv2(wrap_can_intf(can_intf), ODRV2_NODE_ID);
+ODriveCAN* odrives[] = {&odrv0, &odrv1, &odrv2}; // Make sure all ODriveCAN instances are accounted for here
 
 struct ODriveUserData {
   Heartbeat_msg_t last_heartbeat;
@@ -265,6 +277,8 @@ struct ODriveUserData {
 
 // Keep some application-specific user data for every ODrive.
 ODriveUserData odrv0_user_data;
+ODriveUserData odrv1_user_data;
+ODriveUserData odrv2_user_data;
 
 // Called every time a Heartbeat message arrives from the ODrive
 void onHeartbeat(Heartbeat_msg_t& msg, void* user_data) {
@@ -300,10 +314,24 @@ void setup() {
   z_Input = 0;
   z_Setpoint = 0;
 
+  x_Input = 0;
+  x_Setpoint = 0;
+
+  y_Input = 0;
+  y_Setpoint = 0;
+
   //turn the PID on
   z_PID.SetMode(AUTOMATIC);
   z_PID.SetSampleTime(10);
   z_PID.SetOutputLimits(-10.0, 10.0);
+
+  x_PID.SetMode(AUTOMATIC);
+  x_PID.SetSampleTime(10);
+  x_PID.SetOutputLimits(-10.0, 10.0);
+
+  y_PID.SetMode(AUTOMATIC);
+  y_PID.SetSampleTime(10);
+  y_PID.SetOutputLimits(-10.0, 10.0);
 
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
@@ -318,6 +346,10 @@ void setup() {
   // Register callbacks for the heartbeat and encoder feedback messages
   odrv0.onFeedback(onFeedback, &odrv0_user_data);
   odrv0.onStatus(onHeartbeat, &odrv0_user_data);
+  odrv1.onFeedback(onFeedback, &odrv1_user_data);
+  odrv1.onStatus(onHeartbeat, &odrv1_user_data);
+  odrv2.onFeedback(onFeedback, &odrv2_user_data);
+  odrv2.onStatus(onHeartbeat, &odrv2_user_data);
 
   // Configure and initialize the CAN bus interface. This function depends on
   // your hardware and the CAN stack that you're using.
@@ -429,6 +461,8 @@ void loop() {
   if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
     lastVelocityCommandMs = now;
     z_Input = euler_pry[2];
+    x_Input = euler_pry[0];
+    y_Input = euler_pry[1];
 
       // Calculate the absolute distance to the setpoint
     /*double error = abs(z_Setpoint - z_Input);
@@ -442,8 +476,12 @@ void loop() {
     }*/
 
     z_PID.Compute();
+    x_PID.Compute();
+    y_PID.Compute();
 
     odrv0.setVelocity(z_Output);
+    //odrv1.setVelocity(x_Output);
+    //odrv2.setVelocity(y_Output);
   }
 
   // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
@@ -460,8 +498,13 @@ void loop() {
   if ((uint32_t)(nowPrint - lastPrintMs) >= 20) {
     lastPrintMs = nowPrint;
 
-    Serial.print(">PID-Output:");
+    Serial.print(">PID-Output-z:");
     Serial.println(z_Output);
+    Serial.print(">PID-Output-x:");
+    Serial.println(x_Output);
+    Serial.print(">PID-Output-y:");
+    Serial.println(y_Output);
+
 
     Serial.print(">Roll:");
     Serial.println(euler_pry[0]);
@@ -472,7 +515,10 @@ void loop() {
 
     Serial.print(">Yaw-reference:");
     Serial.println(z_Setpoint);
-
+    Serial.print(">Roll-reference:");
+    Serial.println(x_Setpoint);
+    Serial.print(">Pitch-reference:");
+    Serial.println(y_Setpoint);
 
   }
 
