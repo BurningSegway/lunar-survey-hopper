@@ -6,7 +6,7 @@
   <default>
     <geom contype="1" conaffinity="1" friction="1 0.1 0.1"/>
     
-    <!-- FIX 1: This forces the physics engine to respect the ctrlrange limits on your actuators -->
+    <!-- Forces the engine to respect the ctrlrange limits on your actuators -->
     <motor ctrllimited="true"/>
     
     <default class="shock_absorber">
@@ -22,26 +22,31 @@
     <body name="base_link" pos="0 0 0.25">
       <freejoint name="root"/>
       
-      <!-- FIX 2: Explicitly defined 5.0 kg box with 0.12 kg/m2 inertia -->
+      <!-- Explicitly defined 5.0 kg box with 0.12 kg/m2 inertia -->
       <inertial pos="0 0 0" mass="5.0" diaginertia="0.12 0.12 0.12"/>
       <geom name="body_box" type="box" size="0.1 0.1 0.1" rgba="0.2 0.6 0.8 0.8"/>
 
-      <!-- REACTION WHEELS -->
-      <body name="rw_x" pos="0 0 0">
-        <!-- FIX 3: Explicitly defined 200g mass with 0.0036 kg/m2 inertia -->
+ <!-- REACTION WHEELS (Mounted to the outer boundaries) -->
+      <!-- X-axis wheel mounted on the right face -->
+      <body name="rw_x" pos="0.12 0 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_x_joint" type="hinge" axis="1 0 0" damping="0.01"/>
-        <geom type="cylinder" size="0.08 0.02" rgba="0.8 0.2 0.2 1"/>
+        <geom type="cylinder" size="0.08 0.02" euler="0 90 0" rgba="0.8 0.2 0.2 1"/>
       </body>
-      <body name="rw_y" pos="0 0 0">
+      
+      <!-- Y-axis wheel mounted on the front face -->
+      <body name="rw_y" pos="0 0.12 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_y_joint" type="hinge" axis="0 1 0" damping="0.01"/>
         <geom type="cylinder" size="0.08 0.02" euler="90 0 0" rgba="0.2 0.8 0.2 1"/>
       </body>
-      <body name="rw_z" pos="0 0 0">
+      
+      <!-- Z-axis wheel mounted on the top face (to avoid blocking the jump foot) -->
+      <body name="rw_z" pos="0 0 0.12">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_z_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-        <geom type="cylinder" size="0.08 0.02" euler="0 90 0" rgba="0.8 0.8 0.2 1"/>
+        <!-- No euler rotation needed; defaults to flat on the XY plane -->
+        <geom type="cylinder" size="0.08 0.02" rgba="0.8 0.8 0.2 1"/>
       </body>
 
       <!-- MOVABLE SHOCK ABSORBER LEGS -->
@@ -80,4 +85,10 @@
     <motor name="tilt_fl" joint="shock_fl" gear="1" ctrlrange="-1000 1000"/>
     <motor name="tilt_fr" joint="shock_fr" gear="1" ctrlrange="-1000 1000"/>
   </actuator>
+
+  <sensor>
+    <!-- Corrected sensor tags for MuJoCo -->
+    <framequat name="robot_orientation" objtype="body" objname="base_link"/>
+    <frameangvel name="robot_gyro" objtype="body" objname="base_link"/>
+  </sensor>
 </mujoco>
