@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/mujoco-3.2.3/include
+CXX_INCLUDES = -I/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/mujoco-3.2.3/include -I/home/mort/lunar-survey-hopper/software/Sim_MuJoCo
 
-CXX_FLAGS = -std=gnu++17
+CXX_FLAGS = 
 

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcontroller_core.a CMakeFiles/controller_core.dir/rw_controller.cpp.o CMakeFiles/controller_core.dir/lqr_controller.cpp.o
+/usr/bin/ranlib libcontroller_core.a

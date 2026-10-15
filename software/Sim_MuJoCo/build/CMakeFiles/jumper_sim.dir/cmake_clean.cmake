@@ -1,8 +1,6 @@
 file(REMOVE_RECURSE
   "CMakeFiles/jumper_sim.dir/main.cpp.o"
   "CMakeFiles/jumper_sim.dir/main.cpp.o.d"
-  "CMakeFiles/jumper_sim.dir/rw_controller.cpp.o"
-  "CMakeFiles/jumper_sim.dir/rw_controller.cpp.o.d"
   "jumper_sim"
   "jumper_sim.pdb"
 )

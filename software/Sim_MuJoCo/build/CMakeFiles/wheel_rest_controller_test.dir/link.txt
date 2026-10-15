@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/wheel_rest_controller_test.dir/wheel_rest_controller_test.cpp.o -o wheel_rest_controller_test  libcontroller_core.a 
