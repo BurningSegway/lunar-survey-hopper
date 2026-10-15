@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/jumper_sim.dir/main.cpp.o -o jumper_sim  -Wl,-rpath,/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/mujoco-3.2.3/lib libcontroller_core.a /home/mort/lunar-survey-hopper/software/Sim_MuJoCo/mujoco-3.2.3/lib/libmujoco.so /usr/lib/x86_64-linux-gnu/libglfw.so.3.3 -lGL -lm 

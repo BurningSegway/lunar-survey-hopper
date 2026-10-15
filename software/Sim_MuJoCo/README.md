@@ -1,43 +1,88 @@
-# MuJoCo simulator
+# Python MuJoCo jumper simulator
 
-The simulator uses the MuJoCo distribution in `mujoco-3.2.3/` and the robot
-model at `build/Jumping_Robot.xml`. Keep the working directory at this folder
-when running the executable so the model can be found.
+The supported simulator is the Python application in `jumper_sim/`, using
+MuJoCo's interactive Python viewer and the model at
+`build/Jumping_Robot.xml`. Its controls run the jumper's PID or LQR attitude
+controller, jump/tilt behavior, and reaction-wheel management while the viewer
+is open.
 
-## Build and test
+## Setup
 
-Requirements: CMake 3.10+, a C++17 compiler, GLFW 3, and OpenGL development
-libraries. On Linux, configure and build out of tree:
-
-```sh
-cmake -S . -B cmake-build
-cmake --build cmake-build
-ctest --test-dir cmake-build --output-on-failure
-```
-
-Run from this folder:
+MuJoCo 3.2.3 has a prebuilt wheel for Python 3.12. Create the project venv and
+install the runtime and terrain conversion dependencies:
 
 ```sh
-./cmake-build/jumper_sim --controller pid --gravity earth
+python3.12 -m venv --without-pip .venv
+pip --python .venv/bin/python install -r requirements.txt -r requirements-terrain.txt
 ```
 
-Options are `--controller pid|lqr` and `--gravity earth|moon`. Backspace
-switches Earth/Moon gravity during the simulation; reset (`R`) restores the
-gravity selected at launch.
+The MJCF uses a visual `build/terrain.obj` and a collision
+`build/terrain_height.png`, generated locally from the USD source. Place
+`terrain_merged.usd` in `build/` and run:
 
-## Tunable parameters
+```sh
+.venv/bin/python build/convert_usd.py
+```
 
-Edit the defaults in `rw_controller.h` in `ReactionWheelTuning` to adjust the
-wheel speed/acceleration limits, wheel-rest behavior, robot and wheel mass and
-inertia, and per-axis PID gains. `LqrWeights` in the same file holds the LQR
-angle, angular-rate, and torque weights. Keep the mass and inertia values
-consistent with the inertial properties in `build/Jumping_Robot.xml`.
+The converter also accepts explicit paths:
+
+```sh
+.venv/bin/python build/convert_usd.py --input /path/to/terrain.usd --output build/terrain.obj --heightfield build/terrain_height.png
+```
+
+Terrain source and generated OBJ/PNG are not checked into Git. Generate both
+terrain assets before launching the model. The converter requires the packages
+listed in `requirements-terrain.txt`. The visual mesh remains at its original
+orientation and `z=0` placement. Its collision is approximated by a heightfield;
+there is no separate plane geom in the MJCF.
+
+## Launch
+
+Run from this directory:
+
+```sh
+.venv/bin/python -m jumper_sim --controller pid
+```
+
+Options:
+
+- `--controller pid|lqr` selects the attitude controller (default: `pid`).
+- `--model PATH` loads another compatible MJCF (default:
+  `build/Jumping_Robot.xml`). It must provide the simulator's named root,
+  reaction-wheel, jump, and tilt joints/actuators.
 
 ## Controls
 
-- `Space`: initiate a jump
-- `Enter`: toggle directional jump tilt
-- `Backspace`: toggle Earth/Moon gravity
-- `C`: request or cancel controlled wheel rest; rest holds the current yaw
-- `X`: disable/zero reaction-wheel motor torque
-- `R`: reset the simulation
+- `Space`: initiate a jump (release for 0.4 seconds, then wind the spring back)
+- `Enter`: toggle front-leg shortening force for directional tilt
+- `Backspace`: toggle Earth/Moon gravity without resetting the simulation
+- `C`: request/cancel controlled wheel rest; rest ramps the wheels toward zero
+  while holding the current yaw reference
+- `X`: disable reaction-wheel motor torque; press `C` to re-enable stabilization
+- `R`: reset the simulation and restore Earth gravity
+
+MuJoCo's viewer has its own Backspace reset shortcut. The simulator restores
+the previous physics state when that default action occurs, then applies the
+gravity toggle; use `R` when an actual reset is desired.
+
+Telemetry is sent as JSON UDP datagrams to `127.0.0.1:9870` using the
+PlotJuggler signal names from the existing setup file.
+
+## Tuning
+
+Edit `ReactionWheelTuning`, `PidGains`, and `LqrWeights` in
+`jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
+limits, wheel-rest behavior, mass/inertia values, and LQR weights. Keep the
+robot and wheel inertia values consistent with `build/Jumping_Robot.xml`.
+
+## Tests
+
+Run controller, telemetry, and available headless MuJoCo tests with:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The headless model tests require the locally generated
+`build/terrain.obj` and `build/terrain_height.png` and are skipped with a setup
+hint when either file is absent.

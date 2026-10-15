@@ -15,34 +15,43 @@
     </default>
   </default>
 
+  <asset>
+    <mesh name="terrain_mesh" file="terrain.obj"/>
+    <hfield name="terrain_heightfield" file="terrain_height.png"
+            size="30.6882 30.2793 9.3697 0.1"/>
+  </asset>
+
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
-    <geom name="floor" type="plane" size="5 5 0.1" rgba="0.8 0.9 0.8 1" friction="1 0.5 0.1"/>
+    <geom name="terrain_visual" type="mesh" mesh="terrain_mesh" pos="-30 -30 0"
+          contype="0" conaffinity="0" rgba="0.45 0.5 0.4 1"/>
+    <geom name="terrain_collision" type="hfield" hfield="terrain_heightfield"
+          pos="0.0727399 -0.2976348 -3.8133624" friction="1 0.5 0.1"/>
 
     <body name="base_link" pos="0 0 0.25">
       <freejoint name="root"/>
       
-      <!-- Explicitly defined 5.0 kg box with 0.12 kg/m2 inertia -->
-      <inertial pos="0 0 0" mass="5.0" diaginertia="0.12 0.12 0.12"/>
-      <geom name="body_box" type="box" size="0.1 0.1 0.1" rgba="0.2 0.6 0.8 0.8"/>
+      <!-- Explicitly defined 5.0 kg, 30 cm cube -->
+      <inertial pos="0 0 0" mass="5.0" diaginertia="0.075 0.075 0.075"/>
+      <geom name="body_box" type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.8 0.8"/>
 
  <!-- REACTION WHEELS (Mounted to the outer boundaries) -->
       <!-- X-axis wheel mounted on the right face -->
-      <body name="rw_x" pos="0.12 0 0">
+      <body name="rw_x" pos="0.18 0 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_x_joint" type="hinge" axis="1 0 0" damping="0.01"/>
         <geom type="cylinder" size="0.08 0.02" euler="0 90 0" rgba="0.8 0.2 0.2 1"/>
       </body>
       
       <!-- Y-axis wheel mounted on the front face -->
-      <body name="rw_y" pos="0 0.12 0">
+      <body name="rw_y" pos="0 0.18 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_y_joint" type="hinge" axis="0 1 0" damping="0.01"/>
         <geom type="cylinder" size="0.08 0.02" euler="90 0 0" rgba="0.2 0.8 0.2 1"/>
       </body>
       
       <!-- Z-axis wheel mounted on the top face (to avoid blocking the jump foot) -->
-      <body name="rw_z" pos="0 0 0.12">
+      <body name="rw_z" pos="0 0 0.18">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_z_joint" type="hinge" axis="0 0 1" damping="0.01"/>
         <!-- No euler rotation needed; defaults to flat on the XY plane -->
@@ -50,25 +59,25 @@
       </body>
 
       <!-- MOVABLE SHOCK ABSORBER LEGS -->
-      <body name="leg_fl" pos="0.08 0.08 -0.1">
+      <body name="leg_fl" pos="0.12 0.12 -0.15">
         <joint name="shock_fl" class="shock_absorber"/>
-        <geom type="capsule" class="shock_absorber" fromto="0 0 0  0.1 0.1 -0.15"/>
+        <geom type="capsule" class="shock_absorber" fromto="0 0 0  0.075 0.075 -0.1125"/>
       </body>
-      <body name="leg_fr" pos="0.08 -0.08 -0.1">
+      <body name="leg_fr" pos="0.12 -0.12 -0.15">
         <joint name="shock_fr" class="shock_absorber"/>
-        <geom type="capsule" class="shock_absorber" fromto="0 0 0  0.1 -0.1 -0.15"/>
+        <geom type="capsule" class="shock_absorber" fromto="0 0 0  0.075 -0.075 -0.1125"/>
       </body>
-      <body name="leg_bl" pos="-0.08 0.08 -0.1">
+      <body name="leg_bl" pos="-0.12 0.12 -0.15">
         <joint name="shock_bl" class="shock_absorber"/>
-        <geom type="capsule" class="shock_absorber" fromto="0 0 0 -0.1 0.1 -0.15"/>
+        <geom type="capsule" class="shock_absorber" fromto="0 0 0 -0.075 0.075 -0.1125"/>
       </body>
-      <body name="leg_br" pos="-0.08 -0.08 -0.1">
+      <body name="leg_br" pos="-0.12 -0.12 -0.15">
         <joint name="shock_br" class="shock_absorber"/>
-        <geom type="capsule" class="shock_absorber" fromto="0 0 0 -0.1 -0.1 -0.15"/>
+        <geom type="capsule" class="shock_absorber" fromto="0 0 0 -0.075 -0.075 -0.1125"/>
       </body>
 
       <!-- CENTRAL JUMPING FOOT -->
-      <body name="central_foot" pos="0 0 -0.10">
+      <body name="central_foot" pos="0 0 -0.15">
         <joint name="jump_joint" type="slide" axis="0 0 -1" stiffness="20000" damping="100" springref="0.3" limited="true" range="-0.02 0.4" armature="0.1"/>
         <geom type="cylinder" size="0.04 0.01" mass="0.2" rgba="0.9 0.5 0.1 1"/>
       </body>
