@@ -139,6 +139,14 @@ bool setupCan() {
   return true;
 }
 
+bool requestBusVoltage() {
+  CAN_message_t request = {};
+  request.id = (ODRV0_NODE_ID << 5) | Get_Bus_Voltage_Current_msg_t::cmd_id;
+  request.flags.remote = true;
+  request.len = 0;
+  return can_intf.write(request) > 0;
+}
+
 #endif // IS_TEENSY_BUILTIN
 
 
@@ -273,6 +281,9 @@ struct ODriveUserData {
   bool received_heartbeat = false;
   Get_Encoder_Estimates_msg_t last_feedback;
   bool received_feedback = false;
+  Get_Bus_Voltage_Current_msg_t last_bus_voltage_current;
+  bool received_bus_voltage_current = false;
+  uint32_t last_bus_voltage_current_ms = 0;
 };
 
 // Keep some application-specific user data for every ODrive.
@@ -292,6 +303,13 @@ void onFeedback(Get_Encoder_Estimates_msg_t& msg, void* user_data) {
   ODriveUserData* odrv_user_data = static_cast<ODriveUserData*>(user_data);
   odrv_user_data->last_feedback = msg;
   odrv_user_data->received_feedback = true;
+}
+
+void onBusVoltageCurrent(Get_Bus_Voltage_Current_msg_t& msg, void* user_data) {
+  ODriveUserData* odrv_user_data = static_cast<ODriveUserData*>(user_data);
+  odrv_user_data->last_bus_voltage_current = msg;
+  odrv_user_data->last_bus_voltage_current_ms = millis();
+  odrv_user_data->received_bus_voltage_current = true;
 }
 
 // Called for every message that arrives on the CAN bus
@@ -350,6 +368,7 @@ void setup() {
   odrv1.onStatus(onHeartbeat, &odrv1_user_data);
   odrv2.onFeedback(onFeedback, &odrv2_user_data);
   odrv2.onStatus(onHeartbeat, &odrv2_user_data);
+  odrv0.onBusVI(onBusVoltageCurrent, &odrv0_user_data);
 
   // Configure and initialize the CAN bus interface. This function depends on
   // your hardware and the CAN stack that you're using.
@@ -364,19 +383,6 @@ void setup() {
   }
 
   Serial.println("found ODrive");
-
-  // request bus voltage and current (1sec timeout)
-  Serial.println("attempting to read bus voltage and current");
-  Get_Bus_Voltage_Current_msg_t vbus;
-  if (!odrv0.request(vbus, 1000)) {
-    Serial.println("vbus request failed!");
-    while (true); // spin indefinitely
-  }
-
-  Serial.print("DC voltage [V]: ");
-  Serial.println(vbus.Bus_Voltage);
-  Serial.print("DC current [A]: ");
-  Serial.println(vbus.Bus_Current);
 
   Serial.println("Enabling closed loop control...");
   while (odrv0_user_data.last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
@@ -419,6 +425,37 @@ void loop() {
   static uint32_t previousMillis = 0;
   static int interval = 1000;
   float vel = 0.0;
+
+  static uint32_t lastBusVoltageRequestMs = 0;
+  static bool busVoltageRequestFailureReported = false;
+  if ((uint32_t)(currentMillis - lastBusVoltageRequestMs) >= 100) {
+    lastBusVoltageRequestMs = currentMillis;
+    if (!requestBusVoltage()) {
+      if (!busVoltageRequestFailureReported) {
+        Serial.println("Failed to send ODrive bus voltage request");
+        busVoltageRequestFailureReported = true;
+      }
+    } else {
+      busVoltageRequestFailureReported = false;
+    }
+  }
+
+  static bool lowBusVoltageReported = false;
+  static bool staleBusVoltageReported = false;
+  const bool busVoltageIsFresh =
+      odrv0_user_data.received_bus_voltage_current &&
+      (uint32_t)(currentMillis - odrv0_user_data.last_bus_voltage_current_ms) <= 500;
+  if (busVoltageIsFresh) {
+    staleBusVoltageReported = false;
+    if (odrv0_user_data.last_bus_voltage_current.Bus_Voltage < 22.5f &&
+        !lowBusVoltageReported) {
+      Serial.println("WARNING: ODrive bus voltage below 22.5 V");
+      lowBusVoltageReported = true;
+    }
+  } else if (odrv0_user_data.received_bus_voltage_current && !staleBusVoltageReported) {
+    Serial.println("WARNING: ODrive bus voltage reading is stale");
+    staleBusVoltageReported = true;
+  }
 
   uint32_t setpointMillis = millis();
   static uint32_t lastSetpoint = 0;
