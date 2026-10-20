@@ -50,6 +50,8 @@ xsens_interface_t imu_interface = XSENS_INTERFACE_RX( &imu_callback );
 
 bool direction = true;
 
+constexpr uint8_t LOW_VOLTAGE_WARNING_PIN = 5;
+
 // CAN bus baudrate. Make sure this matches for every device on the bus
 #define CAN_BAUDRATE 1000000
 
@@ -324,6 +326,9 @@ void onCanMessage(const CanMsg& msg) {
 #############
 */
 void setup() {
+  pinMode(LOW_VOLTAGE_WARNING_PIN, OUTPUT);
+  digitalWrite(LOW_VOLTAGE_WARNING_PIN, LOW);
+
   Serial.begin(115200);
   Serial1.begin(115200); //TTL to RS232 converter for MTI-3 IMU
 
@@ -451,6 +456,7 @@ void loop() {
         !lowBusVoltageReported) {
       Serial.println("WARNING: ODrive bus voltage below 22.5 V");
       lowBusVoltageReported = true;
+      digitalWrite(LOW_VOLTAGE_WARNING_PIN, HIGH);
     }
   } else if (odrv0_user_data.received_bus_voltage_current && !staleBusVoltageReported) {
     Serial.println("WARNING: ODrive bus voltage reading is stale");
