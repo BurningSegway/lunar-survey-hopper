@@ -1,3 +1,0 @@
-/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/build/CMakeFiles/jumper_sim.dir
-/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/build/CMakeFiles/edit_cache.dir
-/home/mort/lunar-survey-hopper/software/Sim_MuJoCo/build/CMakeFiles/rebuild_cache.dir
