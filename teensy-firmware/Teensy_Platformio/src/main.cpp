@@ -312,7 +312,7 @@ void setup() {
   //PID
   //initialize the variables we're linked to
   z_Input = 0;
-  z_Setpoint = 0;
+  z_Setpoint = 45.0/2;
 
   x_Input = 0;
   x_Setpoint = 0;
@@ -476,8 +476,8 @@ void loop() {
     }*/
 
     z_PID.Compute();
-    x_PID.Compute();
-    y_PID.Compute();
+    //x_PID.Compute();
+    //y_PID.Compute();
 
     odrv0.setVelocity(z_Output);
     //odrv1.setVelocity(x_Output);
