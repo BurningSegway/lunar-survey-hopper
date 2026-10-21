@@ -32,6 +32,9 @@ double y_Setpoint, y_Input, y_Output;
 double y_Kp=1.1, y_Ki=0.15, y_Kd=0.13;
 PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
 
+double min_output = -10.0;
+double max_output = 10.0;
+
 
 //MTI Callback function used by the library and such
 // Callback function used by the library
@@ -403,23 +406,23 @@ void setup() {
   z_Setpoint = 45.0/2;
 
   x_Input = 0;
-  x_Setpoint = 0;
+  x_Setpoint = 45.0/2;
 
   y_Input = 0;
-  y_Setpoint = 0;
+  y_Setpoint = 45.0/2;
 
   //turn the PID on
   z_PID.SetMode(AUTOMATIC);
   z_PID.SetSampleTime(10);
-  z_PID.SetOutputLimits(-10.0, 10.0);
+  z_PID.SetOutputLimits(min_output, max_output);
 
   x_PID.SetMode(AUTOMATIC);
   x_PID.SetSampleTime(10);
-  x_PID.SetOutputLimits(-10.0, 10.0);
+  x_PID.SetOutputLimits(min_output, max_output);
 
   y_PID.SetMode(AUTOMATIC);
   y_PID.SetSampleTime(10);
-  y_PID.SetOutputLimits(-10.0, 10.0);
+  y_PID.SetOutputLimits(min_output, max_output);
 
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
