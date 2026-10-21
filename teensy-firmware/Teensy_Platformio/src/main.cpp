@@ -314,6 +314,20 @@ void onBusVoltageCurrent(Get_Bus_Voltage_Current_msg_t& msg, void* user_data) {
   odrv_user_data->received_bus_voltage_current = true;
 }
 
+void enableClosedLoopControl(ODriveCAN& odrive, ODriveUserData& user_data) {
+  while (user_data.last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+    odrive.clearErrors();
+    delay(1);
+    odrive.setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+
+    // Allow time for multiple heartbeats and for commands delayed by bus congestion.
+    for (int i = 0; i < 15; ++i) {
+      delay(10);
+      pumpEvents(can_intf);
+    }
+  }
+}
+
 // Called for every message that arrives on the CAN bus
 void onCanMessage(const CanMsg& msg) {
   for (auto odrive: odrives) {
@@ -382,35 +396,25 @@ void setup() {
     while (true); // spin indefinitely
   }
 
-  Serial.println("Waiting for ODrive...");
-  while (!odrv0_user_data.received_heartbeat) {
+  Serial.println("Waiting for ODrives...");
+  while (!odrv0_user_data.received_heartbeat ||
+         !odrv1_user_data.received_heartbeat ||
+         !odrv2_user_data.received_heartbeat) {
     pumpEvents(can_intf);
   }
 
-  Serial.println("found ODrive");
+  Serial.println("found ODrives");
 
   Serial.println("Enabling closed loop control...");
-  while (odrv0_user_data.last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
-    odrv0.clearErrors();
-    delay(1);
-    odrv0.setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+  enableClosedLoopControl(odrv0, odrv0_user_data);
+  enableClosedLoopControl(odrv1, odrv1_user_data);
+  enableClosedLoopControl(odrv2, odrv2_user_data);
 
-    // Pump events for 150ms. This delay is needed for two reasons;
-    // 1. If there is an error condition, such as missing DC power, the ODrive might
-    //    briefly attempt to enter CLOSED_LOOP_CONTROL state, so we can't rely
-    //    on the first heartbeat response, so we want to receive at least two
-    //    heartbeats (100ms default interval).
-    // 2. If the bus is congested, the setState command won't get through
-    //    immediately but can be delayed.
-    for (int i = 0; i < 15; ++i) {
-      delay(10);
-      pumpEvents(can_intf);
-    }
-  }
-
-  Serial.println("ODrive running!");
+  Serial.println("ODrives running!");
   Serial.println("Setting ramped vel. control mode...");
   odrv0.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
+  odrv1.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
+  odrv2.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
 }
 
 /*
@@ -452,9 +456,11 @@ void loop() {
       (uint32_t)(currentMillis - odrv0_user_data.last_bus_voltage_current_ms) <= 500;
   if (busVoltageIsFresh) {
     staleBusVoltageReported = false;
-    if (odrv0_user_data.last_bus_voltage_current.Bus_Voltage < 22.5f &&
-        !lowBusVoltageReported) {
-      Serial.println("WARNING: ODrive bus voltage below 22.5 V");
+    const float busVoltage = odrv0_user_data.last_bus_voltage_current.Bus_Voltage;
+    if (busVoltage < 22.5f && !lowBusVoltageReported) {
+      Serial.print("WARNING: ODrive bus voltage below 22.5 V: ");
+      Serial.print(busVoltage, 2);
+      Serial.println(" V");
       lowBusVoltageReported = true;
       digitalWrite(LOW_VOLTAGE_WARNING_PIN, HIGH);
     }
@@ -469,6 +475,8 @@ void loop() {
   if ((uint32_t)(setpointMillis - lastSetpoint) >= 5000) {
     lastSetpoint = setpointMillis;
     z_Setpoint = -z_Setpoint;
+    x_Setpoint = -x_Setpoint;
+    y_Setpoint = -y_Setpoint;
 
   }
 
@@ -519,28 +527,35 @@ void loop() {
     }*/
 
     z_PID.Compute();
-    //x_PID.Compute();
-    //y_PID.Compute();
+    x_PID.Compute();
+    y_PID.Compute();
 
     odrv0.setVelocity(z_Output);
-    //odrv1.setVelocity(x_Output);
-    //odrv2.setVelocity(y_Output);
+    odrv1.setVelocity(x_Output);
+    odrv2.setVelocity(y_Output);
   }
 
   // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
   if (odrv0_user_data.received_feedback) {
     Get_Encoder_Estimates_msg_t feedback = odrv0_user_data.last_feedback;
     odrv0_user_data.received_feedback = false;
-    Serial.print(">odrv0-pos:");
-    Serial.println(feedback.Pos_Estimate);
-    Serial.print(">odrv0-vel:");
-    Serial.println(feedback.Vel_Estimate);
+    //Serial.print(">odrv0-pos:");
+    //Serial.println(feedback.Pos_Estimate);
+    //Serial.print(">odrv0-vel:");
+    //Serial.println(feedback.Vel_Estimate);
   }
 
   //50 hz print rate for serial plotter otherwise bogs system down, and the CAN line gets unhappy :(
   if ((uint32_t)(nowPrint - lastPrintMs) >= 20) {
     lastPrintMs = nowPrint;
 
+    /*
+    if (busVoltageIsFresh) {
+      Serial.print(">BusVoltage:");
+      Serial.println(odrv0_user_data.last_bus_voltage_current.Bus_Voltage, 2);
+    }*/
+
+    
     Serial.print(">PID-Output-z:");
     Serial.println(z_Output);
     Serial.print(">PID-Output-x:");
