@@ -292,6 +292,12 @@ struct ODriveUserData {
 ODriveUserData odrv0_user_data;
 ODriveUserData odrv1_user_data;
 ODriveUserData odrv2_user_data;
+ODriveUserData* odrive_user_data[] = {
+  &odrv0_user_data,
+  &odrv1_user_data,
+  &odrv2_user_data
+};
+const char* const odrive_names[] = {"odrv0", "odrv1", "odrv2"};
 
 // Called every time a Heartbeat message arrives from the ODrive
 void onHeartbeat(Heartbeat_msg_t& msg, void* user_data) {
@@ -314,17 +320,62 @@ void onBusVoltageCurrent(Get_Bus_Voltage_Current_msg_t& msg, void* user_data) {
   odrv_user_data->received_bus_voltage_current = true;
 }
 
-void enableClosedLoopControl(ODriveCAN& odrive, ODriveUserData& user_data) {
-  while (user_data.last_heartbeat.Axis_State != ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
-    odrive.clearErrors();
-    delay(1);
-    odrive.setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+bool enableClosedLoopControl() {
+  uint32_t lastStateRequestMs[3] = {};
+  bool stateRequestSent[3] = {};
+  uint32_t startMs = millis();
 
-    // Allow time for multiple heartbeats and for commands delayed by bus congestion.
-    for (int i = 0; i < 15; ++i) {
-      delay(10);
-      pumpEvents(can_intf);
+  for (size_t i = 0; i < 3; ++i) {
+    if (odrive_user_data[i]->last_heartbeat.Axis_Error != 0) {
+      Serial.print(odrive_names[i]);
+      Serial.print(" reported axis error before enabling: 0x");
+      Serial.println(odrive_user_data[i]->last_heartbeat.Axis_Error, HEX);
     }
+    odrives[i]->clearErrors();
+  }
+
+  while (true) {
+    bool allDrivesClosedLoop = true;
+    uint32_t now = millis();
+
+    for (size_t i = 0; i < 3; ++i) {
+      if (odrive_user_data[i]->last_heartbeat.Axis_State !=
+          ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+        allDrivesClosedLoop = false;
+        if (!stateRequestSent[i] ||
+            (uint32_t)(now - lastStateRequestMs[i]) >= 150) {
+          odrives[i]->setState(ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL);
+          lastStateRequestMs[i] = now;
+          stateRequestSent[i] = true;
+        }
+      }
+
+      odrives[i]->setVelocity(0.0f);
+    }
+
+    if (allDrivesClosedLoop) {
+      return true;
+    }
+
+    if ((uint32_t)(now - startMs) >= 5000) {
+      for (size_t i = 0; i < 3; ++i) {
+        if (odrive_user_data[i]->last_heartbeat.Axis_State !=
+            ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL) {
+          Serial.print("Failed to enable ");
+          Serial.print(odrive_names[i]);
+          Serial.print(": state=");
+          Serial.print(odrive_user_data[i]->last_heartbeat.Axis_State);
+          Serial.print(", axis_error=0x");
+          Serial.print(odrive_user_data[i]->last_heartbeat.Axis_Error, HEX);
+          Serial.print(", procedure_result=");
+          Serial.println(odrive_user_data[i]->last_heartbeat.Procedure_Result);
+        }
+      }
+      return false;
+    }
+
+    pumpEvents(can_intf);
+    delay(10);
   }
 }
 
@@ -405,16 +456,24 @@ void setup() {
 
   Serial.println("found ODrives");
 
-  Serial.println("Enabling closed loop control...");
-  enableClosedLoopControl(odrv0, odrv0_user_data);
-  enableClosedLoopControl(odrv1, odrv1_user_data);
-  enableClosedLoopControl(odrv2, odrv2_user_data);
-
-  Serial.println("ODrives running!");
   Serial.println("Setting ramped vel. control mode...");
   odrv0.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
   odrv1.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
   odrv2.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
+
+  Serial.println("Enabling closed loop control...");
+  if (!enableClosedLoopControl()) {
+    Serial.println("Startup halted; holding zero velocity while CAN remains serviced.");
+    while (true) {
+      for (ODriveCAN* odrive : odrives) {
+        odrive->setVelocity(0.0f);
+      }
+      pumpEvents(can_intf);
+      delay(10);
+    }
+  }
+
+  Serial.println("ODrives running!");
 }
 
 /*
