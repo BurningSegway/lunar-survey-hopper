@@ -403,13 +403,13 @@ void setup() {
   //PID
   //initialize the variables we're linked to
   z_Input = 0;
-  z_Setpoint = 45.0/2;
+  z_Setpoint = 0; //45.0/2;
 
   x_Input = 0;
-  x_Setpoint = 45.0/2;
+  x_Setpoint = 0; //45.0/2;
 
   y_Input = 0;
-  y_Setpoint = 45.0/2;
+  y_Setpoint = 0; //45.0/2;
 
   //turn the PID on
   z_PID.SetMode(AUTOMATIC);
