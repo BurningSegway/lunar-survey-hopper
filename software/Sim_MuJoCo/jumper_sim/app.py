@@ -13,6 +13,7 @@ import mujoco.viewer
 import numpy as np
 
 from .simulation import EARTH_GRAVITY, JumperSimulation
+from .status_indicator import RelaxationIndicator
 from .telemetry import UdpTelemetry
 
 FRAME_PERIOD = 1.0 / 60.0
@@ -82,38 +83,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         "[SPACE] Jump | [ENTER] Toggle Tilt | [BACKSPACE] Toggle Earth/Moon Gravity"
     )
     print(
-        "[C] Request/cancel controlled wheel rest | "
+        "[C] Re-enable stabilization | "
         "[X] Disable/zero motor torque | [R] Reset"
     )
+    print("[TELEMETRY] Streaming PlotJuggler data to 127.0.0.1:9870")
 
     with closing(UdpTelemetry()) as telemetry:
-        with mujoco.viewer.launch_passive(
-            model, data, key_callback=on_key
-        ) as viewer:
-            while viewer.is_running():
-                frame_started = time.perf_counter()
+        with closing(RelaxationIndicator()) as indicator:
+            with mujoco.viewer.launch_passive(
+                model, data, key_callback=on_key
+            ) as viewer:
+                base_body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
+                )
+                if base_body_id < 0:
+                    raise ValueError("MuJoCo model is missing required body 'base_link'")
                 with viewer.lock():
-                    while not key_queue.empty():
-                        key = key_queue.get()
-                        if key == "backspace":
-                            # MuJoCo's viewer resets data on Backspace before
-                            # forwarding the key to the Python callback.
-                            mujoco.mj_setState(model, data, last_state, state_spec)
-                            mujoco.mj_forward(model, data)
-                        message = simulation.handle_key(key)
-                        if message:
-                            print(message)
+                    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                    viewer.cam.trackbodyid = base_body_id
+                    viewer.cam.distance = 3.0
+                    viewer.cam.azimuth = 135.0
+                    viewer.cam.elevation = -20.0
 
-                    frame_end = float(data.time) + FRAME_PERIOD
-                    while data.time < frame_end:
-                        simulation.step()
-                    telemetry.send(simulation.telemetry_payload())
-                    mujoco.mj_getState(model, data, last_state, state_spec)
+                while viewer.is_running():
+                    frame_started = time.perf_counter()
+                    with viewer.lock():
+                        while not key_queue.empty():
+                            key = key_queue.get()
+                            if key == "backspace":
+                                # MuJoCo's viewer resets data on Backspace before
+                                # forwarding the key to the Python callback.
+                                mujoco.mj_setState(model, data, last_state, state_spec)
+                                mujoco.mj_forward(model, data)
+                            message = simulation.handle_key(key)
+                            if message:
+                                print(message)
 
-                viewer.sync()
-                remaining = FRAME_PERIOD - (time.perf_counter() - frame_started)
-                if remaining > 0.0:
-                    time.sleep(remaining)
+                        frame_end = float(data.time) + FRAME_PERIOD
+                        while data.time < frame_end:
+                            simulation.step()
+                        telemetry.send(simulation.telemetry_payload())
+                        mujoco.mj_getState(model, data, last_state, state_spec)
+                        relaxation_active = simulation.relaxation_active
+
+                    viewer.sync()
+                    indicator.update(relaxation_active)
+                    remaining = FRAME_PERIOD - (time.perf_counter() - frame_started)
+                    if remaining > 0.0:
+                        time.sleep(remaining)
     return 0
 
 

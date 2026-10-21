@@ -56,23 +56,35 @@ Options:
 - `Space`: initiate a jump (release for 0.4 seconds, then wind the spring back)
 - `Enter`: toggle front-leg shortening force for directional tilt
 - `Backspace`: toggle Earth/Moon gravity without resetting the simulation
-- `C`: request/cancel controlled wheel rest; rest ramps the wheels toward zero
-  while holding the current yaw reference
+- When the robot remains below the configured linear and angular speed limits
+  (0.05 m/s and 0.05 rad/s by default) for one second, wheel speed references
+  ramp toward zero while existing attitude references are retained. Motion
+  resumes normal stabilization.
 - `X`: disable reaction-wheel motor torque; press `C` to re-enable stabilization
+- `C`: re-enable stabilization after disabling it with `X`
 - `R`: reset the simulation and restore Earth gravity
+
+The separate state window shows a red `RELAXATION INACTIVE` button while
+normal stabilization is active, and turns green when automatic wheel
+relaxation begins.
 
 MuJoCo's viewer has its own Backspace reset shortcut. The simulator restores
 the previous physics state when that default action occurs, then applies the
 gravity toggle; use `R` when an actual reset is desired.
 
-Telemetry is sent as JSON UDP datagrams to `127.0.0.1:9870` using the
-PlotJuggler signal names from the existing setup file.
+The simulator streams telemetry over UDP to PlotJuggler at
+`127.0.0.1:9870`. Open `PlotJuggler_Setup.xml` in PlotJuggler to load the
+existing orientation and reaction-wheel plots. The stream includes current
+roll, pitch, and yaw, their references, and X/Y/Z wheel speeds in rad/s.
+Start PlotJuggler's UDP Server listening on port `9870` before launching the
+simulator.
 
 ## Tuning
 
 Edit `ReactionWheelTuning`, `PidGains`, and `LqrWeights` in
 `jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
-limits, wheel-rest behavior, mass/inertia values, and LQR weights. Keep the
+limits, stationary detection thresholds and duration, wheel-rest behavior,
+mass/inertia values, and LQR weights. Keep the
 robot and wheel inertia values consistent with `build/Jumping_Robot.xml`.
 
 ## Tests

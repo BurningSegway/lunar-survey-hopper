@@ -2,6 +2,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 import io
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -36,7 +37,10 @@ class ViewerApplicationTests(unittest.TestCase):
     def test_keyboard_callback_drives_simulation_and_telemetry(self) -> None:
         messages: list[str] = []
         telemetry_payloads: list[TelemetryPayload] = []
+        indicator_states: list[bool] = []
         simulated_data: list[mujoco.MjData] = []
+        viewer_cameras: list[SimpleNamespace] = []
+        base_body_ids: list[int] = []
         backspace_before: list[
             tuple[np.ndarray, np.ndarray, np.ndarray, float]
         ] = []
@@ -48,8 +52,18 @@ class ViewerApplicationTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def send(self, payload: dict[str, float]) -> None:
+            def send(self, payload: TelemetryPayload) -> None:
                 telemetry_payloads.append(payload)
+
+            def close(self) -> None:
+                pass
+
+        class FakeIndicator:
+            def __init__(self) -> None:
+                pass
+
+            def update(self, active: bool) -> None:
+                indicator_states.append(active)
 
             def close(self) -> None:
                 pass
@@ -65,6 +79,7 @@ class ViewerApplicationTests(unittest.TestCase):
                 self._model = model
                 self._data = data
                 self._key_callback = key_callback
+                self.cam = SimpleNamespace()
 
             def is_running(self) -> bool:
                 self._iterations += 1
@@ -105,7 +120,14 @@ class ViewerApplicationTests(unittest.TestCase):
         ) -> Generator[FakeViewer, None, None]:
             simulated_data.append(_data)
             self.assertGreater(_model.nbody, 0)
-            yield FakeViewer(_model, _data, key_callback)
+            base_body_ids.append(
+                mujoco.mj_name2id(
+                    _model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
+                )
+            )
+            viewer = FakeViewer(_model, _data, key_callback)
+            viewer_cameras.append(viewer.cam)
+            yield viewer
 
         original_handle_key = JumperSimulation.handle_key
 
@@ -126,6 +148,7 @@ class ViewerApplicationTests(unittest.TestCase):
         with (
             patch.object(app.mujoco.viewer, "launch_passive", launch_passive),
             patch.object(app, "UdpTelemetry", FakeTelemetry),
+            patch.object(app, "RelaxationIndicator", FakeIndicator),
             patch.object(JumperSimulation, "handle_key", record_state_on_backspace),
             patch.object(app.time, "sleep"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
@@ -135,6 +158,15 @@ class ViewerApplicationTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertGreater(simulated_data[0].time, 0.0)
+        self.assertEqual(
+            viewer_cameras[0].type, mujoco.mjtCamera.mjCAMERA_TRACKING
+        )
+        self.assertEqual(
+            viewer_cameras[0].trackbodyid, base_body_ids[0]
+        )
+        self.assertEqual(viewer_cameras[0].distance, 3.0)
+        self.assertEqual(viewer_cameras[0].azimuth, 135.0)
+        self.assertEqual(viewer_cameras[0].elevation, -20.0)
         self.assertEqual(len(backspace_before), 1)
         self.assertEqual(len(backspace_after), 1)
         before = backspace_before[0]
@@ -144,6 +176,7 @@ class ViewerApplicationTests(unittest.TestCase):
         np.testing.assert_array_equal(before[2], after[2])
         self.assertEqual(before[3], after[3])
         self.assertEqual(len(telemetry_payloads), 2)
+        self.assertEqual(len(indicator_states), 2)
         self.assertAlmostEqual(
             telemetry_payloads[0]["sat_max"],
             ReactionWheelTuning().max_wheel_velocity,
@@ -154,7 +187,6 @@ class ViewerApplicationTests(unittest.TestCase):
             "[JUMP INITIATED]",
             "[TILT] Front-leg shortening is ON",
             "[GRAVITY] Switched to Moon",
-            "[WHEELS] Controlled rest requested",
             "[CONTROLLER] Disabled",
             "[CONTROLLER] Attitude stabilization enabled",
             "[RESET] Simulation reset",
