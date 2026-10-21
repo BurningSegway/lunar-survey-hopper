@@ -1,5 +1,6 @@
-import json
+
 from pathlib import Path
+import json
 import socket
 import unittest
 
@@ -14,6 +15,7 @@ from jumper_sim.simulation import (
 )
 from jumper_sim.controller import (
     ReactionWheelTuning,
+    WheelSpeeds,
     limit_wheel_command,
     wheel_effective_inertia,
 )
@@ -82,6 +84,27 @@ class SimulationTests(unittest.TestCase):
         self.assertGreater(self.model.geom_contype[collision_id], 0)
         self.assertGreater(self.model.geom_conaffinity[collision_id], 0)
 
+    def test_reaction_wheels_are_inside_box_and_cannot_contact_ground(self) -> None:
+        for name, expected_pos in (
+            ("rw_x", (0.10, 0.0, 0.0)),
+            ("rw_y", (0.0, 0.10, 0.0)),
+            ("rw_z", (0.0, 0.0, 0.10)),
+        ):
+            body_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, name
+            )
+            self.assertGreaterEqual(body_id, 0)
+            np.testing.assert_allclose(
+                self.model.body_pos[body_id], expected_pos
+            )
+
+            geom_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_geom"
+            )
+            self.assertGreaterEqual(geom_id, 0)
+            self.assertEqual(self.model.geom_contype[geom_id], 0)
+            self.assertEqual(self.model.geom_conaffinity[geom_id], 0)
+
     def test_heightfield_collision_matches_visual_terrain(self) -> None:
         mujoco.mj_forward(self.model, self.data)
         visual_id = mujoco.mj_name2id(
@@ -130,15 +153,72 @@ class SimulationTests(unittest.TestCase):
             self.data.ctrl[self.simulation.ids.wind_up_actuator], 0.0
         )
 
-    def test_disable_and_controlled_rest_transitions(self) -> None:
-        self.simulation.handle_key("c")
-        self.assertEqual(self.simulation.wheel_control_mode, WheelControlMode.RESTING)
+    def test_stationary_robot_automatically_restores_wheels(self) -> None:
+        time_step = float(self.model.opt.timestep)
+        tuning = ReactionWheelTuning(stationary_duration=2.0 * time_step)
+        self.simulation = JumperSimulation(
+            self.model, self.data, "pid", tuning
+        )
+        self.simulation.yaw_reference = 0.75
+        root_dof = self.model.jnt_dofadr[self.simulation.ids.root_joint]
+        self.data.qvel[root_dof : root_dof + 6] = 0.0
+        wheel_speeds = (10.0, -5.0, 2.0)
+        for joint_id, speed in zip(
+            self.simulation.ids.wheel_joints, wheel_speeds, strict=True
+        ):
+            self.data.qvel[self.model.jnt_dofadr[joint_id]] = speed
+
+        self.simulation._update_wheel_rest_state()
+        self.assertEqual(
+            self.simulation.wheel_control_mode, WheelControlMode.STABILIZING
+        )
+        self.simulation._update_wheel_rest_state()
+        self.assertEqual(
+            self.simulation.wheel_control_mode, WheelControlMode.RESTING
+        )
+        self.assertTrue(self.simulation.relaxation_active)
+        self.assertEqual(self.simulation.yaw_reference, 0.75)
+        self.assertEqual(
+            self.simulation.wheel_rest_controller.target_speeds,
+            WheelSpeeds(*wheel_speeds),
+        )
+
+        self.data.qvel[root_dof] = tuning.stationary_linear_speed + 0.1
+        self.simulation._update_wheel_rest_state()
+        self.assertEqual(
+            self.simulation.wheel_control_mode, WheelControlMode.STABILIZING
+        )
+        self.assertFalse(self.simulation.relaxation_active)
+        self.assertFalse(self.simulation.wheel_rest_controller.active)
+
+    def test_relaxation_slows_wheels_and_telemetry_reports_joint_velocity(self) -> None:
+        self.simulation = JumperSimulation(self.model, self.data, "lqr")
+        for joint_id, speed in zip(
+            self.simulation.ids.wheel_joints, (20.0, -15.0, 10.0), strict=True
+        ):
+            self.data.qvel[self.model.jnt_dofadr[joint_id]] = speed
+
+        for _ in range(5000):
+            self.simulation.step()
+
+        self.assertTrue(self.simulation.relaxation_active)
+        wheel_speeds = self.simulation.read_wheel_speeds()
+        self.assertLess(max(abs(wheel_speeds.x), abs(wheel_speeds.y), abs(wheel_speeds.z)), 0.1)
+        telemetry = self.simulation.telemetry_payload()
+        for axis, speed in zip("xyz", (wheel_speeds.x, wheel_speeds.y, wheel_speeds.z), strict=True):
+            self.assertEqual(telemetry[f"vel_{axis}"], speed)
+
+    def test_disable_and_reenable_stabilization(self) -> None:
         self.simulation.handle_key("x")
         self.assertEqual(self.simulation.wheel_control_mode, WheelControlMode.DISABLED)
         self.simulation.step()
         self.assertEqual(
             self.data.ctrl[list(self.simulation.ids.wheel_actuators)].tolist(),
             [0.0, 0.0, 0.0],
+        )
+        self.simulation.handle_key("c")
+        self.assertEqual(
+            self.simulation.wheel_control_mode, WheelControlMode.STABILIZING
         )
 
     def test_wheel_command_respects_speed_headroom(self) -> None:
@@ -176,41 +256,32 @@ class SimulationTests(unittest.TestCase):
 
 
 class TelemetryTests(unittest.TestCase):
-    def test_udp_datagram_retains_plotjuggler_field_schema(self) -> None:
+    def test_udp_datagram_matches_plotjuggler_signal_names(self) -> None:
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         receiver.bind(("127.0.0.1", 0))
         receiver.settimeout(1.0)
-        port = receiver.getsockname()[1]
-        telemetry = UdpTelemetry(port=port)
+        telemetry = UdpTelemetry(port=receiver.getsockname()[1])
+        payload = {
+            "roll": 0.1,
+            "roll_ref": 0.0,
+            "pitch": 0.2,
+            "pitch_ref": 0.0,
+            "yaw": 0.3,
+            "yaw_ref": 0.4,
+            "vel_x": 1.0,
+            "vel_y": 2.0,
+            "vel_z": 3.0,
+            "sat_max": 4.0,
+            "sat_min": -4.0,
+        }
         try:
-            telemetry.send(
-                {
-                    "roll": 0.1,
-                    "roll_ref": 0.0,
-                    "pitch": 0.2,
-                    "pitch_ref": 0.0,
-                    "yaw": 0.3,
-                    "yaw_ref": 0.0,
-                    "vel_x": 1.0,
-                    "vel_y": 2.0,
-                    "vel_z": 3.0,
-                    "sat_max": 4.0,
-                    "sat_min": -4.0,
-                }
-            )
-            payload, _ = receiver.recvfrom(2048)
+            telemetry.send(payload)
+            datagram, _ = receiver.recvfrom(2048)
         finally:
             telemetry.close()
             receiver.close()
 
-        decoded = json.loads(payload)
-        self.assertEqual(
-            set(decoded),
-            {
-                "roll", "roll_ref", "pitch", "pitch_ref", "yaw", "yaw_ref",
-                "vel_x", "vel_y", "vel_z", "sat_max", "sat_min",
-            },
-        )
+        self.assertEqual(json.loads(datagram), payload)
 
 
 if __name__ == "__main__":

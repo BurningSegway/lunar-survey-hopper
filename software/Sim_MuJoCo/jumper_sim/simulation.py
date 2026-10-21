@@ -97,6 +97,7 @@ class JumperSimulation:
         self.controller_name = controller_name
         self.wheel_rest_controller = WheelRestController(tuning)
         self.wheel_control_mode = WheelControlMode.STABILIZING
+        self._stationary_duration = 0.0
         self.yaw_reference = 0.0
         self.jump_triggered = False
         self.jump_start_time = 0.0
@@ -124,34 +125,20 @@ class JumperSimulation:
             name = "Moon" if self.selected_gravity == MOON_GRAVITY else "Earth"
             return f"[GRAVITY] Switched to {name} ({self.selected_gravity} m/s^2)."
         elif key == "c":
-            return self._toggle_wheel_rest()
+            if self.wheel_control_mode is WheelControlMode.DISABLED:
+                self.wheel_control_mode = WheelControlMode.STABILIZING
+                self._stationary_duration = 0.0
+                return "[CONTROLLER] Attitude stabilization enabled."
         elif key == "x":
             self.wheel_rest_controller.cancel()
             self.wheel_control_mode = WheelControlMode.DISABLED
+            self._stationary_duration = 0.0
             self.controller.reset()
             return "[CONTROLLER] Disabled; reaction-wheel motor torques are zero."
         elif key == "r":
             self.reset()
             return "[RESET] Simulation reset to initial state."
         return None
-
-    def _toggle_wheel_rest(self) -> str:
-        if self.wheel_control_mode is WheelControlMode.STABILIZING:
-            sensor = read_simulated_imu(self.model, self.data, self.ids.root_joint)
-            self.yaw_reference = sensor.yaw
-            speeds = self.read_wheel_speeds()
-            self.wheel_rest_controller.begin(speeds)
-            self.wheel_control_mode = WheelControlMode.RESTING
-            return (
-                "[WHEELS] Controlled rest requested; holding current yaw at "
-                f"{self.yaw_reference} rad while attitude stabilization remains active."
-            )
-        if self.wheel_control_mode is WheelControlMode.RESTING:
-            self.wheel_rest_controller.cancel()
-            self.wheel_control_mode = WheelControlMode.STABILIZING
-            return "[WHEELS] Rest request cancelled; attitude stabilization remains active."
-        self.wheel_control_mode = WheelControlMode.STABILIZING
-        return "[CONTROLLER] Attitude stabilization enabled."
 
     def reset(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
@@ -160,6 +147,7 @@ class JumperSimulation:
         self.controller.reset()
         self.wheel_rest_controller.cancel()
         self.wheel_control_mode = WheelControlMode.STABILIZING
+        self._stationary_duration = 0.0
         self.yaw_reference = 0.0
         self.jump_triggered = False
         self.jump_start_time = 0.0
@@ -169,6 +157,10 @@ class JumperSimulation:
     def read_wheel_speeds(self) -> WheelSpeeds:
         return read_wheel_speeds(self.model, self.data, self.ids.wheel_joints)
 
+    @property
+    def relaxation_active(self) -> bool:
+        return self.wheel_control_mode is WheelControlMode.RESTING
+
     def telemetry_payload(self) -> TelemetryPayload:
         sensor = read_simulated_imu(self.model, self.data, self.ids.root_joint)
         return make_telemetry_payload(
@@ -176,8 +168,40 @@ class JumperSimulation:
         )
 
     def step(self) -> None:
+        self._update_wheel_rest_state()
         self._apply_controls()
         mujoco.mj_step(self.model, self.data)
+
+    def _update_wheel_rest_state(self) -> None:
+        if self.wheel_control_mode is WheelControlMode.DISABLED:
+            self._stationary_duration = 0.0
+            return
+
+        dof_address = self.model.jnt_dofadr[self.ids.root_joint]
+        linear_velocity = self.data.qvel[dof_address : dof_address + 3]
+        angular_velocity = self.data.qvel[dof_address + 3 : dof_address + 6]
+        stationary = (
+            not self.jump_triggered
+            and not self.tilt_active
+            and float(linear_velocity @ linear_velocity)
+            <= self.tuning.stationary_linear_speed**2
+            and float(angular_velocity @ angular_velocity)
+            <= self.tuning.stationary_angular_speed**2
+        )
+
+        if stationary:
+            self._stationary_duration += float(self.model.opt.timestep)
+            if (
+                self.wheel_control_mode is WheelControlMode.STABILIZING
+                and self._stationary_duration >= self.tuning.stationary_duration
+            ):
+                self.wheel_rest_controller.begin(self.read_wheel_speeds())
+                self.wheel_control_mode = WheelControlMode.RESTING
+        else:
+            self._stationary_duration = 0.0
+            if self.wheel_control_mode is WheelControlMode.RESTING:
+                self.wheel_rest_controller.cancel()
+                self.wheel_control_mode = WheelControlMode.STABILIZING
 
     def _apply_controls(self) -> None:
         if self.wheel_control_mode is not WheelControlMode.DISABLED:

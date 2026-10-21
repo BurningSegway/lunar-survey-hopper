@@ -20,6 +20,9 @@ class ReactionWheelTuning:
     max_wheel_acceleration: float = 75.0 * 2.0 * math.pi
     wheel_rest_deceleration: float = 10.0 * 2.0 * math.pi
     wheel_rest_response_time: float = 0.25
+    stationary_linear_speed: float = 0.05
+    stationary_angular_speed: float = 0.05
+    stationary_duration: float = 1.0
     robot_mass: float = 5.0
     robot_inertia: float = 0.075
     wheel_mass: float = 0.2
@@ -305,6 +308,8 @@ def combine_attitude_and_rest_torque(
     attitude_torque: float, rest_torque: float, tuning: ReactionWheelTuning
 ) -> float:
     max_motor_torque = wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
+    if attitude_torque * rest_torque < 0.0:
+        return max(-max_motor_torque, min(max_motor_torque, rest_torque))
     available_rest_torque = max(
         -max_motor_torque - attitude_torque,
         min(max_motor_torque - attitude_torque, rest_torque),

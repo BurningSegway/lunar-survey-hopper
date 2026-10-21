@@ -35,27 +35,26 @@
       <inertial pos="0 0 0" mass="5.0" diaginertia="0.075 0.075 0.075"/>
       <geom name="body_box" type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.8 0.8"/>
 
- <!-- REACTION WHEELS (Mounted to the outer boundaries) -->
-      <!-- X-axis wheel mounted on the right face -->
-      <body name="rw_x" pos="0.18 0 0">
+      <!-- REACTION WHEELS (Housed inside the box on their respective axes) -->
+      <body name="rw_x" pos="0.125 0 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_x_joint" type="hinge" axis="1 0 0" damping="0.01"/>
-        <geom type="cylinder" size="0.08 0.02" euler="0 90 0" rgba="0.8 0.2 0.2 1"/>
+        <geom name="rw_x_geom" type="cylinder" size="0.08 0.02" euler="0 90 0"
+              contype="0" conaffinity="0" rgba="0.8 0.2 0.2 1"/>
       </body>
       
-      <!-- Y-axis wheel mounted on the front face -->
-      <body name="rw_y" pos="0 0.18 0">
+      <body name="rw_y" pos="0 0.125 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_y_joint" type="hinge" axis="0 1 0" damping="0.01"/>
-        <geom type="cylinder" size="0.08 0.02" euler="90 0 0" rgba="0.2 0.8 0.2 1"/>
+        <geom name="rw_y_geom" type="cylinder" size="0.08 0.02" euler="90 0 0"
+              contype="0" conaffinity="0" rgba="0.2 0.8 0.2 1"/>
       </body>
       
-      <!-- Z-axis wheel mounted on the top face (to avoid blocking the jump foot) -->
-      <body name="rw_z" pos="0 0 0.18">
+      <body name="rw_z" pos="0 0 0.125">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
         <joint name="rw_z_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-        <!-- No euler rotation needed; defaults to flat on the XY plane -->
-        <geom type="cylinder" size="0.08 0.02" rgba="0.8 0.8 0.2 1"/>
+        <geom name="rw_z_geom" type="cylinder" size="0.08 0.02"
+              contype="0" conaffinity="0" rgba="0.8 0.8 0.2 1"/>
       </body>
 
       <!-- MOVABLE SHOCK ABSORBER LEGS -->

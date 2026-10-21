@@ -87,6 +87,11 @@ class ControllerTests(unittest.TestCase):
         output = combine_attitude_and_rest_torque(maximum * 0.75, maximum, tuning)
         self.assertLessEqual(abs(output), maximum)
 
+    def test_wheel_rest_torque_takes_priority_when_attitude_conflicts(self) -> None:
+        tuning = ReactionWheelTuning()
+        output = combine_attitude_and_rest_torque(0.5, -0.1, tuning)
+        self.assertEqual(output, -0.1)
+
     def test_wrapped_yaw_error_uses_shortest_angle(self) -> None:
         self.assertAlmostEqual(wrapped_yaw_error(-math.pi + 0.1, math.pi - 0.1), 0.2)
 
