@@ -25,8 +25,9 @@
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
     <geom name="terrain_visual" type="mesh" mesh="terrain_mesh" pos="-30 -30 0"
           contype="0" conaffinity="0" rgba="0.45 0.5 0.4 1"/>
+    <!-- group 2: the only group the downward depth camera's rays can hit -->
     <geom name="terrain_collision" type="hfield" hfield="terrain_heightfield"
-          pos="0.0727399 -0.2976348 -3.8133624" friction="1 0.5 0.1"/>
+          pos="0.0727399 -0.2976348 -3.8133624" friction="1 0.5 0.1" group="2"/>
 
     <body name="base_link" pos="0 0 0.25">
       <freejoint name="root"/>
@@ -34,6 +35,10 @@
       <!-- Explicitly defined 5.0 kg, 30 cm cube -->
       <inertial pos="0 0 0" mass="5.0" diaginertia="0.075 0.075 0.075"/>
       <geom name="body_box" type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.8 0.8"/>
+
+      <!-- DOWNWARD DEPTH CAMERA (RealSense D435 stand-in). Looks along the
+           site's -z axis; offset from the central foot so it is not occluded. -->
+      <site name="realsense" pos="0.06 -0.06 -0.151" size="0.012" rgba="0.1 0.1 0.1 1"/>
 
       <!-- REACTION WHEELS (Housed inside the box on their respective axes) -->
       <body name="rw_x" pos="0.125 0 0">

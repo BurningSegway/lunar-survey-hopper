@@ -15,6 +15,7 @@ import numpy as np
 from .simulation import EARTH_GRAVITY, JumperSimulation
 from .status_indicator import RelaxationIndicator
 from .telemetry import UdpTelemetry
+from .visualization import draw_landing_plane
 
 FRAME_PERIOD = 1.0 / 60.0
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
@@ -87,6 +88,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "[X] Disable/zero motor torque | [R] Reset"
     )
     print("[TELEMETRY] Streaming PlotJuggler data to 127.0.0.1:9870")
+    if simulation.contact_gating:
+        print("[CONTACT] LQR is gated: attitude control in flight, wheel bleed-off in contact")
+    if simulation.landing_reference is not None:
+        print(
+            "[CAMERA] Landing plane overlay: disc = latest fit (orange = used, "
+            "grey = not used/held), green arrow = reference normal, blue dots = depth points"
+        )
 
     with closing(UdpTelemetry()) as telemetry:
         with closing(RelaxationIndicator()) as indicator:
@@ -104,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     viewer.cam.distance = 3.0
                     viewer.cam.azimuth = 135.0
                     viewer.cam.elevation = -20.0
+                overlay_scene = getattr(viewer, "user_scn", None)
 
                 while viewer.is_running():
                     frame_started = time.perf_counter()
@@ -122,6 +131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         frame_end = float(data.time) + FRAME_PERIOD
                         while data.time < frame_end:
                             simulation.step()
+                        if overlay_scene is not None:
+                            overlay_scene.ngeom = 0
+                            draw_landing_plane(overlay_scene, simulation)
                         telemetry.send(simulation.telemetry_payload())
                         mujoco.mj_getState(model, data, last_state, state_spec)
                         relaxation_active = simulation.relaxation_active

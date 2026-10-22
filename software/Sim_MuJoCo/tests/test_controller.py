@@ -1,15 +1,25 @@
+from dataclasses import astuple
 import math
 import unittest
 
+import numpy as np
+
 from jumper_sim.controller import (
     LqrController,
+    LqrLimits,
+    LqrWeights,
+    RobotInertia,
     ReactionWheelController,
     ReactionWheelTuning,
     SensorData,
     WheelRestController,
     WheelSpeeds,
     combine_attitude_and_rest_torque,
+    gyroscopic_torque,
+    quaternion_attitude_error,
+    solve_continuous_are,
     wheel_effective_inertia,
+    wheel_friction_compensation,
     wrapped_yaw_error,
 )
 
@@ -48,6 +58,160 @@ class ControllerTests(unittest.TestCase):
         self.assertLess(angle_command.tau_x, 0.0)
         self.assertLess(rate_command.tau_x, 0.0)
         self.assertEqual(neutral_command.tau_x, 0.0)
+
+    def test_lqr_gains_solve_the_riccati_equation_per_axis(self) -> None:
+        weights = LqrWeights(integral=0.0)
+        controller = LqrController(
+            ReactionWheelTuning(), weights, axis_inertia=(0.1, 0.12, 0.08)
+        )
+        for inertia, (k_angle, k_rate) in zip(
+            controller.axis_inertia, controller.gains, strict=True
+        ):
+            a = np.array([[0.0, 1.0], [0.0, 0.0]])
+            b = np.array([[0.0], [1.0 / inertia]])
+            q = np.diag([weights.angle, weights.angular_rate])
+            # Reconstruct P from K = R^-1 B^T P and check the CARE residual.
+            p12 = k_angle * weights.torque * inertia
+            p22 = k_rate * weights.torque * inertia
+            p11 = p12 * p22 / (weights.torque * inertia**2)
+            p = np.array([[p11, p12], [p12, p22]])
+            residual = (
+                a.T @ p + p @ a - p @ b @ b.T @ p / weights.torque + q
+            )
+            np.testing.assert_allclose(residual, 0.0, atol=1e-9)
+            closed_loop = a - b @ np.array([[k_angle, k_rate]])
+            self.assertTrue(np.all(np.linalg.eigvals(closed_loop).real < 0.0))
+
+    def test_numeric_riccati_matches_closed_form(self) -> None:
+        inertia, weights = 0.1, LqrWeights(integral=0.0)
+        a = np.array([[0.0, 1.0], [0.0, 0.0]])
+        b = np.array([[0.0], [1.0 / inertia]])
+        p = solve_continuous_are(
+            a, b, np.diag([weights.angle, weights.angular_rate]), np.array([[1.0]])
+        )
+        k = (b.T @ p).ravel()
+        closed = LqrController(ReactionWheelTuning(), weights, (inertia,) * 3)
+        np.testing.assert_allclose(k, closed.gains[0], rtol=1e-9)
+
+    def test_lqi_is_stable_and_removes_constant_disturbance(self) -> None:
+        inertia = 0.1
+        controller = LqrController(
+            ReactionWheelTuning(), LqrWeights(), axis_inertia=(inertia,) * 3
+        )
+        k_i, (k_angle, k_rate) = controller.integral_gains[0], controller.gains[0]
+        closed_loop = np.array([
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-k_i / inertia, -k_angle / inertia, -k_rate / inertia],
+        ])
+        self.assertTrue(np.all(np.linalg.eigvals(closed_loop).real < 0.0))
+
+        # Double integrator with a constant 0.2 N*m disturbance on roll.
+        angle, rate, dt = 0.0, 0.0, 0.001
+        for _ in range(4000):
+            sensor = SensorData(angle, 0.0, 0.0, rate, 0.0, 0.0)
+            torque = controller.compute_torque(sensor, WheelSpeeds(0.0, 0.0, 0.0), dt)
+            rate += (torque.tau_x + 0.2) / inertia * dt
+            angle += rate * dt
+        self.assertLess(abs(angle), 1e-3)
+
+        without_integral = LqrController(
+            ReactionWheelTuning(), LqrWeights(integral=0.0), (inertia,) * 3
+        )
+        steady_error = 0.2 / without_integral.gains[0][0]
+        self.assertGreater(steady_error, 1e-2)
+
+    def test_lqi_integrator_is_clamped_outside_zone_and_reset(self) -> None:
+        weights = LqrWeights(integral_torque_limit=0.5)
+        controller = LqrController(ReactionWheelTuning(), weights, (0.1,) * 3)
+        k_i = controller.integral_gains[0]
+        k_angle = controller.gains[0][0]
+        small = weights.integral_zone / 2.0
+        for _ in range(100000):
+            command = controller.compute_torque(
+                SensorData(small, 0.0, 0.0, 0.0, 0.0, 0.0), WheelSpeeds(0.0, 0.0, 0.0), 0.01
+            )
+        self.assertAlmostEqual(command.tau_x + k_angle * small, -0.5, places=9)
+        controller.reset()
+        large = weights.integral_zone * 2.0
+        command = controller.compute_torque(
+            SensorData(large, 0.0, 0.0, 0.0, 0.0, 0.0), WheelSpeeds(0.0, 0.0, 0.0), 0.01
+        )
+        self.assertAlmostEqual(command.tau_x, -k_angle * large, places=12)
+        self.assertGreater(k_i, 0.0)
+
+    def test_friction_compensation_pushes_wheel_along_its_spin(self) -> None:
+        tuning = ReactionWheelTuning()
+        self.assertAlmostEqual(
+            wheel_friction_compensation(50.0, tuning), tuning.wheel_viscous_friction * 50.0
+        )
+        self.assertLess(wheel_friction_compensation(-50.0, tuning), 0.0)
+
+    def test_lqr_limits_follow_brysons_rule(self) -> None:
+        tuning = ReactionWheelTuning()
+        limits = LqrLimits(max_angle_error=0.2, integral_time=0.0, max_torque=1.5)
+        weights = limits.to_weights(tuning)
+        self.assertEqual(weights.integral, 0.0)
+        controller = LqrController(tuning, weights, (0.1,) * 3)
+        # Double-integrator LQR: angle gain = sqrt(q/r) = max_torque / max_angle.
+        self.assertAlmostEqual(controller.gains[0][0], 1.5 / 0.2)
+        default = LqrLimits().to_weights(tuning)
+        self.assertAlmostEqual(
+            1.0 / math.sqrt(default.torque),
+            wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration,
+        )
+
+    def test_quaternion_error_is_body_rotation_vector(self) -> None:
+        self.assertEqual(quaternion_attitude_error((1.0, 0.0, 0.0, 0.0), 0.0), (0.0, 0.0, 0.0))
+        for axis in range(3):
+            for angle in (0.3, -1.2, math.radians(100.0)):
+                q = [math.cos(angle / 2), 0.0, 0.0, 0.0]
+                q[axis + 1] = math.sin(angle / 2)
+                error = quaternion_attitude_error(tuple(q), 0.0)
+                expected = [0.0, 0.0, 0.0]
+                expected[axis] = angle
+                np.testing.assert_allclose(error, expected, atol=1e-12)
+
+    def test_quaternion_error_uses_yaw_reference_and_shortest_rotation(self) -> None:
+        yaw = math.radians(170.0)
+        q = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+        np.testing.assert_allclose(
+            quaternion_attitude_error(q, yaw), (0.0, 0.0, 0.0), atol=1e-12
+        )
+        # 170 deg heading vs a -170 deg reference is a 20 deg (not 340) error.
+        error = quaternion_attitude_error(q, math.radians(-170.0))
+        np.testing.assert_allclose(error, (0.0, 0.0, math.radians(-20.0)), atol=1e-12)
+        # Negated quaternion is the same attitude.
+        negated = tuple(-v for v in q)
+        np.testing.assert_allclose(
+            quaternion_attitude_error(negated, 0.0), quaternion_attitude_error(q, 0.0)
+        )
+
+    def test_gyroscopic_torque_is_rate_cross_total_momentum(self) -> None:
+        inertia = RobotInertia(
+            rigid_body=((0.11, 0.0, 0.0), (0.0, 0.12, 0.0), (0.0, 0.0, 0.10)),
+            wheel_spin=(0.0036, 0.0036, 0.0036),
+        )
+        np.testing.assert_allclose(inertia.plant_axis_inertia, (0.1064, 0.1164, 0.0964))
+        still = SensorData(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.assertEqual(
+            gyroscopic_torque(inertia, still, WheelSpeeds(50.0, 50.0, 50.0)), (0.0, 0.0, 0.0)
+        )
+        sensor = SensorData(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)  # yawing
+        torque = gyroscopic_torque(inertia, sensor, WheelSpeeds(0.0, 70.0, 0.0))
+        # w = z, H_y = 0.0036*70 -> z x y = -x
+        np.testing.assert_allclose(torque, (-0.0036 * 70.0, 0.0, 0.0), atol=1e-12)
+        with_ff = LqrController(ReactionWheelTuning(), gyroscopic_inertia=inertia)
+        without = LqrController(ReactionWheelTuning(), axis_inertia=inertia.plant_axis_inertia)
+        delta = np.subtract(
+            astuple(with_ff.compute_torque(sensor, WheelSpeeds(0.0, 70.0, 0.0), 0.001)),
+            astuple(without.compute_torque(sensor, WheelSpeeds(0.0, 70.0, 0.0), 0.001)),
+        )
+        np.testing.assert_allclose(delta, torque, atol=1e-12)
+
+    def test_lqr_rejects_non_positive_axis_inertia(self) -> None:
+        with self.assertRaises(ValueError):
+            LqrController(ReactionWheelTuning(), axis_inertia=(0.1, 0.0, 0.1))
 
     def test_wheel_rest_ramps_targets_and_cancels(self) -> None:
         tuning = ReactionWheelTuning()
