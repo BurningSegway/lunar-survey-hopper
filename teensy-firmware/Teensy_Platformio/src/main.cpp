@@ -1,5 +1,6 @@
 
 #include <Arduino.h>
+#include <math.h>
 #include "ODriveCAN.h"
 
 //MTI includes
@@ -15,6 +16,28 @@ float    temperature     = 0;       // in degress celcius
 uint32_t pressure        = 0;       // in pascals
 float    euler_pry[3]    = { 0 };   // -180 to +180 degress
 float    acceleration[3] = { 0 };   // in m/s^2
+uint32_t lastAccelerationMs = 0;
+uint32_t accelerationSampleCount = 0;
+
+constexpr float GRAVITY_M_S2 = 9.81f;
+constexpr float LAUNCH_ACCEL_THRESHOLD_M_S2 = 1.25f * GRAVITY_M_S2;
+constexpr uint32_t LAUNCH_DEBOUNCE_MS = 30;
+constexpr float FLIGHT_ACCEL_THRESHOLD_M_S2 = 0.75f * GRAVITY_M_S2;
+constexpr uint32_t FLIGHT_DEBOUNCE_MS = 50;
+constexpr float LANDING_ACCEL_THRESHOLD_M_S2 = 1.75f * GRAVITY_M_S2;
+constexpr uint32_t LANDING_DEBOUNCE_MS = 30;
+constexpr uint32_t ACCELERATION_STALE_TIMEOUT_MS = 100;
+
+enum class FlightState {
+  WAITING_FOR_LAUNCH,
+  AIRBORNE_WAITING_FOR_FLIGHT,
+  AIRBORNE_LANDING_ARMED
+};
+
+FlightState flightState = FlightState::WAITING_FOR_LAUNCH;
+float accelerationMagnitude = 0.0f;
+
+void setPidControlEnabled(bool enabled);
 
 //PID vars
 //Define Variables we'll be connecting to
@@ -34,6 +57,94 @@ PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
 
 double min_output = -10.0;
 double max_output = 10.0;
+
+void updateFlightState(uint32_t now) {
+  static uint32_t processedSampleCount = 0;
+  static uint32_t launchCandidateSince = 0;
+  static bool launchCandidateActive = false;
+  static uint32_t flightCandidateSince = 0;
+  static bool flightCandidateActive = false;
+  static uint32_t landingCandidateSince = 0;
+  static bool landingCandidateActive = false;
+
+  if (accelerationSampleCount == 0 ||
+      (uint32_t)(now - lastAccelerationMs) > ACCELERATION_STALE_TIMEOUT_MS) {
+    processedSampleCount = accelerationSampleCount;
+    launchCandidateActive = false;
+
+    if (flightState != FlightState::WAITING_FOR_LAUNCH) {
+      flightState = FlightState::WAITING_FOR_LAUNCH;
+      flightCandidateActive = false;
+      landingCandidateActive = false;
+      setPidControlEnabled(false);
+      Serial.println("IMU acceleration stale; attitude control disabled");
+    }
+    return;
+  }
+
+  if (processedSampleCount == accelerationSampleCount) {
+    return;
+  }
+  processedSampleCount = accelerationSampleCount;
+
+  accelerationMagnitude = sqrtf(
+      acceleration[0] * acceleration[0] +
+      acceleration[1] * acceleration[1] +
+      acceleration[2] * acceleration[2]);
+  const uint32_t sampleMs = lastAccelerationMs;
+
+  switch (flightState) {
+    case FlightState::WAITING_FOR_LAUNCH:
+      if (accelerationMagnitude >= LAUNCH_ACCEL_THRESHOLD_M_S2) {
+        if (!launchCandidateActive) {
+          launchCandidateSince = sampleMs;
+          launchCandidateActive = true;
+        } else if ((uint32_t)(sampleMs - launchCandidateSince) >=
+                   LAUNCH_DEBOUNCE_MS) {
+          flightState = FlightState::AIRBORNE_WAITING_FOR_FLIGHT;
+          launchCandidateActive = false;
+          flightCandidateActive = false;
+          setPidControlEnabled(true);
+          Serial.println("Launch detected; attitude control enabled");
+        }
+      } else {
+        launchCandidateActive = false;
+      }
+      break;
+
+    case FlightState::AIRBORNE_WAITING_FOR_FLIGHT:
+      if (accelerationMagnitude <= FLIGHT_ACCEL_THRESHOLD_M_S2) {
+        if (!flightCandidateActive) {
+          flightCandidateSince = sampleMs;
+          flightCandidateActive = true;
+        } else if ((uint32_t)(sampleMs - flightCandidateSince) >=
+                   FLIGHT_DEBOUNCE_MS) {
+          flightState = FlightState::AIRBORNE_LANDING_ARMED;
+          flightCandidateActive = false;
+        }
+      } else {
+        flightCandidateActive = false;
+      }
+      break;
+
+    case FlightState::AIRBORNE_LANDING_ARMED:
+      if (accelerationMagnitude >= LANDING_ACCEL_THRESHOLD_M_S2) {
+        if (!landingCandidateActive) {
+          landingCandidateSince = sampleMs;
+          landingCandidateActive = true;
+        } else if ((uint32_t)(sampleMs - landingCandidateSince) >=
+                   LANDING_DEBOUNCE_MS) {
+          flightState = FlightState::WAITING_FOR_LAUNCH;
+          landingCandidateActive = false;
+          setPidControlEnabled(false);
+          Serial.println("Landing detected; attitude control disabled");
+        }
+      } else {
+        landingCandidateActive = false;
+      }
+      break;
+  }
+}
 
 
 //MTI Callback function used by the library and such
@@ -281,6 +392,22 @@ ODriveCAN odrv1(wrap_can_intf(can_intf), ODRV1_NODE_ID);
 ODriveCAN odrv2(wrap_can_intf(can_intf), ODRV2_NODE_ID);
 ODriveCAN* odrives[] = {&odrv0, &odrv1, &odrv2}; // Make sure all ODriveCAN instances are accounted for here
 
+void setPidControlEnabled(bool enabled) {
+  const int mode = enabled ? AUTOMATIC : MANUAL;
+  z_PID.SetMode(mode);
+  x_PID.SetMode(mode);
+  y_PID.SetMode(mode);
+
+  if (!enabled) {
+    z_Output = 0.0;
+    x_Output = 0.0;
+    y_Output = 0.0;
+    odrv0.setVelocity(0.0f);
+    odrv1.setVelocity(0.0f);
+    odrv2.setVelocity(0.0f);
+  }
+}
+
 struct ODriveUserData {
   Heartbeat_msg_t last_heartbeat;
   bool received_heartbeat = false;
@@ -411,16 +538,16 @@ void setup() {
   y_Input = 0;
   y_Setpoint = 0; //45.0/2;
 
-  //turn the PID on
-  z_PID.SetMode(AUTOMATIC);
+  // Keep the PID controllers inactive until a launch is detected.
+  z_PID.SetMode(MANUAL);
   z_PID.SetSampleTime(10);
   z_PID.SetOutputLimits(min_output, max_output);
 
-  x_PID.SetMode(AUTOMATIC);
+  x_PID.SetMode(MANUAL);
   x_PID.SetSampleTime(10);
   x_PID.SetOutputLimits(min_output, max_output);
 
-  y_PID.SetMode(AUTOMATIC);
+  y_PID.SetMode(MANUAL);
   y_PID.SetSampleTime(10);
   y_PID.SetOutputLimits(min_output, max_output);
 
@@ -562,6 +689,8 @@ void loop() {
       xsens_mti_parse( &imu_interface, Serial1.read() );
   }
 
+  updateFlightState(millis());
+
   static uint32_t lastVelocityCommandMs = 0;
   uint32_t now = millis();
 
@@ -588,13 +717,19 @@ void loop() {
       z_PID.SetTunings(z_Kp, z_Ki, z_Kd); 
     }*/
 
-    z_PID.Compute();
-    x_PID.Compute();
-    y_PID.Compute();
+    if (flightState != FlightState::WAITING_FOR_LAUNCH) {
+      z_PID.Compute();
+      x_PID.Compute();
+      y_PID.Compute();
 
-    odrv0.setVelocity(z_Output);
-    odrv1.setVelocity(x_Output);
-    odrv2.setVelocity(y_Output);
+      odrv0.setVelocity(z_Output);
+      odrv1.setVelocity(x_Output);
+      odrv2.setVelocity(y_Output);
+    } else {
+      odrv0.setVelocity(0.0f);
+      odrv1.setVelocity(0.0f);
+      odrv2.setVelocity(0.0f);
+    }
   }
 
   // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
@@ -624,6 +759,11 @@ void loop() {
     Serial.println(x_Output);
     Serial.print(">PID-Output-y:");
     Serial.println(y_Output);
+
+    Serial.print(">AccelerationMagnitude:");
+    Serial.println(accelerationMagnitude);
+    Serial.print(">Airborne:");
+    Serial.println(flightState == FlightState::WAITING_FOR_LAUNCH ? 0 : 1);
 
 
     Serial.print(">Roll:");
@@ -677,6 +817,8 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 acceleration[0] = mtdata->data.f4x3[0];
                 acceleration[1] = mtdata->data.f4x3[1];
                 acceleration[2] = mtdata->data.f4x3[2];
+                lastAccelerationMs = millis();
+                ++accelerationSampleCount;
 
                 /*Serial.print(">AccelX:");
                 Serial.println(acceleration[0]);
