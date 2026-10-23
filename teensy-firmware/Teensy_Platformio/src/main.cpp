@@ -58,8 +58,8 @@ double y_Setpoint, y_Input, y_Output;
 double y_Kp=1.1, y_Ki=0.15, y_Kd=0.13;
 PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
 
-double min_output = -1.0;
-double max_output = 1.0;
+double min_output = -10.0;
+double max_output = 10.0;
 
 void updateFlightState(uint32_t now) {
   static uint32_t processedSampleCount = 0;
