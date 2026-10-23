@@ -21,15 +21,18 @@ uint32_t accelerationSampleCount = 0;
 
 constexpr float GRAVITY_M_S2 = 9.81f;
 constexpr float LAUNCH_ACCEL_THRESHOLD_M_S2 = 1.25f * GRAVITY_M_S2;
-constexpr uint32_t LAUNCH_DEBOUNCE_MS = 30;
+constexpr uint32_t LAUNCH_DEBOUNCE_MS = 150;
+constexpr float PROPULSION_END_ACCEL_THRESHOLD_M_S2 = 1.1f * GRAVITY_M_S2; //tjek når accleration falder, før hjul tænder
 constexpr float FLIGHT_ACCEL_THRESHOLD_M_S2 = 0.75f * GRAVITY_M_S2;
 constexpr uint32_t FLIGHT_DEBOUNCE_MS = 50;
+constexpr float LANDING_DECEL_THRESHOLD_M_S2 = GRAVITY_M_S2 / 1.25f;
 constexpr float LANDING_ACCEL_THRESHOLD_M_S2 = 1.75f * GRAVITY_M_S2;
 constexpr uint32_t LANDING_DEBOUNCE_MS = 30;
 constexpr uint32_t ACCELERATION_STALE_TIMEOUT_MS = 100;
 
 enum class FlightState {
   WAITING_FOR_LAUNCH,
+  WAITING_FOR_PROPULSION_CUTOFF,
   AIRBORNE_WAITING_FOR_FLIGHT,
   AIRBORNE_LANDING_ARMED
 };
@@ -55,27 +58,32 @@ double y_Setpoint, y_Input, y_Output;
 double y_Kp=1.1, y_Ki=0.15, y_Kd=0.13;
 PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
 
-double min_output = -10.0;
-double max_output = 10.0;
+double min_output = -1.0;
+double max_output = 1.0;
 
 void updateFlightState(uint32_t now) {
   static uint32_t processedSampleCount = 0;
+  static float previousAccelerationMagnitude = 0.0f;
+  static bool hasPreviousAccelerationSample = false;
   static uint32_t launchCandidateSince = 0;
   static bool launchCandidateActive = false;
   static uint32_t flightCandidateSince = 0;
   static bool flightCandidateActive = false;
   static uint32_t landingCandidateSince = 0;
   static bool landingCandidateActive = false;
+  static bool landingDecelerationCandidateActive = false;
 
   if (accelerationSampleCount == 0 ||
       (uint32_t)(now - lastAccelerationMs) > ACCELERATION_STALE_TIMEOUT_MS) {
     processedSampleCount = accelerationSampleCount;
     launchCandidateActive = false;
+    hasPreviousAccelerationSample = false;
 
     if (flightState != FlightState::WAITING_FOR_LAUNCH) {
       flightState = FlightState::WAITING_FOR_LAUNCH;
       flightCandidateActive = false;
       landingCandidateActive = false;
+      landingDecelerationCandidateActive = false;
       setPidControlEnabled(false);
       Serial.println("IMU acceleration stale; attitude control disabled");
     }
@@ -101,14 +109,20 @@ void updateFlightState(uint32_t now) {
           launchCandidateActive = true;
         } else if ((uint32_t)(sampleMs - launchCandidateSince) >=
                    LAUNCH_DEBOUNCE_MS) {
-          flightState = FlightState::AIRBORNE_WAITING_FOR_FLIGHT;
+          flightState = FlightState::WAITING_FOR_PROPULSION_CUTOFF;
           launchCandidateActive = false;
-          flightCandidateActive = false;
-          setPidControlEnabled(true);
-          Serial.println("Launch detected; attitude control enabled");
         }
       } else {
         launchCandidateActive = false;
+      }
+      break;
+
+    case FlightState::WAITING_FOR_PROPULSION_CUTOFF:
+      if (accelerationMagnitude < PROPULSION_END_ACCEL_THRESHOLD_M_S2) {
+        flightState = FlightState::AIRBORNE_WAITING_FOR_FLIGHT;
+        flightCandidateActive = false;
+        setPidControlEnabled(true);
+        Serial.println("Propulsion ended; attitude control enabled");
       }
       break;
 
@@ -129,6 +143,10 @@ void updateFlightState(uint32_t now) {
 
     case FlightState::AIRBORNE_LANDING_ARMED:
       if (accelerationMagnitude >= LANDING_ACCEL_THRESHOLD_M_S2) {
+        if (landingDecelerationCandidateActive) {
+          landingCandidateActive = false;
+        }
+        landingDecelerationCandidateActive = false;
         if (!landingCandidateActive) {
           landingCandidateSince = sampleMs;
           landingCandidateActive = true;
@@ -139,11 +157,31 @@ void updateFlightState(uint32_t now) {
           setPidControlEnabled(false);
           Serial.println("Landing detected; attitude control disabled");
         }
+      } else if (landingDecelerationCandidateActive &&
+                 accelerationMagnitude <= LANDING_DECEL_THRESHOLD_M_S2) {
+        if ((uint32_t)(sampleMs - landingCandidateSince) >=
+            LANDING_DEBOUNCE_MS) {
+          flightState = FlightState::WAITING_FOR_LAUNCH;
+          landingCandidateActive = false;
+          landingDecelerationCandidateActive = false;
+          setPidControlEnabled(false);
+          Serial.println("Landing detected; attitude control disabled");
+        }
+      } else if (hasPreviousAccelerationSample &&
+                 previousAccelerationMagnitude > GRAVITY_M_S2 &&
+                 accelerationMagnitude <= LANDING_DECEL_THRESHOLD_M_S2) {
+        landingCandidateSince = sampleMs;
+        landingCandidateActive = true;
+        landingDecelerationCandidateActive = true;
       } else {
         landingCandidateActive = false;
+        landingDecelerationCandidateActive = false;
       }
       break;
   }
+
+  previousAccelerationMagnitude = accelerationMagnitude;
+  hasPreviousAccelerationSample = true;
 }
 
 
@@ -752,20 +790,24 @@ void loop() {
       Serial.println(odrv0_user_data.last_bus_voltage_current.Bus_Voltage, 2);
     }*/
 
-    
+    /*
     Serial.print(">PID-Output-z:");
     Serial.println(z_Output);
     Serial.print(">PID-Output-x:");
     Serial.println(x_Output);
     Serial.print(">PID-Output-y:");
-    Serial.println(y_Output);
+    Serial.println(y_Output);*/
 
     Serial.print(">AccelerationMagnitude:");
     Serial.println(accelerationMagnitude);
     Serial.print(">Airborne:");
-    Serial.println(flightState == FlightState::WAITING_FOR_LAUNCH ? 0 : 1);
+    Serial.println(
+        flightState == FlightState::AIRBORNE_WAITING_FOR_FLIGHT ||
+                flightState == FlightState::AIRBORNE_LANDING_ARMED
+            ? 1
+            : 0);
 
-
+/*
     Serial.print(">Roll:");
     Serial.println(euler_pry[0]);
     Serial.print(">Pitch:");
@@ -778,7 +820,7 @@ void loop() {
     Serial.print(">Roll-reference:");
     Serial.println(x_Setpoint);
     Serial.print(">Pitch-reference:");
-    Serial.println(y_Setpoint);
+    Serial.println(y_Setpoint);*/
 
   }
 
