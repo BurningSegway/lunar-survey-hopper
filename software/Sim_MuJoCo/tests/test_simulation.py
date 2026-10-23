@@ -1,6 +1,8 @@
 
+from dataclasses import astuple
 from pathlib import Path
 import json
+import math
 import socket
 import unittest
 
@@ -9,6 +11,7 @@ import numpy as np
 
 from jumper_sim.simulation import (
     EARTH_GRAVITY,
+    FLIGHT_DEBOUNCE,
     MOON_GRAVITY,
     JumperSimulation,
     WheelControlMode,
@@ -17,9 +20,17 @@ from jumper_sim.controller import (
     ReactionWheelTuning,
     WheelSpeeds,
     limit_wheel_command,
+    robot_inertia,
     wheel_effective_inertia,
 )
+from jumper_sim.depth_camera import (
+    DepthCameraSpec,
+    HeightfieldRayCaster,
+    MujocoRayCaster,
+    SimulatedDepthCamera,
+)
 from jumper_sim.telemetry import UdpTelemetry
+from jumper_sim.visualization import draw_landing_plane
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 TERRAIN_ASSETS = (
@@ -38,6 +49,183 @@ class SimulationTests(unittest.TestCase):
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
         self.data = mujoco.MjData(self.model)
         self.simulation = JumperSimulation(self.model, self.data, "pid")
+
+    def test_lqr_uses_whole_robot_inertia_from_model(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        inertia = simulation.controller.axis_inertia
+        rigid = robot_inertia(
+            self.model, simulation.ids.root_joint, simulation.ids.wheel_joints
+        )
+        np.testing.assert_allclose(rigid.wheel_spin, (0.0036,) * 3)
+        # Box 0.075 + two off-axis wheels (0.0036 + 0.2*0.125^2 each) + legs
+        # and foot; the axis's own wheel spin inertia is excluded.
+        np.testing.assert_allclose(inertia, (0.1064, 0.1064, 0.0986), atol=5e-4)
+
+    def test_friction_tuning_matches_model_wheel_damping(self) -> None:
+        for joint_id in self.simulation.ids.wheel_joints:
+            self.assertAlmostEqual(
+                float(self.model.dof_damping[self.model.jnt_dofadr[joint_id]]),
+                self.simulation.tuning.wheel_viscous_friction,
+            )
+
+    def test_heightfield_ray_caster_matches_mujoco(self) -> None:
+        mujoco.mj_forward(self.model, self.data)
+        fast = HeightfieldRayCaster(self.model)
+        reference = MujocoRayCaster(self.model, self.data)
+        rng = np.random.default_rng(4)
+        for origin in ((0.0, 0.0, 3.0), (5.0, -3.0, 8.0), (-12.0, 7.0, 1.0)):
+            directions = rng.standard_normal((400, 3))
+            directions[:, 2] = -np.abs(directions[:, 2])
+            directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+            a = fast.cast(np.array(origin), directions, 15.0)
+            b = reference.cast(np.array(origin), directions, 15.0)
+            b[b > 15.0] = np.nan
+            np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
+            np.testing.assert_allclose(a[np.isfinite(a)], b[np.isfinite(b)], atol=1e-6)
+
+    def test_depth_camera_sees_ground_only_within_d435_range(self) -> None:
+        camera = SimulatedDepthCamera(
+            self.model, self.simulation.ids.root_joint, DepthCameraSpec(noise=False)
+        )
+        caster = HeightfieldRayCaster(self.model)
+        ground = float(caster.height(np.array([0.0]), np.array([0.0]))[0])
+        for height, expect_valid in ((2.0, True), (0.35, False)):
+            self.data.qpos[:3] = (0.0, 0.0, ground + height)
+            self.data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+            mujoco.mj_forward(self.model, self.data)
+            frame = camera.capture(self.data)
+            self.assertEqual(frame.depth.shape, (60, 106))
+            centre = frame.depth[30, 53]
+            if expect_valid:
+                self.assertAlmostEqual(centre, height - 0.151, delta=0.15)
+            else:
+                self.assertTrue(np.isnan(frame.depth).mean() > 0.9)
+
+    def test_landing_reference_updates_only_in_flight(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self.assertIsNotNone(simulation.landing_reference)
+        caster = HeightfieldRayCaster(self.model)
+        x, y = 5.0, -3.0  # sloped spot
+        ground = float(caster.height(np.array([x]), np.array([y]))[0])
+        self.model.opt.gravity[2] = -MOON_GRAVITY
+        self.data.qpos[:3] = (x, y, ground + 3.0)
+        mujoco.mj_forward(self.model, self.data)
+        simulation.landing_reference.reset(float(self.data.time))
+        self.assertFalse(simulation.robot_touches_terrain())
+        while not simulation.robot_touches_terrain() and self.data.time < 4.0:
+            simulation.step()
+        filt = simulation.landing_reference.filter
+        self.assertGreater(filt.accepted, 5)
+        self.assertGreater(math.degrees(math.acos(filt.normal[2])), 5.0)
+        # No depth frame is ever captured while the robot is in contact
+        # (bounces are flights and may capture).
+        camera = simulation.landing_reference.camera
+        original_capture = camera.capture
+        captures_in_contact = []
+
+        def capture(data, roi_radius=None):
+            captures_in_contact.append(simulation.in_contact)
+            return original_capture(data, roi_radius)
+
+        camera.capture = capture
+        for _ in range(1500):
+            simulation.step()
+        self.assertNotIn(True, captures_in_contact)
+        telemetry = simulation.telemetry_payload()
+        self.assertNotEqual((telemetry["roll_ref"], telemetry["pitch_ref"]), (0.0, 0.0))
+        simulation.handle_key("space")
+        np.testing.assert_allclose(filt.normal, (0.0, 0.0, 1.0))
+
+    def _drop(self, simulation, height=1.5, x=0.0, y=0.0):
+        caster = HeightfieldRayCaster(self.model)
+        ground = float(caster.height(np.array([x]), np.array([y]))[0])
+        self.data.qpos[:3] = (x, y, ground + height)
+        self.data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+        mujoco.mj_forward(self.model, self.data)
+        if simulation.landing_reference is not None:
+            simulation.landing_reference.reset(float(self.data.time))
+
+    def test_contact_gating_switches_modes_and_bleeds_wheels(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self.assertTrue(simulation.contact_gating)
+        self.model.opt.gravity[2] = -MOON_GRAVITY
+        self._drop(simulation)
+        for joint_id, speed in zip(simulation.ids.wheel_joints, (30.0, -20.0, 10.0)):
+            self.data.qvel[self.model.jnt_dofadr[joint_id]] = speed
+        simulation.step()
+        self.assertFalse(simulation.in_contact)
+        self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
+        while not simulation.in_contact and self.data.time < 3.0:
+            simulation.step()
+        self.assertTrue(simulation.in_contact)
+        self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
+        # In contact only the rest torque acts: it opposes each wheel's spin.
+        simulation.step()
+        for actuator_id, joint_id in zip(simulation.ids.wheel_actuators, simulation.ids.wheel_joints):
+            speed = self.data.qvel[self.model.jnt_dofadr[joint_id]]
+            if abs(speed) > 1.0:
+                self.assertLessEqual(self.data.ctrl[actuator_id] * speed, 0.0)
+        for _ in range(6000):
+            simulation.step()
+        if simulation.in_contact:
+            self.assertLess(max(abs(v) for v in astuple(simulation.read_wheel_speeds())), 1.0)
+
+    def test_short_contact_gaps_do_not_count_as_flight(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        simulation._update_contact_phase(True)
+        self.assertTrue(simulation.in_contact)
+        gap_steps = int(0.5 * FLIGHT_DEBOUNCE / self.model.opt.timestep)
+        for _ in range(gap_steps):
+            simulation._update_contact_phase(False)
+        self.assertTrue(simulation.in_contact)
+        simulation._update_contact_phase(True)
+        for _ in range(int(1.2 * FLIGHT_DEBOUNCE / self.model.opt.timestep)):
+            simulation._update_contact_phase(False)
+        self.assertFalse(simulation.in_contact)
+        self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
+        self.assertEqual(simulation.contact_phases, 1)
+
+    def test_lift_off_holds_current_heading(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        yaw = 0.7
+        self.data.qpos[3:7] = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+        mujoco.mj_forward(self.model, self.data)
+        simulation._update_contact_phase(True)
+        for _ in range(int(1.5 * FLIGHT_DEBOUNCE / self.model.opt.timestep)):
+            simulation._update_contact_phase(False)
+        self.assertAlmostEqual(simulation.yaw_reference, yaw, places=9)
+
+    def test_disabled_wheels_stay_disabled_through_contact_changes(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        simulation.handle_key("x")
+        simulation._update_contact_phase(True)
+        self.assertIs(simulation.wheel_control_mode, WheelControlMode.DISABLED)
+        simulation.handle_key("c")
+        self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
+
+    def test_pid_is_not_contact_gated(self) -> None:
+        self.assertFalse(self.simulation.contact_gating)
+
+    def test_landing_plane_overlay_is_drawn(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self.model.opt.gravity[2] = -MOON_GRAVITY
+        self._drop(simulation, height=2.5, x=5.0, y=-3.0)
+        scene = mujoco.MjvScene(self.model, maxgeom=500)
+        self.assertEqual(draw_landing_plane(scene, simulation), 0)  # nothing fitted yet
+        while self.data.time < 0.5:
+            simulation.step()
+        added = draw_landing_plane(scene, simulation)
+        self.assertGreater(added, 2)
+        disc = scene.geoms[0]
+        self.assertEqual(disc.type, mujoco.mjtGeom.mjGEOM_CYLINDER)
+        np.testing.assert_allclose(
+            disc.mat[:, 2], simulation.landing_reference.visual.measured_normal, atol=1e-6
+        )
+        small = mujoco.MjvScene(self.model, maxgeom=3)
+        self.assertLessEqual(draw_landing_plane(small, simulation), 3)
+
+    def test_pid_has_no_landing_reference(self) -> None:
+        self.assertIsNone(self.simulation.landing_reference)
 
     def test_model_loads_and_steps_headlessly(self) -> None:
         self.simulation.step()
@@ -192,7 +380,11 @@ class SimulationTests(unittest.TestCase):
         self.assertFalse(self.simulation.wheel_rest_controller.active)
 
     def test_relaxation_slows_wheels_and_telemetry_reports_joint_velocity(self) -> None:
-        self.simulation = JumperSimulation(self.model, self.data, "lqr")
+        # Ground-rest behaviour only; the camera's landing reference (which the
+        # spawn drop would pick up) is covered by the landing tests.
+        self.simulation = JumperSimulation(
+            self.model, self.data, "lqr", landing_reference=False
+        )
         for joint_id, speed in zip(
             self.simulation.ids.wheel_joints, (20.0, -15.0, 10.0), strict=True
         ):

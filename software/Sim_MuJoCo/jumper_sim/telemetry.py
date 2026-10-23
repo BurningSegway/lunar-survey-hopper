@@ -39,12 +39,14 @@ def make_telemetry_payload(
     yaw_reference: float,
     wheel_speeds: WheelSpeeds,
     tuning: ReactionWheelTuning,
+    roll_reference: float = 0.0,
+    pitch_reference: float = 0.0,
 ) -> TelemetryPayload:
     return {
         "roll": sensor.roll,
-        "roll_ref": 0.0,
+        "roll_ref": roll_reference,
         "pitch": sensor.pitch,
-        "pitch_ref": 0.0,
+        "pitch_ref": pitch_reference,
         "yaw": sensor.yaw,
         "yaw_ref": yaw_reference,
         "vel_x": wheel_speeds.x,

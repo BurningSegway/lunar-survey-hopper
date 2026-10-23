@@ -79,13 +79,67 @@ roll, pitch, and yaw, their references, and X/Y/Z wheel speeds in rad/s.
 Start PlotJuggler's UDP Server listening on port `9870` before launching the
 simulator.
 
+## Contact gating (LQR only)
+
+The LQR only controls attitude in flight. From the first step any part of the
+robot touches the terrain it is "in contact": attitude control stops, the
+integrator resets and the wheel-rest ramp bleeds the wheels' momentum into
+the ground (this replaces the stationary-for-1-s rest trigger for the LQR).
+It is airborne again after 60 ms without contact (`FLIGHT_DEBOUNCE`), so
+rocking on the legs or skidding is one contact phase; at lift-off the LQR
+resumes with a fresh integrator and the current heading as yaw reference.
+The PID keeps its previous behaviour. Disable with
+`JumperSimulation(..., contact_gating=False)`.
+
+## Landing reference from the depth camera (LQR only)
+
+A RealSense D435 stand-in (site `realsense` on the bottom face) looks down.
+While the robot is airborne it produces 30 Hz depth frames (106x60 rays,
+87x58 deg, 0.3-10 m, D435 stereo noise, 50 ms latency) by ray casting the
+terrain heightfield. Each frame is fitted to the area-averaged ground plane
+in a 0.5 m-radius disc straight below the robot and fused in a small Kalman
+filter; fits whose depth noise is too large (above ~5-6 m) are ignored and
+the reference freezes when touchdown is < 1 m or < 0.3 s away. The LQR holds
+body z along that plane normal (clamped to 20 deg) with the usual yaw
+reference. Nothing updates in contact; a jump resets the reference to level.
+PlotJuggler's `roll_ref`/`pitch_ref` show it.
+
+In the viewer: the disc is the latest fit (orange = it updated the
+reference, grey = not used or held in contact), the green arrow is the
+reference normal, and the blue dots are a sample of the depth points used.
+
+- `jumper_sim/depth_camera.py`: camera spec, ray casters, simulated camera
+  (the only simulation-specific part).
+- `jumper_sim/landing_reference.py`: plane fit, filter and reference attitude;
+  written to run unchanged on the robot from real D435 frames + IMU attitude.
+- `jumper_sim/visualization.py`: the viewer overlay.
+- Tuning: `LandingReferenceConfig` (disc radius, max tilt, filter noise,
+  freeze rules) and `DepthCameraSpec`.
+
+## Benchmarks
+
+- `python -m benchmarks.lqr_benchmark --label NAME [--compare OTHER]`:
+  free-flight attitude recovery; `python -m benchmarks.plot_results A B ...`
+  plots saved runs.
+- `python -m benchmarks.landing_benchmark --label NAME`: drops onto sloped
+  terrain, touchdown misalignment with and without the camera reference.
+- `python -m benchmarks.contact_benchmark --label NAME`: drops with bounces
+  and a hop from the spawn point, with and without contact gating.
+
+Contact behaviour differs between MuJoCo versions (on 3.2.3 the jump spring
+launches the robot at ~5 m/s, on 3.16 at ~1 m/s), so run the contact and
+landing benchmarks on the pinned version.
+
 ## Tuning
 
-Edit `ReactionWheelTuning`, `PidGains`, and `LqrWeights` in
+Edit `ReactionWheelTuning`, `PidGains`, and `LqrLimits` in
 `jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
 limits, stationary detection thresholds and duration, wheel-rest behavior,
-mass/inertia values, and LQR weights. Keep the
-robot and wheel inertia values consistent with `build/Jumping_Robot.xml`.
+wheel friction, and the LQR's physical tuning limits. The LQR takes the
+robot's inertia from the MJCF; keep `robot_inertia`/`wheel_inertia` and
+`wheel_viscous_friction` consistent with `build/Jumping_Robot.xml` for the
+PID and the motor limits.
+
 
 ## Tests
 
