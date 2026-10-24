@@ -285,7 +285,7 @@ class SimulationTests(unittest.TestCase):
         rng = np.random.default_rng(2)
         origin = np.array([8.0, 3.0, 6.0])
         hits = 0
-        for direction in rng.normal([0, 0, -1], 0.15, (100, 3)):
+        for direction in rng.normal([0, 0, -1], 0.03, (100, 3)):  # ~0.2 m spread on the 0.3 m bunny
             direction /= np.linalg.norm(direction)
             geom = np.zeros(1, dtype=np.int32)
             expected = mujoco.mj_ray(self.model, self.data, origin, direction, only_target, 1, -1, geom)

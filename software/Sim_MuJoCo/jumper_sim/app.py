@@ -17,7 +17,6 @@ import numpy as np
 
 from .pointcloud import PointCloudRecorder, ScanConfig
 from .simulation import MOON_GRAVITY, JumperSimulation
-from .status_indicator import RelaxationIndicator
 from .telemetry import UdpTelemetry
 from .visualization import draw_flight_target, draw_landing_plane, draw_target_scan
 
@@ -184,55 +183,52 @@ def track_robot(viewer, base_body_id: int) -> None:
 
 def run_viewer(model, data, simulation, key_queue, on_key, last_state, state_spec) -> None:
     with closing(UdpTelemetry()) as telemetry:
-        with closing(RelaxationIndicator()) as indicator:
-            with mujoco.viewer.launch_passive(
-                model, data, key_callback=on_key
-            ) as viewer:
-                base_body_id = mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
-                )
-                if base_body_id < 0:
-                    raise ValueError("MuJoCo model is missing required body 'base_link'")
+        with mujoco.viewer.launch_passive(
+            model, data, key_callback=on_key
+        ) as viewer:
+            base_body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
+            )
+            if base_body_id < 0:
+                raise ValueError("MuJoCo model is missing required body 'base_link'")
+            with viewer.lock():
+                track_robot(viewer, base_body_id)
+            overlay_scene = getattr(viewer, "user_scn", None)
+
+            while viewer.is_running():
+                frame_started = time.perf_counter()
                 with viewer.lock():
-                    track_robot(viewer, base_body_id)
-                overlay_scene = getattr(viewer, "user_scn", None)
+                    while not key_queue.empty():
+                        key = key_queue.get()
+                        if key == "backspace":
+                            # MuJoCo's viewer resets data on Backspace before
+                            # forwarding the key to the Python callback.
+                            mujoco.mj_setState(model, data, last_state, state_spec)
+                            mujoco.mj_forward(model, data)
+                        message = simulation.handle_key(key)
+                        if message:
+                            print(message)
+                        if key == "r":
+                            track_robot(viewer, base_body_id)  # follow the robot again
 
-                while viewer.is_running():
-                    frame_started = time.perf_counter()
-                    with viewer.lock():
-                        while not key_queue.empty():
-                            key = key_queue.get()
-                            if key == "backspace":
-                                # MuJoCo's viewer resets data on Backspace before
-                                # forwarding the key to the Python callback.
-                                mujoco.mj_setState(model, data, last_state, state_spec)
-                                mujoco.mj_forward(model, data)
-                            message = simulation.handle_key(key)
-                            if message:
-                                print(message)
-                            if key == "r":
-                                track_robot(viewer, base_body_id)  # follow the robot again
+                    frame_end = float(data.time) + FRAME_PERIOD
+                    while data.time < frame_end:
+                        simulation.step()
+                        for event in simulation.flight_events:
+                            print(event)
+                        simulation.flight_events.clear()
+                    if overlay_scene is not None:
+                        overlay_scene.ngeom = 0
+                        draw_landing_plane(overlay_scene, simulation)
+                        draw_flight_target(overlay_scene, simulation)
+                        draw_target_scan(overlay_scene, simulation)
+                    telemetry.send(simulation.telemetry_payload())
+                    mujoco.mj_getState(model, data, last_state, state_spec)
 
-                        frame_end = float(data.time) + FRAME_PERIOD
-                        while data.time < frame_end:
-                            simulation.step()
-                            for event in simulation.flight_events:
-                                print(event)
-                            simulation.flight_events.clear()
-                        if overlay_scene is not None:
-                            overlay_scene.ngeom = 0
-                            draw_landing_plane(overlay_scene, simulation)
-                            draw_flight_target(overlay_scene, simulation)
-                            draw_target_scan(overlay_scene, simulation)
-                        telemetry.send(simulation.telemetry_payload())
-                        mujoco.mj_getState(model, data, last_state, state_spec)
-                        relaxation_active = simulation.relaxation_active
-
-                    viewer.sync()
-                    indicator.update(relaxation_active)
-                    remaining = FRAME_PERIOD - (time.perf_counter() - frame_started)
-                    if remaining > 0.0:
-                        time.sleep(remaining)
+                viewer.sync()
+                remaining = FRAME_PERIOD - (time.perf_counter() - frame_started)
+                if remaining > 0.0:
+                    time.sleep(remaining)
 
 
 if __name__ == "__main__":

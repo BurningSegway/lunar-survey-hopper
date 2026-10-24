@@ -108,10 +108,6 @@ Options:
 - `R`: reset the simulation, restore Moon gravity and point the camera back at
   the robot
 
-The separate state window shows a red `RELAXATION INACTIVE` button while
-normal stabilization is active, and turns green when automatic wheel
-relaxation begins.
-
 MuJoCo's viewer has its own Backspace reset shortcut. The simulator restores
 the previous physics state when that default action occurs, then applies the
 gravity toggle; use `R` when an actual reset is desired.
@@ -203,17 +199,18 @@ into the ground on release (see the open items).
 
 ### Target object
 
-With `--track-target X Y Z` a bright orange Stanford Bunny (1.5 m tall,
-`build/target_bunny.obj`; Stanford University Computer Graphics Laboratory,
-taken from MuJoCo's model collection) stands on the terrain under (X, Y). The
-depth camera sees it (an exact ray/mesh test added to the heightfield ray
-caster, `MeshRayCaster` in `jumper_sim/depth_camera.py`), so it appears in the
-target point cloud and in landing-plane fits near it; the robot collides with
-its convex hull. Give Z about the middle of the bunny (ground height + 0.75)
-to aim the camera at it. Without a target it is hidden below the terrain.
-LQR only. From the spawn, a Moon hop towards a bunny 8 m away put 41 of
-13253 scan points on it, about 20 cm apart (the scan uses 53x30 rays; see
-`ScanConfig`).
+With `--track-target X Y Z` a bright orange Stanford Bunny (0.3 m tall:
+`build/target_bunny.obj` is 1.5 m, scaled by 0.2 in the MJCF; Stanford
+University Computer Graphics Laboratory, taken from MuJoCo's model collection)
+rests on the terrain at (X, Y), tilted to a plane fitted to the ground under
+it so it neither floats nor sinks in on slopes. The depth camera sees it (an
+exact ray/mesh test added to the heightfield ray caster, `MeshRayCaster` in
+`jumper_sim/depth_camera.py`), so it appears in the target point cloud and in
+landing-plane fits near it; the robot collides with its convex hull. Give Z
+about the middle of the bunny (ground height + 0.15) to aim the camera at it.
+Without a target it is hidden below the terrain. LQR only. From the spawn, a
+Moon hop towards the bunny 4 m away put 29 of 21668 scan points on it; at 8 m
+none (the scan's 53x30 rays land about 20 cm apart there; see `ScanConfig`).
 
 ### Tipped over
 

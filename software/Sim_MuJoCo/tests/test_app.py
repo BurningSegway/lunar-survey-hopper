@@ -39,7 +39,6 @@ class ViewerApplicationTests(unittest.TestCase):
     def test_keyboard_callback_drives_simulation_and_telemetry(self) -> None:
         messages: list[str] = []
         telemetry_payloads: list[TelemetryPayload] = []
-        indicator_states: list[bool] = []
         simulated_data: list[mujoco.MjData] = []
         viewer_cameras: list[SimpleNamespace] = []
         base_body_ids: list[int] = []
@@ -56,16 +55,6 @@ class ViewerApplicationTests(unittest.TestCase):
 
             def send(self, payload: TelemetryPayload) -> None:
                 telemetry_payloads.append(payload)
-
-            def close(self) -> None:
-                pass
-
-        class FakeIndicator:
-            def __init__(self) -> None:
-                pass
-
-            def update(self, active: bool) -> None:
-                indicator_states.append(active)
 
             def close(self) -> None:
                 pass
@@ -177,7 +166,6 @@ class ViewerApplicationTests(unittest.TestCase):
         with (
             patch.object(app.mujoco.viewer, "launch_passive", launch_passive),
             patch.object(app, "UdpTelemetry", FakeTelemetry),
-            patch.object(app, "RelaxationIndicator", FakeIndicator),
             patch.object(JumperSimulation, "handle_key", record_state_on_backspace),
             patch.object(app.time, "sleep"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
@@ -221,7 +209,6 @@ class ViewerApplicationTests(unittest.TestCase):
         np.testing.assert_array_equal(before[2], after[2])
         self.assertEqual(before[3], after[3])
         self.assertEqual(len(telemetry_payloads), 2)
-        self.assertEqual(len(indicator_states), 2)
         self.assertAlmostEqual(
             telemetry_payloads[0]["sat_max"],
             ReactionWheelTuning().max_wheel_velocity,

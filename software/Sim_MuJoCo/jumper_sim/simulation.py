@@ -279,8 +279,13 @@ class JumperSimulation:
         # MuJoCo centres a mesh on its centre of mass: the geom sits at the
         # mesh's offset (mesh_pos) from the asset origin (the object's base).
         # Taken from the mesh, as other simulations on this model move the geom.
+        # The mesh's orientation (mesh_quat) is the geom's when upright.
         self._target_offset = (
             model.mesh_pos[model.geom_dataid[self._target_geom]].copy()
+            if self._target_geom >= 0 else None
+        )
+        self._target_quat = (
+            model.mesh_quat[model.geom_dataid[self._target_geom]].copy()
             if self._target_geom >= 0 else None
         )
         self._place_target_object(track_target)
@@ -393,23 +398,45 @@ class JumperSimulation:
         terrain = self._terrain_ray_caster()
         if terrain is not None:
             terrain.objects = []
+        self.model.geom_quat[self._target_geom] = self._target_quat
         if target is None or terrain is None:
             self.model.geom_pos[self._target_geom] = self._target_offset - (0.0, 0.0, TARGET_PARKED_DEPTH)
             return
         x, y = float(target[0]), float(target[1])
-        # Base on the lowest ground under the object, so it never floats.
+        # Rest on the ground like a real object: tilt it to a plane fitted to
+        # the ground under its footprint and put its base on that plane. On a
+        # crater wall, the lowest ground (upright) buried it by up to 60%.
         ring = np.linspace(0.0, 2.0 * math.pi, 12, endpoint=False)
-        reach = 0.5 * float(np.ptp(self._target_footprint(), axis=0).max())
-        xs = np.append(x + reach * np.cos(ring), x)
-        ys = np.append(y + reach * np.sin(ring), y)
-        base = float(np.nanmin(terrain.height(xs, ys)))
-        self.model.geom_pos[self._target_geom] = self._target_offset + (x, y, base)
+        reach = float(np.hypot(*self._target_footprint().T).max())
+        dx = np.append(np.concatenate([r * np.cos(ring) for r in (0.5 * reach, reach)]), 0.0)
+        dy = np.append(np.concatenate([r * np.sin(ring) for r in (0.5 * reach, reach)]), 0.0)
+        heights = terrain.height(x + dx, y + dy)
+        valid = np.isfinite(heights)
+        if valid.sum() >= 3:
+            a, b, base = np.linalg.lstsq(
+                np.column_stack([dx, dy, np.ones_like(dx)])[valid], heights[valid], rcond=None
+            )[0]
+            normal = np.array([-a, -b, 1.0]) / math.hypot(a, b, 1.0)
+        else:
+            base, normal = float(np.nanmin(heights)), np.array([0.0, 0.0, 1.0])
+        tilt = np.zeros(4)
+        mujoco.mju_quatZ2Vec(tilt, normal)
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, tilt)
+        mujoco.mju_mulQuat(self.model.geom_quat[self._target_geom], tilt, self._target_quat)
+        self.model.geom_pos[self._target_geom] = (
+            rotation.reshape(3, 3) @ self._target_offset + (x, y, float(base))
+        )
         terrain.objects = [MeshRayCaster.from_model(self.model, self._target_geom)]
 
     def _target_footprint(self) -> np.ndarray:
+        """Horizontal extent of the upright object around its base (x, y)."""
         mesh = int(self.model.geom_dataid[self._target_geom])
         adr, num = int(self.model.mesh_vertadr[mesh]), int(self.model.mesh_vertnum[mesh])
-        return self.model.mesh_vert[adr : adr + num, :2]
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, self._target_quat)
+        upright = self.model.mesh_vert[adr : adr + num] @ rotation.reshape(3, 3).T
+        return (upright + self._target_offset)[:, :2]
 
     def _terrain_ray_caster(self) -> HeightfieldRayCaster | None:
         """The ray caster the depth cameras share (None without a camera)."""
