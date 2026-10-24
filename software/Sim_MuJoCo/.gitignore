@@ -2,10 +2,9 @@
 __pycache__/
 *.py[cod]
 pointclouds/
-# Generated terrain (build/convert_usd.py) and the moon-surface source.
-# build/terrain_merged.usd (the previous terrain's source) stays tracked.
+# Generated terrain (build/convert_usd.py) and the extracted moon-surface source;
+# the trimmed download build/moon-surface.zip is tracked with Git LFS.
 build/terrain.obj
-build/terrain_height.png
 build/terrain_height.bin
 build/terrain_diffuse.png
 build/Testing/

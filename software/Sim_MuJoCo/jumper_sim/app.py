@@ -87,8 +87,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if model_path == MODEL_PATH.resolve() and missing_terrain_paths:
         raise FileNotFoundError(
             f"Terrain assets not found: {', '.join(map(str, missing_terrain_paths))}. "
-            f"Generate them from {terrain_paths[0].with_name('terrain_merged.usd')} "
-            f"with '{Path('.venv/bin/python')} build/convert_usd.py'."
+            f"Extract {terrain_paths[0].with_name('moon-surface.zip')} into "
+            f"build/Testing/Temporary/moon-surface and run "
+            f"'{Path('.venv/bin/python')} build/convert_usd.py'."
         )
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
