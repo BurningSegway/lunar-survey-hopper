@@ -7,7 +7,11 @@ Drawn into a ``mujoco.MjvScene`` (the passive viewer's ``user_scn``):
   did not (too far away to trust, frozen just before touchdown, rejected as
   an outlier) or while the robot is in contact and the estimate is held;
 * a green arrow along the filtered reference normal the LQR aligns body z to;
-* small blue dots: a sample of the depth points the fit used.
+* small blue dots: a sample of the depth points the fit used;
+* the camera's tracking target (red sphere) while a hop is under way, with a
+  red line from the camera to it during the ascent;
+* cyan dots: a sample of the target point cloud collected so far (with
+  ``--scan-file`` scanning on), refreshed after each jump's ascent.
 """
 
 from __future__ import annotations
@@ -21,8 +25,13 @@ DISC_FLIGHT_RGBA = np.array([1.0, 0.55, 0.1, 0.35], dtype=np.float32)
 DISC_HELD_RGBA = np.array([0.6, 0.6, 0.6, 0.25], dtype=np.float32)
 ARROW_RGBA = np.array([0.1, 0.85, 0.2, 0.9], dtype=np.float32)
 POINT_RGBA = np.array([0.2, 0.5, 1.0, 0.9], dtype=np.float32)
+TARGET_RGBA = np.array([0.95, 0.15, 0.15, 0.9], dtype=np.float32)
+SIGHT_RGBA = np.array([0.95, 0.15, 0.15, 0.6], dtype=np.float32)
+TARGET_RADIUS = 0.06
 ARROW_LENGTH = 0.45
 POINT_RADIUS = 0.008
+SCAN_RGBA = np.array([0.1, 0.9, 0.9, 0.8], dtype=np.float32)
+SCAN_POINT_RADIUS = 0.01
 
 
 def frame_from_normal(normal: np.ndarray) -> np.ndarray:
@@ -76,4 +85,44 @@ def draw_landing_plane(scene: mujoco.MjvScene, simulation: JumperSimulation,
             mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE,
                                 np.array([POINT_RADIUS, 0.0, 0.0]), point,
                                 np.eye(3).ravel(), POINT_RGBA)
+    return scene.ngeom - start
+
+
+def draw_flight_target(scene: mujoco.MjvScene, simulation: JumperSimulation) -> int:
+    """Append the tracking target (and line of sight during ascent)."""
+    reference = simulation.flight_reference
+    if reference is None or reference.active_target is None or not reference.tracking:
+        return 0
+    from .flight_phase import FlightPhase
+
+    start = scene.ngeom
+    marker = _add_geom(scene)
+    if marker is not None:
+        mujoco.mjv_initGeom(marker, mujoco.mjtGeom.mjGEOM_SPHERE,
+                            np.array([TARGET_RADIUS, 0.0, 0.0]), reference.active_target,
+                            np.eye(3).ravel(), TARGET_RGBA)
+    if simulation.phase is FlightPhase.ASCENT:
+        line = _add_geom(scene)
+        if line is not None:
+            mujoco.mjv_initGeom(line, mujoco.mjtGeom.mjGEOM_LINE, np.zeros(3), np.zeros(3),
+                                np.eye(3).ravel(), SIGHT_RGBA)
+            mujoco.mjv_connector(line, mujoco.mjtGeom.mjGEOM_LINE, 2.0,
+                                 simulation.data.site_xpos[simulation._camera_site],
+                                 reference.active_target)
+    return scene.ngeom - start
+
+
+def draw_target_scan(scene: mujoco.MjvScene, simulation: JumperSimulation) -> int:
+    """Append an even sample of the target point cloud collected so far."""
+    scan = simulation.target_scan
+    if scan is None:
+        return 0
+    start = scene.ngeom
+    for point in scan.preview:
+        geom = _add_geom(scene)
+        if geom is None:
+            break
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE,
+                            np.array([SCAN_POINT_RADIUS, 0.0, 0.0]), point,
+                            np.eye(3).ravel(), SCAN_RGBA)
     return scene.ngeom - start

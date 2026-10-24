@@ -1,4 +1,4 @@
-from dataclasses import astuple
+from dataclasses import astuple, replace
 import math
 import unittest
 
@@ -7,7 +7,6 @@ import numpy as np
 from jumper_sim.controller import (
     LqrController,
     LqrLimits,
-    LqrWeights,
     RobotInertia,
     ReactionWheelController,
     ReactionWheelTuning,
@@ -16,12 +15,22 @@ from jumper_sim.controller import (
     WheelSpeeds,
     combine_attitude_and_rest_torque,
     gyroscopic_torque,
-    quaternion_attitude_error,
+    quaternion_error,
     solve_continuous_are,
     wheel_effective_inertia,
     wheel_friction_compensation,
     wrapped_yaw_error,
 )
+
+
+def level_error(q, yaw):
+    """Error from a level reference with heading ``yaw``."""
+    return quaternion_error(q, (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
+
+
+def limits_weights(**overrides):
+    """The simulator's default weights, optionally with fields replaced."""
+    return replace(LqrLimits().to_weights(ReactionWheelTuning()), **overrides)
 
 
 class ControllerTests(unittest.TestCase):
@@ -60,7 +69,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(neutral_command.tau_x, 0.0)
 
     def test_lqr_gains_solve_the_riccati_equation_per_axis(self) -> None:
-        weights = LqrWeights(integral=0.0)
+        weights = limits_weights(integral=0.0)
         controller = LqrController(
             ReactionWheelTuning(), weights, axis_inertia=(0.1, 0.12, 0.08)
         )
@@ -82,21 +91,24 @@ class ControllerTests(unittest.TestCase):
             closed_loop = a - b @ np.array([[k_angle, k_rate]])
             self.assertTrue(np.all(np.linalg.eigvals(closed_loop).real < 0.0))
 
-    def test_numeric_riccati_matches_closed_form(self) -> None:
-        inertia, weights = 0.1, LqrWeights(integral=0.0)
+    def test_gains_match_closed_form_double_integrator(self) -> None:
+        inertia, weights = 0.1, limits_weights(integral=0.0)
+        q1, q2, r = weights.angle, weights.angular_rate, weights.torque
+        # Analytic CARE solution for J*theta_ddot = u.
+        p12 = inertia * math.sqrt(r * q1)
+        p22 = inertia * math.sqrt(r * (2.0 * p12 + q2))
+        expected = (p12 / (r * inertia), p22 / (r * inertia))
+        controller = LqrController(ReactionWheelTuning(), weights, (inertia,) * 3)
+        np.testing.assert_allclose(controller.gains[0], expected, rtol=1e-9)
         a = np.array([[0.0, 1.0], [0.0, 0.0]])
         b = np.array([[0.0], [1.0 / inertia]])
-        p = solve_continuous_are(
-            a, b, np.diag([weights.angle, weights.angular_rate]), np.array([[1.0]])
-        )
-        k = (b.T @ p).ravel()
-        closed = LqrController(ReactionWheelTuning(), weights, (inertia,) * 3)
-        np.testing.assert_allclose(k, closed.gains[0], rtol=1e-9)
+        p = solve_continuous_are(a, b, np.diag([q1, q2]), np.array([[r]]))
+        np.testing.assert_allclose(p[0, 1], p12, rtol=1e-9)
 
     def test_lqi_is_stable_and_removes_constant_disturbance(self) -> None:
         inertia = 0.1
         controller = LqrController(
-            ReactionWheelTuning(), LqrWeights(), axis_inertia=(inertia,) * 3
+            ReactionWheelTuning(), limits_weights(), axis_inertia=(inertia,) * 3
         )
         k_i, (k_angle, k_rate) = controller.integral_gains[0], controller.gains[0]
         closed_loop = np.array([
@@ -116,13 +128,13 @@ class ControllerTests(unittest.TestCase):
         self.assertLess(abs(angle), 1e-3)
 
         without_integral = LqrController(
-            ReactionWheelTuning(), LqrWeights(integral=0.0), (inertia,) * 3
+            ReactionWheelTuning(), limits_weights(integral=0.0), (inertia,) * 3
         )
         steady_error = 0.2 / without_integral.gains[0][0]
         self.assertGreater(steady_error, 1e-2)
 
     def test_lqi_integrator_is_clamped_outside_zone_and_reset(self) -> None:
-        weights = LqrWeights(integral_torque_limit=0.5)
+        weights = limits_weights(integral_torque_limit=0.5)
         controller = LqrController(ReactionWheelTuning(), weights, (0.1,) * 3)
         k_i = controller.integral_gains[0]
         k_angle = controller.gains[0][0]
@@ -162,12 +174,12 @@ class ControllerTests(unittest.TestCase):
         )
 
     def test_quaternion_error_is_body_rotation_vector(self) -> None:
-        self.assertEqual(quaternion_attitude_error((1.0, 0.0, 0.0, 0.0), 0.0), (0.0, 0.0, 0.0))
+        self.assertEqual(level_error((1.0, 0.0, 0.0, 0.0), 0.0), (0.0, 0.0, 0.0))
         for axis in range(3):
             for angle in (0.3, -1.2, math.radians(100.0)):
                 q = [math.cos(angle / 2), 0.0, 0.0, 0.0]
                 q[axis + 1] = math.sin(angle / 2)
-                error = quaternion_attitude_error(tuple(q), 0.0)
+                error = level_error(tuple(q), 0.0)
                 expected = [0.0, 0.0, 0.0]
                 expected[axis] = angle
                 np.testing.assert_allclose(error, expected, atol=1e-12)
@@ -176,15 +188,15 @@ class ControllerTests(unittest.TestCase):
         yaw = math.radians(170.0)
         q = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         np.testing.assert_allclose(
-            quaternion_attitude_error(q, yaw), (0.0, 0.0, 0.0), atol=1e-12
+            level_error(q, yaw), (0.0, 0.0, 0.0), atol=1e-12
         )
         # 170 deg heading vs a -170 deg reference is a 20 deg (not 340) error.
-        error = quaternion_attitude_error(q, math.radians(-170.0))
+        error = level_error(q, math.radians(-170.0))
         np.testing.assert_allclose(error, (0.0, 0.0, math.radians(-20.0)), atol=1e-12)
         # Negated quaternion is the same attitude.
         negated = tuple(-v for v in q)
         np.testing.assert_allclose(
-            quaternion_attitude_error(negated, 0.0), quaternion_attitude_error(q, 0.0)
+            level_error(negated, 0.0), level_error(q, 0.0)
         )
 
     def test_gyroscopic_torque_is_rate_cross_total_momentum(self) -> None:
