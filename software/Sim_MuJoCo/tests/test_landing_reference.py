@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from jumper_sim.controller import quaternion_attitude_error, quaternion_error
+from jumper_sim.controller import quaternion_error
 from jumper_sim.depth_camera import CameraMount, DepthCameraSpec, DepthFrame
 from jumper_sim.landing_reference import (
     LandingReference,
@@ -210,7 +210,7 @@ class ReferenceAttitudeTests(unittest.TestCase):
         yaw = 0.8
         np.testing.assert_allclose(
             quaternion_error(q, (math.cos(yaw / 2), 0, 0, math.sin(yaw / 2))),
-            quaternion_attitude_error(q, yaw),
+            quaternion_error(q, tilted_reference_quaternion(np.array([0.0, 0.0, 1.0]), yaw)),
         )
         reference = tilted_reference_quaternion(normal_of(0.2, 0.1), yaw)
         np.testing.assert_allclose(quaternion_error(reference, reference), (0, 0, 0), atol=1e-12)

@@ -1,3 +1,4 @@
 usd-core
 trimesh
 scipy
+pillow

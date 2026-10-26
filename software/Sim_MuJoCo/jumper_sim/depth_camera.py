@@ -5,13 +5,14 @@ The camera is a MuJoCo ``<site>`` on the robot. Its optical axis is the site's
 site with the body's orientation on the bottom face looks straight down.
 
 Depth is produced by ray casting one ray per (decimated) pixel against the
-terrain. Two ray casters are provided:
-
-* :class:`HeightfieldRayCaster` -- vectorised ray marching against the terrain
-  heightfield. Fast enough for 30 Hz in the interactive viewer.
-* :class:`MujocoRayCaster` -- ``mj_multiRay`` against any geoms in a geom
-  group. Exact for any geometry, but ~30 us per ray on the 257x257 terrain
-  heightfield, so it is mainly a reference for testing.
+terrain with :class:`HeightfieldRayCaster`, an exact ray/heightfield
+intersection that is fast enough for 30 Hz in the interactive viewer.
+MuJoCo's own ``mj_multiRay`` gives the same distances (checked in the tests)
+but costs ~30 us per ray on the 257x257 terrain heightfield. Objects standing
+on the terrain (the scan target) are added to it as :class:`MeshRayCaster` s
+in ``HeightfieldRayCaster.objects``; the camera sees the nearest of all. Any
+object with a matching ``cast`` method (see :class:`RayCaster`) can be passed
+instead, e.g. for non-heightfield terrain.
 
 The output :class:`DepthFrame` is what a real D435 driver would hand over: a
 z-depth image (NaN where invalid), the intrinsics, a timestamp and the body
@@ -111,37 +112,15 @@ class DepthFrame:
     spec: DepthCameraSpec
     timestamp: float
     body_quaternion: tuple[float, float, float, float]  # IMU attitude (w, x, y, z)
+    # Robot origin (world) when the frame was taken. Sim ground truth, used
+    # to place points in the world; on the robot this comes from odometry.
+    body_position: tuple[float, float, float] | None = None
 
 
 class RayCaster(Protocol):
     def cast(self, origin: np.ndarray, directions: np.ndarray, max_range: float) -> np.ndarray:
         """Distance along each unit direction to the terrain; NaN for no hit."""
         ...
-
-
-class MujocoRayCaster:
-    """``mj_multiRay`` against the geoms in ``TERRAIN_GEOM_GROUP``."""
-
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        self._model = model
-        self._data = data
-        self._group = np.zeros(6, dtype=np.uint8)
-        self._group[TERRAIN_GEOM_GROUP] = 1
-
-    def cast(self, origin: np.ndarray, directions: np.ndarray, max_range: float) -> np.ndarray:
-        n = len(directions)
-        geom_ids = np.zeros(n, dtype=np.int32)
-        dist = np.zeros(n)
-        vec = np.ascontiguousarray(directions, dtype=float).ravel()
-        pnt = np.asarray(origin, dtype=float)
-        try:  # MuJoCo >= 3.3 has an extra optional "normal" output.
-            mujoco.mj_multiRay(self._model, self._data, pnt, vec, self._group, True,
-                               -1, geom_ids, dist, None, n, max_range)
-        except TypeError:
-            mujoco.mj_multiRay(self._model, self._data, pnt, vec, self._group, True,
-                               -1, geom_ids, dist, n, max_range)
-        dist[geom_ids < 0] = np.nan
-        return dist
 
 
 class HeightfieldRayCaster:
@@ -174,6 +153,8 @@ class HeightfieldRayCaster:
         self._dy = 2.0 * size_y / (rows - 1)
         self._rows, self._cols = rows, cols
         self._max_height = float(self._heights.max())
+        # Static meshes on the terrain the camera also sees (e.g. the target).
+        self.objects: list[MeshRayCaster] = []
 
     def height(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         """Terrain height at (x, y); NaN outside the heightfield."""
@@ -198,6 +179,14 @@ class HeightfieldRayCaster:
         return np.where(inside, h, np.nan)
 
     def cast(self, origin: np.ndarray, directions: np.ndarray, max_range: float) -> np.ndarray:
+        """Distance to the terrain or the nearest object on it; NaN for no hit."""
+        result = self.cast_terrain(origin, directions, max_range)
+        for obj in self.objects:
+            hit = obj.cast(origin, directions, max_range)
+            result = np.fmin(result, hit)  # fmin: a NaN (miss) never wins
+        return result
+
+    def cast_terrain(self, origin: np.ndarray, directions: np.ndarray, max_range: float) -> np.ndarray:
         """Exact ray/heightfield intersection.
 
         Along a ray the gap between ray and terrain is piecewise linear: it
@@ -254,12 +243,79 @@ class HeightfieldRayCaster:
         return result
 
     def max_height_near(self, x: float, y: float, radius: float) -> float:
-        """Highest terrain point within ``radius`` (square window) of (x, y)."""
+        """Highest terrain (or object) point within ``radius`` (square window) of (x, y)."""
+        top = -math.inf
+        for obj in self.objects:
+            if obj.near(x, y, radius):
+                top = max(top, obj.top)
         j0 = int(np.clip(np.floor((x - radius - self._x0) / self._dx), 0, self._cols - 1))
         j1 = int(np.clip(np.ceil((x + radius - self._x0) / self._dx), 0, self._cols - 1))
         i0 = int(np.clip(np.floor((y - radius - self._y0) / self._dy), 0, self._rows - 1))
         i1 = int(np.clip(np.ceil((y + radius - self._y0) / self._dy), 0, self._rows - 1))
-        return float(self._heights[i0 : i1 + 1, j0 : j1 + 1].max())
+        return max(top, float(self._heights[i0 : i1 + 1, j0 : j1 + 1].max()))
+
+
+class MeshRayCaster:
+    """Exact ray/triangle intersection (Moller-Trumbore) with a static mesh.
+
+    Only rays passing the mesh's bounding sphere are tested against its
+    triangles, so a small object far from the view costs next to nothing.
+    """
+
+    CHUNK = 64  # rays tested against all triangles at once
+
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray) -> None:
+        vertices = np.asarray(vertices, float)
+        faces = np.asarray(faces, int)
+        self._v0 = vertices[faces[:, 0]]
+        self._e1 = vertices[faces[:, 1]] - self._v0
+        self._e2 = vertices[faces[:, 2]] - self._v0
+        lower, upper = vertices.min(axis=0), vertices.max(axis=0)
+        self.centre = 0.5 * (lower + upper)
+        self.radius = float(np.linalg.norm(vertices - self.centre, axis=1).max())
+        self.top = float(upper[2])
+        self._lower, self._upper = lower, upper
+
+    @classmethod
+    def from_model(cls, model: mujoco.MjModel, geom_id: int) -> "MeshRayCaster":
+        """World-frame triangles of a static (world body) mesh geom."""
+        mesh = int(model.geom_dataid[geom_id])
+        vadr, vnum = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
+        fadr, fnum = int(model.mesh_faceadr[mesh]), int(model.mesh_facenum[mesh])
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, model.geom_quat[geom_id])
+        vertices = model.mesh_vert[vadr : vadr + vnum] @ rotation.reshape(3, 3).T + model.geom_pos[geom_id]
+        return cls(vertices, model.mesh_face[fadr : fadr + fnum])
+
+    def near(self, x: float, y: float, radius: float) -> bool:
+        return bool(
+            x + radius >= self._lower[0] and x - radius <= self._upper[0]
+            and y + radius >= self._lower[1] and y - radius <= self._upper[1]
+        )
+
+    def cast(self, origin: np.ndarray, directions: np.ndarray, max_range: float) -> np.ndarray:
+        origin = np.asarray(origin, float)
+        result = np.full(len(directions), np.nan)
+        to_centre = self.centre - origin
+        along = directions @ to_centre
+        miss_sq = float(to_centre @ to_centre) - along**2
+        candidates = np.flatnonzero((miss_sq <= self.radius**2) & (along + self.radius > 0.0))
+        for start in range(0, len(candidates), self.CHUNK):
+            rays = candidates[start : start + self.CHUNK]
+            d = directions[rays][:, None, :]  # (r, 1, 3)
+            p = np.cross(d, self._e2[None])  # (r, f, 3)
+            det = np.einsum("fk,rfk->rf", self._e1, p)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                inv = 1.0 / det
+                s = origin - self._v0  # (f, 3)
+                u = np.einsum("fk,rfk->rf", s, p) * inv
+                q = np.cross(s, self._e1)  # (f, 3)
+                v = np.einsum("rk,fk->rf", directions[rays], q) * inv
+                t = np.einsum("fk,fk->f", self._e2, q)[None] * inv
+            ok = (np.abs(det) > 1e-12) & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 0) & (t <= max_range)
+            t = np.where(ok, t, np.inf).min(axis=1)
+            result[rays] = np.where(np.isfinite(t), t, np.nan)
+        return result
 
 
 class SimulatedDepthCamera:
@@ -278,7 +334,7 @@ class SimulatedDepthCamera:
         self.mount = CameraMount.from_model(model, site_name)
         self._model = model
         self._site_id = _required(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
-        self._qpos_address = int(model.jnt_qposadr[root_joint_id])
+        self._body_id = int(model.jnt_bodyid[root_joint_id])
         self._ray_caster = ray_caster or HeightfieldRayCaster(model)
         self._optical_rays = spec.optical_rays()
         self._site_rays = self._optical_rays @ SITE_FROM_OPTICAL.T
@@ -317,12 +373,15 @@ class SimulatedDepthCamera:
             depth[self._rng.random(depth.shape) < self.spec.dropout_probability] = np.nan
         with np.errstate(invalid="ignore"):
             depth[(depth < self.spec.min_range) | (depth > self.spec.max_range)] = np.nan
-        q = data.qpos[self._qpos_address + 3 : self._qpos_address + 7]
+        # Tag the frame with the pose the rays were cast from: the body's
+        # kinematics (xquat/xpos), which match site_xpos/xmat. (Right after
+        # mj_step, qpos is already one step further than those.)
         return DepthFrame(
             depth=depth.reshape(self.spec.height, self.spec.width),
             spec=self.spec,
             timestamp=float(data.time),
-            body_quaternion=tuple(float(v) for v in q),
+            body_quaternion=tuple(float(v) for v in data.xquat[self._body_id]),
+            body_position=tuple(float(v) for v in data.xpos[self._body_id]),
         )
 
 

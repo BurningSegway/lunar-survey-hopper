@@ -74,15 +74,15 @@ class LqrLimits:
 
 @dataclass(frozen=True)
 class LqrWeights:
-    """Raw LQR weights. Prefer building them with :class:`LqrLimits`."""
+    """Raw LQR weights; build them with :meth:`LqrLimits.to_weights`."""
 
-    angle: float = 100.0
-    angular_rate: float = 1.0
-    torque: float = 1.0
+    angle: float
+    angular_rate: float
+    torque: float
     # Weight on the integrated angle error (LQI); 0 disables the integrator.
     # It removes the steady error left by bearing friction the feedforward in
     # wheel_friction_compensation() does not cancel (unknown or drifting b).
-    integral: float = 1000.0
+    integral: float
     integral_torque_limit: float = 0.8  # N*m, anti-windup clamp
     # Only integrate while |angle error| is below this [rad], so large
     # transients do not wind the integrator up (integral separation).
@@ -238,9 +238,9 @@ class LqrController:
     ``axis_inertia`` is the inertia the wheels actually push against on each
     body axis (roll, pitch, yaw). Passing ``gyroscopic_inertia`` (from
     :func:`robot_inertia`) also supplies it, and adds the w x H gyroscopic
-    feedforward from :func:`gyroscopic_torque`. Use :func:`attitude_plant_inertia` to take it
-    from the MuJoCo model; when omitted, ``tuning.robot_inertia`` is used for
-    all three axes.
+    feedforward from :func:`gyroscopic_torque`. When neither is given,
+    ``tuning.robot_inertia`` is used for all three axes. ``weights`` default
+    to :class:`LqrLimits` ``().to_weights(tuning)``.
 
     With ``weights.integral > 0`` the state is augmented with the integrated
     angle error (LQI), which removes steady attitude errors from constant
@@ -251,10 +251,12 @@ class LqrController:
     def __init__(
         self,
         tuning: ReactionWheelTuning,
-        weights: LqrWeights = LqrWeights(),
+        weights: LqrWeights | None = None,
         axis_inertia: AxisInertia | None = None,
         gyroscopic_inertia: "RobotInertia | None" = None,
     ) -> None:
+        if weights is None:
+            weights = LqrLimits().to_weights(tuning)
         self._gyroscopic_inertia = gyroscopic_inertia
         if axis_inertia is None and gyroscopic_inertia is not None:
             axis_inertia = gyroscopic_inertia.plant_axis_inertia
@@ -331,22 +333,19 @@ class LqrController:
     ) -> tuple[float, float, float]:
         """Return (integral gain, angle gain, rate gain) for one axis."""
         if weights.integral == 0.0:
-            # Double integrator: closed-form Riccati solution.
-            p_angle_rate = inertia * math.sqrt(weights.torque * weights.angle)
-            p_rate = inertia * math.sqrt(
-                weights.torque * (2.0 * p_angle_rate + weights.angular_rate)
-            )
-            return (
-                0.0,
-                p_angle_rate / (weights.torque * inertia),
-                p_rate / (weights.torque * inertia),
-            )
-        # State [integrated angle, angle, rate].
-        a = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
-        b = np.array([[0.0], [0.0], [1.0 / inertia]])
-        q = np.diag([weights.integral, weights.angle, weights.angular_rate])
+            # State [angle, rate]: double integrator.
+            a = np.array([[0.0, 1.0], [0.0, 0.0]])
+            b = np.array([[0.0], [1.0 / inertia]])
+            q = np.diag([weights.angle, weights.angular_rate])
+        else:
+            # State [integrated angle, angle, rate].
+            a = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+            b = np.array([[0.0], [0.0], [1.0 / inertia]])
+            q = np.diag([weights.integral, weights.angle, weights.angular_rate])
         p = solve_continuous_are(a, b, q, np.array([[weights.torque]]))
         k = (b.T @ p / weights.torque).ravel()
+        if weights.integral == 0.0:
+            return 0.0, float(k[0]), float(k[1])
         return float(k[0]), float(k[1]), float(k[2])
 
 
@@ -423,23 +422,6 @@ def robot_inertia(
         rigid_body=tuple(tuple(float(v) for v in row) for row in inertia_body),
         wheel_spin=tuple(wheel_spin),
     )
-
-
-def attitude_plant_inertia(
-    model: mujoco.MjModel,
-    root_joint_id: int,
-    wheel_joint_ids: tuple[int, int, int],
-) -> AxisInertia:
-    """Inertia about the whole-robot CoM that each reaction wheel drives.
-
-    Evaluated at the model's reference pose: the rotational inertia of every
-    body in the robot (box, legs, foot, and all three wheels as rigid masses)
-    about the combined centre of mass, expressed in the root body frame, minus
-    the spin inertia of the wheel on that axis (that wheel's spin is the
-    actuated DOF, so it is not part of the rigid body the motor reacts
-    against).
-    """
-    return robot_inertia(model, root_joint_id, wheel_joint_ids).plant_axis_inertia
 
 
 def gyroscopic_torque(
@@ -530,18 +512,6 @@ def read_wheel_speeds(
 
 def wrapped_yaw_error(yaw: float, reference: float) -> float:
     return math.remainder(yaw - reference, 2.0 * math.pi)
-
-
-def quaternion_attitude_error(
-    quaternion: tuple[float, float, float, float], yaw_reference: float
-) -> tuple[float, float, float]:
-    """Attitude error from a level reference with heading ``yaw_reference``.
-
-    See :func:`quaternion_error`; this is the special case of a level
-    reference, q_ref = rotation by ``yaw_reference`` about world z.
-    """
-    half = 0.5 * yaw_reference
-    return quaternion_error(quaternion, (math.cos(half), 0.0, 0.0, math.sin(half)))
 
 
 def quaternion_error(

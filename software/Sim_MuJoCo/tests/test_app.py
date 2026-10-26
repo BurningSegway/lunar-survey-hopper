@@ -1,6 +1,7 @@
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 import io
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -11,20 +12,21 @@ import mujoco
 import numpy as np
 
 from jumper_sim import app
+from jumper_sim.pointcloud import read_ply
 from jumper_sim.simulation import JumperSimulation, ReactionWheelTuning
 from jumper_sim.telemetry import TelemetryPayload
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 TERRAIN_ASSETS = (
     MODEL_PATH.parent / "terrain.obj",
-    MODEL_PATH.parent / "terrain_height.png",
+    MODEL_PATH.parent / "terrain_height.bin",
 )
 
 
 @unittest.skipUnless(
     MODEL_PATH.is_file() and all(path.is_file() for path in TERRAIN_ASSETS),
-    "Generate build/terrain.obj and terrain_height.png from "
-    "build/terrain_merged.usd before running app tests.",
+    "Generate build/terrain.obj and terrain_height.bin from "
+    "build/convert_usd.py before running app tests.",
 )
 class ViewerApplicationTests(unittest.TestCase):
     def test_gravity_cannot_be_selected_at_launch(self) -> None:
@@ -37,7 +39,6 @@ class ViewerApplicationTests(unittest.TestCase):
     def test_keyboard_callback_drives_simulation_and_telemetry(self) -> None:
         messages: list[str] = []
         telemetry_payloads: list[TelemetryPayload] = []
-        indicator_states: list[bool] = []
         simulated_data: list[mujoco.MjData] = []
         viewer_cameras: list[SimpleNamespace] = []
         base_body_ids: list[int] = []
@@ -54,16 +55,6 @@ class ViewerApplicationTests(unittest.TestCase):
 
             def send(self, payload: TelemetryPayload) -> None:
                 telemetry_payloads.append(payload)
-
-            def close(self) -> None:
-                pass
-
-        class FakeIndicator:
-            def __init__(self) -> None:
-                pass
-
-            def update(self, active: bool) -> None:
-                indicator_states.append(active)
 
             def close(self) -> None:
                 pass
@@ -96,7 +87,6 @@ class ViewerApplicationTests(unittest.TestCase):
                     for key in (
                         glfw.KEY_BACKSPACE,
                         glfw.KEY_SPACE,
-                        glfw.KEY_ENTER,
                         glfw.KEY_C,
                         glfw.KEY_X,
                         glfw.KEY_C,
@@ -145,16 +135,59 @@ class ViewerApplicationTests(unittest.TestCase):
                 )
             return original_handle_key(simulation, key)
 
+        windows = []
+
+        class FakeWindow:
+            def __init__(self, command, **kwargs) -> None:
+                self.command = command
+                self.terminated = False
+                windows.append(self)
+
+            def poll(self):
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        windows = []
+
+        class FakeWindow:
+            def __init__(self, command, **kwargs) -> None:
+                self.command = command
+                self.terminated = False
+                windows.append(self)
+
+            def poll(self):
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
         with (
             patch.object(app.mujoco.viewer, "launch_passive", launch_passive),
             patch.object(app, "UdpTelemetry", FakeTelemetry),
-            patch.object(app, "RelaxationIndicator", FakeIndicator),
             patch.object(JumperSimulation, "handle_key", record_state_on_backspace),
             patch.object(app.time, "sleep"),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            tempfile.TemporaryDirectory() as scan_dir,
+            patch.object(app.subprocess, "Popen", FakeWindow),
         ):
-            result = app.main(["--controller", "lqr"])
+            scan_file = Path(scan_dir) / "scan.ply"
+            scan_file.write_bytes(b"points from an earlier run")
+            result = app.main(["--controller", "lqr", "--scan-file", str(scan_file)])
             messages.append(stdout.getvalue())
+            # A new run starts a fresh (empty) cloud in the scan file.
+            self.assertEqual(len(read_ply(scan_file)), 0)
+        # The live point cloud window is started on the scan file and closed
+        # again when the viewer exits.
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].command[1:4], ["-m", "jumper_sim.cloud_viewer", str(scan_file)])
+        self.assertTrue(windows[0].terminated)
+        # The live point cloud window is started on the scan file and closed
+        # again when the viewer exits.
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].command[1:4], ["-m", "jumper_sim.cloud_viewer", str(scan_file)])
+        self.assertTrue(windows[0].terminated)
 
         self.assertEqual(result, 0)
         self.assertGreater(simulated_data[0].time, 0.0)
@@ -176,20 +209,21 @@ class ViewerApplicationTests(unittest.TestCase):
         np.testing.assert_array_equal(before[2], after[2])
         self.assertEqual(before[3], after[3])
         self.assertEqual(len(telemetry_payloads), 2)
-        self.assertEqual(len(indicator_states), 2)
         self.assertAlmostEqual(
             telemetry_payloads[0]["sat_max"],
             ReactionWheelTuning().max_wheel_velocity,
         )
         for expected in (
             "[CONTROLLER] Selected: lqr",
-            "[GRAVITY] Selected: earth",
+            "[GRAVITY] Selected: moon",
             "[JUMP INITIATED]",
-            "[TILT] Front-leg shortening is ON",
-            "[GRAVITY] Switched to Moon",
+            "[GRAVITY] Switched to Earth",
             "[CONTROLLER] Disabled",
             "[CONTROLLER] Attitude stabilization enabled",
             "[RESET] Simulation reset",
+            "[SCAN] Target point cloud",
+            "[SCAN] Point cloud window opened",
+            "[SCAN] Point cloud window opened",
         ):
             self.assertIn(expected, messages[0])
 
