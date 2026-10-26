@@ -6,7 +6,7 @@ Drawn into a ``mujoco.MjvScene`` (the passive viewer's ``user_scn``):
   fitting region: orange when that fit updated the reference, grey when it
   did not (too far away to trust, frozen just before touchdown, rejected as
   an outlier) or while the robot is in contact and the estimate is held;
-* a green arrow along the filtered reference normal the LQR aligns body z to;
+* a green arrow along the filtered reference normal the controller aligns body z to;
 * small blue dots: a sample of the depth points the fit used;
 * the camera's tracking target (red sphere) while a hop is under way, with a
   red line from the camera to it during the ascent;

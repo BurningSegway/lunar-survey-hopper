@@ -22,7 +22,6 @@ from .controller import (
     read_wheel_speeds,
     robot_inertia,
     wheel_friction_compensation,
-    wrapped_yaw_error,
 )
 from .flight_phase import FlightPhase, FlightPhaseDetector, gravity_magnitude
 from .flight_reference import FlightReference, FlightReferenceConfig
@@ -205,7 +204,7 @@ class JumperSimulation:
         landing_reference: bool = True,
         contact_gating: bool = True,
         flight_reference: bool = True,
-        track_target: tuple[float, float, float] | None = None,
+        track_target: tuple[float, float] | None = None,
         target_scan: PointCloudRecorder | None = None,
         gravity: float = MOON_GRAVITY,
     ) -> None:
@@ -233,19 +232,21 @@ class JumperSimulation:
         # Only the LQR cancels bearing friction: the PID gains were tuned with
         # that friction acting as extra rate damping, and lose damping without it.
         self.compensate_wheel_friction = controller_name == "lqr"
-        # LQR only: roll/pitch reference from the downward depth camera.
+        # Both controllers run the same hop process (camera landing reference,
+        # contact gating, target tracking, jump aim, scan) so they can be
+        # compared; only the control law differs.
+        # Roll/pitch reference from the downward depth camera.
         self.landing_reference: CameraLandingReference | None = None
         if (
             landing_reference
-            and controller_name == "lqr"
             and mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, CAMERA_SITE) >= 0
         ):
             self.landing_reference = CameraLandingReference(model, self.ids.root_joint)
         self._robot_geoms = _robot_geom_mask(model, self.ids.root_joint)
         self._terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM)
-        # LQR only: attitude control in flight, wheel momentum bleed-off in
-        # contact (replaces the stationary-for-a-while rest trigger).
-        self.contact_gating = contact_gating and controller_name == "lqr"
+        # Attitude control in flight, wheel momentum bleed-off in contact
+        # (replaces the stationary-for-a-while rest trigger).
+        self.contact_gating = contact_gating
         self.in_contact = False
         self._time_without_contact = math.inf
         self.contact_phases = 0
@@ -256,7 +257,9 @@ class JumperSimulation:
         self._camera_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, CAMERA_SITE)
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
-            self.flight_reference = FlightReference(FlightReferenceConfig(), track_target)
+            self.flight_reference = FlightReference(
+                FlightReferenceConfig(), track_target, self._ground_height
+            )
         self._jump_command = False  # given since the last phase update
         self._frozen_at_descent = 0  # landing-filter freezes before this descent
         self.flight_events: list[str] = []
@@ -288,6 +291,12 @@ class JumperSimulation:
             model.mesh_quat[model.geom_dataid[self._target_geom]].copy()
             if self._target_geom >= 0 else None
         )
+        # Its longest dimension: the radius of the scan's keep sphere.
+        self._target_length = (
+            float(np.ptp(self._target_upright(), axis=0).max())
+            if self._target_geom >= 0 else None
+        )
+        self._target_centre: np.ndarray | None = None  # placed object's centre
         self._place_target_object(track_target)
         # Optional: point cloud of the target from on-target ascent frames.
         # Own camera instance (full frames, own noise stream) so the landing
@@ -317,10 +326,9 @@ class JumperSimulation:
             if not self.jump_triggered:
                 self.jump_triggered = True
                 self.jump_start_time = float(self.data.time)
-                if self.controller_name == "lqr":
-                    # Start each flight with an empty integrator rather than
-                    # whatever it collected while standing on the ground.
-                    self.controller.reset()
+                # Start each flight with an empty integrator rather than
+                # whatever it collected while standing on the ground.
+                self.controller.reset()
                 if self.landing_reference is not None:
                     self.landing_reference.reset(float(self.data.time))
                 self._jump_command = True  # GROUND -> TAKEOFF
@@ -385,8 +393,8 @@ class JumperSimulation:
             self.flight_reference.tracking = False
             self.flight_reference.active_target = None
 
-    def set_track_target(self, target: tuple[float, float, float] | None) -> None:
-        """World point the camera tracks during ascent (None: default point)."""
+    def set_track_target(self, target: tuple[float, float] | None) -> None:
+        """Ground position (x, y) the camera tracks during ascent (None: default)."""
         if self.flight_reference is not None:
             self.flight_reference.set_target(target)
         self._place_target_object(target)
@@ -399,6 +407,7 @@ class JumperSimulation:
         if terrain is not None:
             terrain.objects = []
         self.model.geom_quat[self._target_geom] = self._target_quat
+        self._target_centre = None
         if target is None or terrain is None:
             self.model.geom_pos[self._target_geom] = self._target_offset - (0.0, 0.0, TARGET_PARKED_DEPTH)
             return
@@ -428,15 +437,34 @@ class JumperSimulation:
             rotation.reshape(3, 3) @ self._target_offset + (x, y, float(base))
         )
         terrain.objects = [MeshRayCaster.from_model(self.model, self._target_geom)]
+        self._target_centre = terrain.objects[0].centre.copy()
+
+    def _ground_height(self, x: float, y: float) -> float:
+        """Terrain height at (x, y); NaN off the terrain or without a camera."""
+        terrain = self._terrain_ray_caster()
+        if terrain is None:
+            return math.nan
+        return float(terrain.height(np.array([x]), np.array([y]))[0])
+
+    @property
+    def track_target_point(self) -> np.ndarray | None:
+        """The point a set track target makes the camera track (None: default)."""
+        if self.flight_reference is None or self.flight_reference.target_setting is None:
+            return None
+        return self.flight_reference.target_setting.copy()
 
     def _target_footprint(self) -> np.ndarray:
         """Horizontal extent of the upright object around its base (x, y)."""
+        return self._target_upright()[:, :2]
+
+    def _target_upright(self) -> np.ndarray:
+        """The object's vertices upright, relative to its base."""
         mesh = int(self.model.geom_dataid[self._target_geom])
         adr, num = int(self.model.mesh_vertadr[mesh]), int(self.model.mesh_vertnum[mesh])
         rotation = np.zeros(9)
         mujoco.mju_quat2Mat(rotation, self._target_quat)
         upright = self.model.mesh_vert[adr : adr + num] @ rotation.reshape(3, 3).T
-        return (upright + self._target_offset)[:, :2]
+        return upright + self._target_offset
 
     def _terrain_ray_caster(self) -> HeightfieldRayCaster | None:
         """The ray caster the depth cameras share (None without a camera)."""
@@ -557,6 +585,14 @@ class JumperSimulation:
                 if track:
                     if self.target_scan is not None:
                         self.target_scan.start_jump()
+                        # Keep only points on and right around the target: a
+                        # sphere the target object's length around its centre
+                        # (without the object, around the tracked point).
+                        self.target_scan.keep_within(
+                            self._target_centre if self._target_centre is not None
+                            else self.flight_reference.active_target,
+                            self._target_length,
+                        )
                         self._scan_open = True
                         self._scan_next = float(self.data.time)
                         self._scan_points_before = self.target_scan.point_count
@@ -749,8 +785,7 @@ class JumperSimulation:
             ):
                 self.wheel_rest_controller.begin(self.read_wheel_speeds())
                 self.wheel_control_mode = WheelControlMode.RESTING
-                if self.controller_name == "lqr":
-                    self.controller.reset()
+                self.controller.reset()
         else:
             self._stationary_duration = 0.0
             if self.wheel_control_mode is WheelControlMode.RESTING:
@@ -760,19 +795,15 @@ class JumperSimulation:
     def _apply_controls(self) -> None:
         if self.wheel_control_mode is not WheelControlMode.DISABLED:
             sensor = read_simulated_imu(self.model, self.data, self.ids.root_joint)
-            if self.controller_name == "lqr":
-                # The LQR works on the body-frame quaternion error, which lines
-                # up with the gyro rates and wheel axes at any attitude.
-                qpos_address = self.model.jnt_qposadr[self.ids.root_joint]
-                quaternion = self.data.qpos[qpos_address + 3 : qpos_address + 7]
-                error = quaternion_error(
-                    tuple(float(v) for v in quaternion), self.reference_quaternion()
-                )
-                sensor = replace(sensor, roll=error[0], pitch=error[1], yaw=error[2])
-            else:
-                sensor = replace(
-                    sensor, yaw=wrapped_yaw_error(sensor.yaw, self.yaw_reference)
-                )
+            # Both controllers work on the body-frame quaternion error to the
+            # reference attitude, which lines up with the gyro rates and wheel
+            # axes at any attitude.
+            qpos_address = self.model.jnt_qposadr[self.ids.root_joint]
+            quaternion = self.data.qpos[qpos_address + 3 : qpos_address + 7]
+            error = quaternion_error(
+                tuple(float(v) for v in quaternion), self.reference_quaternion()
+            )
+            sensor = replace(sensor, roll=error[0], pitch=error[1], yaw=error[2])
             wheel_speeds = self.read_wheel_speeds()
             torques = self.controller.compute_torque(
                 sensor, wheel_speeds, float(self.model.opt.timestep)

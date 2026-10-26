@@ -51,7 +51,7 @@ class LandingReferenceConfig:
     # correlated; never let the fused estimate claim more certainty than this.
     min_reference_sigma: float = math.radians(1.0)
     # Freeze the reference shortly before touchdown: close-range fits only see
-    # part of the disc, and a late change is one the LQR cannot follow anyway.
+    # part of the disc, and a late change is one the controller cannot follow anyway.
     freeze_height: float = 1.0  # m of plane below the robot
     freeze_time: float = 0.3  # s to touchdown at the measured descent rate
 

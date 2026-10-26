@@ -23,6 +23,10 @@ from .visualization import draw_flight_target, draw_landing_plane, draw_target_s
 FRAME_PERIOD = 1.0 / 60.0
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 SCAN_PATH = Path(__file__).resolve().parents[1] / "pointclouds" / "target_scan.ply"
+# Default track target: a random ground position this far from the spawn, at
+# least RANDOM_TARGET_MIN_DISTANCE away so the object is clear of the robot.
+RANDOM_TARGET_RADIUS = 20.0  # m
+RANDOM_TARGET_MIN_DISTANCE = 2.0  # m
 KEY_NAMES = {
     glfw.KEY_SPACE: "space",
     glfw.KEY_BACKSPACE: "backspace",
@@ -45,15 +49,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--model", type=Path, default=MODEL_PATH,
         help=f"MuJoCo MJCF path (default: {MODEL_PATH})",
     )
-    parser.add_argument(
-        "--track-target", type=float, nargs=3, metavar=("X", "Y", "Z"), default=None,
-        help="world point the camera tracks during a jump's ascent (LQR only; "
-        "default: 3 m ahead of the take-off point, at ground height)",
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument(
+        "--track-target", type=float, nargs=2, metavar=("X", "Y"), default=None,
+        help="ground position the camera tracks during a jump's ascent, 0.15 m "
+        "above the terrain there (default: a random point within "
+        f"{RANDOM_TARGET_RADIUS:g} m of the spawn)",
+    )
+    target.add_argument(
+        "--no-target", action="store_true",
+        help="no target: no target object, and the camera tracks a point 3 m "
+        "ahead of the take-off point",
     )
     parser.add_argument(
         "--scan-file", type=Path, default=SCAN_PATH,
         help="PLY file for the target point cloud collected during tracked ascents; "
-        "emptied at start-up, every jump of the run adds to it (LQR only; "
+        "emptied at start-up, every jump of the run adds to it ("
         f"default: {SCAN_PATH})",
     )
     parser.add_argument(
@@ -94,20 +105,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
     target_scan = None
-    if not args.no_scan and args.controller == "lqr":
+    if not args.no_scan:
         target_scan = PointCloudRecorder(
             args.scan_file.expanduser().resolve(), ScanConfig(math.radians(args.scan_margin))
         )
+    track_target = None if args.track_target is None else tuple(args.track_target)
+    random_target = track_target is None and not args.no_target
+    if random_target:
+        track_target = random_target_near(spawn_position(model, data))
     simulation = JumperSimulation(
         model, data, args.controller,
-        track_target=None if args.track_target is None else tuple(args.track_target),
+        track_target=track_target,
         target_scan=target_scan,
     )
     if simulation.target_scan is not None:
         simulation.target_scan.start_run()  # this run starts a fresh cloud
     scan_window = None
     if simulation.target_scan is not None and not args.no_scan_window:
-        scan_window = open_scan_window(simulation.target_scan.path, args.track_target)
+        scan_window = open_scan_window(simulation.target_scan.path, simulation.track_target_point)
     state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
     last_state = np.empty(mujoco.mj_stateSize(model, state_spec))
     mujoco.mj_getState(model, data, last_state, state_spec)
@@ -128,7 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print("[TELEMETRY] Streaming PlotJuggler data to 127.0.0.1:9870")
     if simulation.contact_gating:
-        print("[CONTACT] LQR is gated: attitude control in flight, wheel bleed-off in contact")
+        print(f"[CONTACT] {args.controller.upper()} is gated: attitude control in flight, wheel bleed-off in contact")
     if simulation.landing_reference is not None:
         print(
             "[CAMERA] Landing plane overlay: disc = latest fit (orange = used, "
@@ -136,12 +151,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if simulation.flight_reference is not None:
         target = (
-            "3 m ahead of the take-off point" if args.track_target is None
-            else "({:.2f}, {:.2f}, {:.2f})".format(*args.track_target)
+            "3 m ahead of the take-off point" if simulation.track_target_point is None
+            else "({:.2f}, {:.2f}, {:.2f})".format(*simulation.track_target_point)
         )
         print(
             f"[FLIGHT] Jumps: camera tracks {target} on the way up (red sphere), "
             "then levels and aligns with the ground seen on the way down"
+        )
+    if random_target:
+        print(
+            f"[TARGET] Random target within {RANDOM_TARGET_RADIUS:g} m of the spawn: "
+            "--track-target {:.2f} {:.2f} repeats it, --no-target turns it off".format(*track_target)
         )
     if simulation.target_scan is not None:
         print(
@@ -156,6 +176,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         if scan_window is not None and scan_window.poll() is None:
             scan_window.terminate()
     return 0
+
+
+def spawn_position(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[float, float]:
+    """Ground position (x, y) of the robot's root joint at start-up."""
+    root = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "root")
+    if root < 0:
+        return (0.0, 0.0)
+    adr = int(model.jnt_qposadr[root])
+    return (float(data.qpos[adr]), float(data.qpos[adr + 1]))
+
+
+def random_target_near(
+    centre: Sequence[float],
+    radius: float = RANDOM_TARGET_RADIUS,
+    min_distance: float = RANDOM_TARGET_MIN_DISTANCE,
+    rng: np.random.Generator | None = None,
+) -> tuple[float, float]:
+    """Uniformly random ground position between ``min_distance`` and ``radius`` of ``centre``."""
+    rng = np.random.default_rng() if rng is None else rng
+    distance = math.sqrt(rng.uniform(min_distance**2, radius**2))  # uniform over the area
+    heading = rng.uniform(0.0, 2.0 * math.pi)
+    return (
+        float(centre[0]) + distance * math.cos(heading),
+        float(centre[1]) + distance * math.sin(heading),
+    )
 
 
 def open_scan_window(path: Path, target: Sequence[float] | None) -> subprocess.Popen | None:

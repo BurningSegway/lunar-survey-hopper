@@ -85,10 +85,16 @@ Options:
 - `--model PATH` loads another compatible MJCF (default:
   `build/Jumping_Robot.xml`). It must provide the simulator's named root,
   reaction-wheel, jump, and tilt joints/actuators.
-- `--track-target X Y Z` sets the world point the camera tracks during a
-  jump's ascent (LQR only; default: 3 m ahead of the take-off point, at
-  ground height).
-- `--scan-file PATH` is where the target point cloud is written (LQR only;
+- `--track-target X Y` sets the ground position the camera tracks during a
+  jump's ascent. The tracked point is 0.15 m above the terrain
+  there (`aim_height` in `FlightReferenceConfig`), so it is never in the air
+  or below the ground; off the terrain the take-off ground height is used.
+  Without it, a random target is chosen 2-20 m from the spawn
+  (`RANDOM_TARGET_RADIUS` in `jumper_sim/app.py`) and printed as
+  `[TARGET] ... --track-target X Y` so the run can be repeated.
+- `--no-target` uses no target: no target object, and the camera tracks a
+  point 3 m ahead of the take-off point.
+- `--scan-file PATH` is where the target point cloud is written (
   default: `pointclouds/target_scan.ply`). `--scan-margin DEG` (default 5)
   sets how close to the target the camera must point for a frame to count;
   `--no-scan` turns scanning off. `--no-scan-window` keeps the file but
@@ -119,19 +125,30 @@ roll, pitch, and yaw, their references, and X/Y/Z wheel speeds in rad/s.
 Start PlotJuggler's UDP Server listening on port `9870` before launching the
 simulator.
 
-## Contact gating (LQR only)
+## One hop process for both controllers
 
-The LQR only controls attitude in flight. From the first step any part of the
+PID and LQR run the same hop process, so they can be compared on equal
+terms: contact gating, the hop phases and attitude reference, leaning
+towards the target, the target object and scan, and the camera landing
+reference below all apply to both. Both regulate the body-frame quaternion
+error to the reference attitude; only the control law differs, plus wheel
+friction compensation, which only the LQR uses (the PID gains were tuned with
+bearing friction acting as damping). The PID tracks the target less tightly:
+2.7-4.6 deg off at the apex of Moon hops against ~0.1 deg for the LQR, close
+to the scan's 5 deg margin, so it collects fewer scan frames.
+
+## Contact gating
+
+The controller only controls attitude in flight. From the first step any part of the
 robot touches the terrain it is "in contact": attitude control stops, the
 integrator resets and the wheel-rest ramp bleeds the wheels' momentum into
-the ground (this replaces the stationary-for-1-s rest trigger for the LQR).
+the ground (this replaces the stationary-for-1-s rest trigger).
 It is airborne again after 60 ms without contact (`FLIGHT_DEBOUNCE`), so
-rocking on the legs or skidding is one contact phase; at lift-off the LQR
+rocking on the legs or skidding is one contact phase; at lift-off the controller
 resumes with a fresh integrator and the current heading as yaw reference.
-The PID keeps its previous behaviour. Disable with
-`JumperSimulation(..., contact_gating=False)`.
+Disable with `JumperSimulation(..., contact_gating=False)`.
 
-## Hop phases and attitude reference (LQR only)
+## Hop phases and attitude reference
 
 A hop runs through five phases; every behaviour switches on them, so none
 acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
@@ -165,11 +182,11 @@ follows it as the robot moves (red sphere and line of sight in the viewer;
 tilt capped at 60 deg); in DESCENT the reference moves back towards level,
 and as soon as the camera has fitted the ground below, to the landing plane
 (next section); LANDING holds it. The reference slews at most 180 deg/s, so
-the LQR never sees a reference step.
+the controller never sees a reference step.
 
 ### Leaning towards the target
 
-On the ground, with a track target set (`--track-target`), the robot leans
+On the ground, with a track target (set or random, not `--no-target`), the robot leans
 its body axis towards the target so the next jump heads that way (the jump
 spring pushes along the body axis). The lean is 3 deg near the target (so a
 hop always moves towards it, and close by goes over it) growing to 8 deg at
@@ -199,25 +216,28 @@ into the ground on release (see the open items).
 
 ### Target object
 
-With `--track-target X Y Z` a bright orange Stanford Bunny (0.3 m tall:
+At the track target (`--track-target X Y` or the random one) a bright orange
+Stanford Bunny (0.3 m tall:
 `build/target_bunny.obj` is 1.5 m, scaled by 0.2 in the MJCF; Stanford
 University Computer Graphics Laboratory, taken from MuJoCo's model collection)
 rests on the terrain at (X, Y), tilted to a plane fitted to the ground under
 it so it neither floats nor sinks in on slopes. The depth camera sees it (an
 exact ray/mesh test added to the heightfield ray caster, `MeshRayCaster` in
 `jumper_sim/depth_camera.py`), so it appears in the target point cloud and in
-landing-plane fits near it; the robot collides with its convex hull. Give Z
-about the middle of the bunny (ground height + 0.15) to aim the camera at it.
-Without a target it is hidden below the terrain. LQR only. From the spawn, a
-Moon hop towards the bunny 4 m away put 29 of 21668 scan points on it; at 8 m
-none (the scan's 53x30 rays land about 20 cm apart there; see `ScanConfig`).
+landing-plane fits near it; the robot collides with its convex hull. The
+camera aims at the middle of the bunny (0.15 m above the ground). With
+`--no-target` it is hidden below the terrain. From the spawn, an LQR Moon
+hop towards the bunny 4 m away keeps 26 scan points (19 on the bunny, 7 on
+the ground at its foot); at 8 m none land on it (the scan's 53x30 rays are
+about 20 cm apart there; see `ScanConfig`). The PID's hop to the same target
+keeps none: it stays outside the 5 deg scan margin.
 
 ### Tipped over
 
 On the ground (GROUND), when the body is tilted more than 60 deg, the robot
 counts as tipped over: all four legs are pulled in to the end of their
 stroke, leaning is off, and the console prints `[TIPPED]`. Below 45 deg it
-is upright again. LQR only.
+is upright again.
 
 This does not right the robot. Tested in Moon gravity with the robot lying
 on its side, none of these did either:
@@ -239,8 +259,12 @@ wheels, or legs that can push sideways.
 During each jump's ascent, every depth frame (53x30 rays, 30 Hz; set by
 `ScanConfig.width`/`height` in `jumper_sim/pointcloud.py`) taken
 with the camera axis within `--scan-margin` (5 deg) of the target direction
-is turned into world points and added to a cloud. Frames from the initial
-turn towards the target are skipped. The cloud is a binary PLY with `x y z`
+is turned into world points. Frames from the initial turn towards the
+target are skipped. Only points within the target object's length (its
+longest dimension, 0.3 m for the bunny) of its centre are added, so the cloud
+holds the bunny and the ground right at its foot; everything else the camera
+saw during the jump is discarded. With `--no-target` the sphere is centred on
+the point tracked on that jump. The cloud is a binary PLY with `x y z`
 (m, world), `jump` (jump number in this run) and `t` (sim time) per point.
 CloudCompare, MeshLab and Open3D read it.
 
@@ -252,7 +276,7 @@ CloudCompare, MeshLab and Open3D read it.
 - Cyan dots in the viewer show a sample of the cloud.
 - A live Open3D window (separate process) opens at start-up and redraws
   whenever the file changes, i.e. after every ascent. Points are coloured by
-  jump, the track target is a red sphere (when `--track-target` is given),
+  jump, the track target is a red sphere (unless `--no-target` is given),
   and axes mark the origin. The view fits the cloud once; after that your
   mouse view is kept (R refits). Run it on its own with
   `.venv/bin/python -m jumper_sim.cloud_viewer pointclouds/target_scan.ply`.
@@ -273,7 +297,7 @@ from jumper_sim.pointcloud import read_ply
 cloud = read_ply("pointclouds/target_scan.ply")  # fields x, y, z, jump, t
 ```
 
-## Landing reference from the depth camera (LQR only)
+## Landing reference from the depth camera
 
 A RealSense D435 stand-in (site `realsense` on the bottom face) looks down.
 During descent (or, without the hop reference, whenever airborne) it produces 30 Hz depth frames (106x60 rays,
@@ -281,7 +305,7 @@ During descent (or, without the hop reference, whenever airborne) it produces 30
 terrain heightfield. Each frame is fitted to the area-averaged ground plane
 in a 0.5 m-radius disc straight below the robot and fused in a small Kalman
 filter; fits whose depth noise is too large (above ~5-6 m) are ignored and
-the reference freezes when touchdown is < 1 m or < 0.3 s away. The LQR holds
+the reference freezes when touchdown is < 1 m or < 0.3 s away. The controller holds
 body z along that plane normal (clamped to 20 deg) with the usual yaw
 reference. Nothing updates in contact; a jump resets the reference to level.
 PlotJuggler's `roll_ref`/`pitch_ref` show it.

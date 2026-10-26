@@ -3,8 +3,9 @@
 * TAKEOFF (lift-off until 0.5 m up): the attitude the robot left the
   ground with is held.
 * ASCENT (only on flights started by a jump): the downward camera (body -z)
-  is pointed at a settable world target point and keeps tracking it as the
-  robot moves. The required tilt is capped at ``max_track_tilt``; heading
+  is pointed at a target point and keeps tracking it as the robot moves. The
+  target is set as a ground position (x, y); the tracked point is
+  ``aim_height`` above the ground there, so it is never in the air or buried. The required tilt is capped at ``max_track_tilt``; heading
   stays at the yaw reference.
 * DESCENT: the reference moves back towards level (the xy plane). As soon as
   the camera has fitted the ground below, the landing-plane reference from
@@ -13,13 +14,14 @@
   "level until the ground is seen, then the plane" falls out of it directly.
 * The commanded reference never jumps: it slews towards the desired one at
   ``slew_rate`` (also at lift-off, starting from the attitude the robot left
-  the ground with), so the LQR is not hit with large reference steps.
+  the ground with), so the controller is not hit with large reference steps.
 
 Pure numpy; meant to run unchanged on the robot.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 
@@ -36,9 +38,15 @@ class FlightReferenceConfig:
     max_track_tilt: float = math.radians(60.0)  # cap on tilt while tracking
     slew_rate: float = math.radians(180.0)  # rad/s, max reference rotation rate
     # Default target when none is set: this far ahead of the take-off point
-    # along the heading, at the take-off ground height.
+    # along the heading.
     default_target_distance: float = 3.0  # m
+    # Tracked point above the ground at the target: the middle of the 0.3 m
+    # target object.
+    aim_height: float = 0.15  # m
+    # Without a ground height, the ground is taken as the take-off ground.
     standing_height: float = 0.27  # m, body origin above the ground when standing
+
+GroundHeight = Callable[[float, float], float]  # terrain height [m] at (x, y)
 
 
 def look_at_quaternion(
@@ -92,25 +100,42 @@ def slew_quaternion(current: Quaternion, desired: Quaternion, max_angle: float) 
 
 def default_target(takeoff_position: np.ndarray, heading: float,
                    config: FlightReferenceConfig = FlightReferenceConfig()) -> np.ndarray:
+    """Ground position (x, y) ``default_target_distance`` ahead of take-off."""
     p = np.asarray(takeoff_position, float)
     return np.array([
         p[0] + config.default_target_distance * math.cos(heading),
         p[1] + config.default_target_distance * math.sin(heading),
-        p[2] - config.standing_height,
     ])
 
 
 class FlightReference:
     def __init__(self, config: FlightReferenceConfig = FlightReferenceConfig(),
-                 target: tuple[float, float, float] | None = None) -> None:
+                 target: tuple[float, float] | None = None,
+                 ground_height: GroundHeight | None = None) -> None:
         self.config = config
-        self.target_setting = None if target is None else np.asarray(target, float)
+        self.ground_height = ground_height
+        self.target_setting: np.ndarray | None = None  # tracked point (x, y, z)
+        self.set_target(target)
         self.active_target: np.ndarray | None = None
         self.commanded: Quaternion = (1.0, 0.0, 0.0, 0.0)
         self.tracking = False
 
-    def set_target(self, target: tuple[float, float, float] | None) -> None:
-        self.target_setting = None if target is None else np.asarray(target, float)
+    def set_target(self, target: tuple[float, float] | None) -> None:
+        """Track ``aim_height`` above the ground at ``target`` (x, y)."""
+        self.target_setting = None if target is None else self.aim_point(target)
+
+    def aim_point(self, xy, takeoff_position: np.ndarray | None = None) -> np.ndarray:
+        """The tracked point ``aim_height`` above the ground at ``xy``.
+
+        Off the terrain (or without a ground height) the ground is the take-off
+        ground, or z = 0 before any take-off.
+        """
+        x, y = (float(v) for v in xy)
+        ground = math.nan if self.ground_height is None else float(self.ground_height(x, y))
+        if not math.isfinite(ground):
+            ground = (0.0 if takeoff_position is None
+                      else float(takeoff_position[2]) - self.config.standing_height)
+        return np.array([x, y, ground + self.config.aim_height])
 
     def start_flight(self, attitude: Quaternion, position: np.ndarray, heading: float,
                      track: bool) -> None:
@@ -120,7 +145,7 @@ class FlightReference:
         if track:
             self.active_target = (
                 self.target_setting.copy() if self.target_setting is not None
-                else default_target(position, heading, self.config)
+                else self.aim_point(default_target(position, heading, self.config), position)
             )
 
     def update(self, phase: FlightPhase, camera_position: np.ndarray, yaw_reference: float,

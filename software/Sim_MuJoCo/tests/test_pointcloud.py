@@ -65,6 +65,24 @@ class PointCloudTests(unittest.TestCase):
         self.assertEqual(sorted(set(cloud["jump"].tolist())), [1, 2])
         self.assertEqual(set(cloud["t"][cloud["jump"] == 2].tolist()), {1.5})
 
+    def test_only_points_inside_the_keep_sphere_are_added(self) -> None:
+        recorder = PointCloudRecorder(self.path)
+        recorder.start_jump()
+        full = flat_frame(depth=2.0, position=(1.0, 2.0, 3.0))  # ground plane at z = 1
+        recorder.keep_within((1.0, 2.0, 1.0), 0.5)
+        added = recorder.add_frame(full, DOWN, 0.0)
+        cloud = recorder.points()
+        xyz = np.column_stack([cloud["x"], cloud["y"], cloud["z"]]).astype(float)
+        self.assertGreater(added, 0)
+        self.assertLess(added, 48)
+        self.assertLessEqual(float(np.max(np.linalg.norm(xyz - (1.0, 2.0, 1.0), axis=1))), 0.5)
+        # Nothing near the sphere: the frame adds nothing.
+        recorder.keep_within((10.0, 2.0, 1.0), 0.5)
+        self.assertEqual(recorder.add_frame(full, DOWN, 0.0), 0)
+        # No sphere: every point again.
+        recorder.keep_within((0.0, 0.0, 0.0), None)
+        self.assertEqual(recorder.add_frame(full, DOWN, 0.0), 48)
+
     def test_start_run_overwrites_earlier_cloud(self) -> None:
         first = PointCloudRecorder(self.path)
         first.start_jump()

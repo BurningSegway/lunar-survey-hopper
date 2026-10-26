@@ -36,6 +36,31 @@ class ViewerApplicationTests(unittest.TestCase):
         ):
             app.build_argument_parser().parse_args(["--gravity", "moon"])
 
+    def test_track_target_takes_x_y_and_excludes_no_target(self) -> None:
+        parser = app.build_argument_parser()
+        self.assertEqual(parser.parse_args(["--track-target", "4", "1"]).track_target, [4.0, 1.0])
+        self.assertTrue(parser.parse_args(["--no-target"]).no_target)
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            parser.parse_args(["--track-target", "4", "1", "--no-target"])
+
+    def test_random_target_is_within_reach_of_the_spawn(self) -> None:
+        rng = np.random.default_rng(3)
+        points = np.array([app.random_target_near((5.0, -2.0), 20.0, 2.0, rng) for _ in range(2000)])
+        distances = np.hypot(points[:, 0] - 5.0, points[:, 1] + 2.0)
+        self.assertGreaterEqual(distances.min(), 2.0)
+        self.assertLessEqual(distances.max(), 20.0)
+        # Spread over the whole disc and in every direction, not bunched up.
+        self.assertGreater(distances.max(), 19.0)
+        self.assertLess(distances.min(), 3.0)
+        self.assertGreater(float(np.mean(distances > 10.0)), 0.6)  # area: (400-100)/(400-4)
+        headings = np.arctan2(points[:, 1] + 2.0, points[:, 0] - 5.0)
+        self.assertEqual(len(np.unique(np.floor((headings + np.pi) / (np.pi / 2)))), 4)
+
+    def test_spawn_position_is_the_root_joint_start(self) -> None:
+        model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        data = mujoco.MjData(model)
+        self.assertEqual(app.spawn_position(model, data), (0.0, 0.0))
+
     def test_keyboard_callback_drives_simulation_and_telemetry(self) -> None:
         messages: list[str] = []
         telemetry_payloads: list[TelemetryPayload] = []
@@ -183,6 +208,11 @@ class ViewerApplicationTests(unittest.TestCase):
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].command[1:4], ["-m", "jumper_sim.cloud_viewer", str(scan_file)])
         self.assertTrue(windows[0].terminated)
+        # Without --track-target or --no-target a random target is chosen and
+        # drawn in the point cloud window.
+        self.assertEqual(windows[0].command[4], "--target")
+        x, y, _ = (float(v) for v in windows[0].command[5:8])
+        self.assertLessEqual(np.hypot(x, y), app.RANDOM_TARGET_RADIUS)
         # The live point cloud window is started on the scan file and closed
         # again when the viewer exits.
         self.assertEqual(len(windows), 1)
@@ -222,6 +252,7 @@ class ViewerApplicationTests(unittest.TestCase):
             "[CONTROLLER] Attitude stabilization enabled",
             "[RESET] Simulation reset",
             "[SCAN] Target point cloud",
+            "[TARGET] Random target",
             "[SCAN] Point cloud window opened",
             "[SCAN] Point cloud window opened",
         ):

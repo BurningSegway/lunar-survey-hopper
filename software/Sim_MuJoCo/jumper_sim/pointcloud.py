@@ -2,8 +2,11 @@
 
 While a jump's ascent keeps the downward camera pointed at the track target,
 every depth frame taken with the camera axis within ``margin`` of the target
-direction is turned into world-frame points and added to the cloud; frames
-from the initial turn towards the target are skipped. The cloud is written as
+direction is turned into world-frame points; frames from the initial turn
+towards the target are skipped. Only points inside the keep sphere
+(:meth:`PointCloudRecorder.keep_within`: around the target object, radius its
+length) are added, so the cloud holds the target and the ground right at it
+rather than everything the camera saw. The cloud is written as
 a binary little-endian PLY (x, y, z as float32, ``jump`` as uint16 and ``t``
 as float32 per point), which CloudCompare, MeshLab, Open3D and most point
 cloud tools read directly.
@@ -49,6 +52,8 @@ class PointCloudRecorder:
         self.jumps = 0
         self.frames = 0
         self.preview = np.empty((0, 3))
+        # Keep sphere (centre, radius); None keeps every point.
+        self.region: tuple[np.ndarray, float] | None = None
 
     @property
     def point_count(self) -> int:
@@ -65,6 +70,10 @@ class PointCloudRecorder:
         self.jumps += 1
         return self.jumps
 
+    def keep_within(self, centre, radius: float | None) -> None:
+        """Only add points within ``radius`` of ``centre`` (None: keep all)."""
+        self.region = None if radius is None else (np.asarray(centre, float), float(radius))
+
     def add_frame(self, frame: DepthFrame, mount: CameraMount, pointing_error: float,
                   robot_position: np.ndarray | None = None) -> int:
         """Add one frame's points if it was taken on target; returns points added.
@@ -77,6 +86,9 @@ class PointCloudRecorder:
         if robot_position is None:
             robot_position = frame.body_position
         points = frame_points_world(frame, mount) + np.asarray(robot_position, float)
+        if self.region is not None:
+            centre, radius = self.region
+            points = points[np.sum((points - centre) ** 2, axis=1) <= radius**2]
         if not len(points):
             return 0
         chunk = np.empty(len(points), PLY_DTYPE)

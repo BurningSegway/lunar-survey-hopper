@@ -221,8 +221,20 @@ class SimulationTests(unittest.TestCase):
         simulation.handle_key("c")
         self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
 
-    def test_pid_is_not_contact_gated(self) -> None:
-        self.assertFalse(self.simulation.contact_gating)
+    def test_both_controllers_run_the_same_hop_process(self) -> None:
+        # PID and LQR are compared on the same chain: camera landing plane,
+        # contact gating, target tracking on ascent and leaning to the target.
+        for controller in ("pid", "lqr"):
+            with self.subTest(controller=controller):
+                simulation = JumperSimulation(self.model, self.data, controller, track_target=(4.0, 1.0))
+                self.assertTrue(simulation.contact_gating)
+                self.assertIsNotNone(simulation.landing_reference)
+                self.assertIsNotNone(simulation.flight_reference)
+                self.assertIsNotNone(simulation.jump_aim)
+                np.testing.assert_allclose(simulation.track_target_point[:2], (4.0, 1.0))
+        # Only the LQR cancels bearing friction (the PID gains rely on it as damping).
+        self.assertFalse(JumperSimulation(self.model, self.data, "pid").compensate_wheel_friction)
+        self.assertTrue(JumperSimulation(self.model, self.data, "lqr").compensate_wheel_friction)
 
     def test_landing_plane_overlay_is_drawn(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
@@ -242,9 +254,6 @@ class SimulationTests(unittest.TestCase):
         small = mujoco.MjvScene(self.model, maxgeom=3)
         self.assertLessEqual(draw_landing_plane(small, simulation), 3)
 
-    def test_pid_has_no_landing_reference(self) -> None:
-        self.assertIsNone(self.simulation.landing_reference)
-
     def test_terrain_is_firm_and_overdamped(self) -> None:
         terrain = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_collision")
         self.assertEqual(self.model.geom_priority[terrain], 1)
@@ -254,7 +263,7 @@ class SimulationTests(unittest.TestCase):
         self.assertGreater(float(self.model.geom_solref[terrain][1]), 1.0)  # overdamped
 
     def test_leans_towards_target_on_the_ground_from_the_imu(self) -> None:
-        target = (-30.0, 0.0, 0.0)
+        target = (-30.0, 0.0)
         simulation = JumperSimulation(self.model, self.data, "lqr", track_target=target,
                                       gravity=EARTH_GRAVITY)
         while self.data.time < 3.0:
@@ -262,7 +271,7 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(simulation.in_contact)
         body = self.model.jnt_bodyid[simulation.ids.root_joint]
         lean = simulation.jump_aim.lean_towards(
-            self.data.xmat[body].reshape(3, 3), self.data.xpos[body], target)
+            self.data.xmat[body].reshape(3, 3), self.data.xpos[body], (*target, 0.0))
         self.assertGreater(lean, math.radians(2.0))  # towards the target
         self.assertLessEqual(lean, simulation.jump_aim.config.max_lean + math.radians(1.0))
         self.assertTrue(any("[AIM]" in e for e in simulation.flight_events))
@@ -272,7 +281,7 @@ class SimulationTests(unittest.TestCase):
         )
 
     def test_target_object_stands_at_target_and_the_camera_sees_it(self) -> None:
-        simulation = JumperSimulation(self.model, self.data, "lqr", track_target=(8.0, 3.0, 0.0))
+        simulation = JumperSimulation(self.model, self.data, "lqr", track_target=(8.0, 3.0))
         mujoco.mj_forward(self.model, self.data)
         target = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "target_object")
         caster = simulation._terrain_ray_caster()
@@ -324,8 +333,15 @@ class SimulationTests(unittest.TestCase):
         np.testing.assert_allclose(forces, 1500.0 * 0.12 * 1.2)
 
     def test_hop_tracks_target_on_ascent_and_fits_ground_only_on_descent(self) -> None:
-        target = (2.0, 0.5, 0.0)
-        simulation = JumperSimulation(self.model, self.data, "lqr", track_target=target,
+        for controller in ("lqr", "pid"):
+            with self.subTest(controller=controller):
+                self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+                self.data = mujoco.MjData(self.model)
+                self._hop_tracks_target(controller)
+
+    def _hop_tracks_target(self, controller: str) -> None:
+        target = (2.0, 0.5)
+        simulation = JumperSimulation(self.model, self.data, controller, track_target=target,
                                       gravity=EARTH_GRAVITY)  # hop fits the test window
         self.assertIsNotNone(simulation.flight_reference)
         camera = simulation.landing_reference.camera
@@ -351,8 +367,11 @@ class SimulationTests(unittest.TestCase):
                     tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._camera_site]))
         self.assertEqual(phases[:4], [FlightPhase.TAKEOFF, FlightPhase.ASCENT,
                                       FlightPhase.DESCENT, FlightPhase.LANDING])
-        np.testing.assert_allclose(simulation.flight_reference.active_target, target)
-        self.assertLess(math.degrees(errors[-1]), 5.0)  # on target at the apex
+        ground = simulation._ground_height(*target)
+        np.testing.assert_allclose(simulation.flight_reference.active_target, (*target, ground + 0.15))
+        # On target at the apex. The PID tracks less tightly: 7.6 deg on this
+        # short Earth hop (2.7-4.6 deg on Moon hops) against ~0 for the LQR.
+        self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
         self.assertTrue(capture_phases)
         self.assertEqual(set(capture_phases), {FlightPhase.DESCENT})
         self.assertGreater(simulation.landing_reference.filter.accepted, 0)
@@ -364,11 +383,14 @@ class SimulationTests(unittest.TestCase):
             path = Path(folder) / "scan.ply"
             recorder = PointCloudRecorder(path, ScanConfig(margin=math.radians(5)))
             simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY,
-                                          track_target=(2.0, 0.5, 0.0), target_scan=recorder)
+                                          track_target=(2.0, 0.5), target_scan=recorder)
             self.assertIs(simulation.target_scan, recorder)
             # Noise-free so the geometry can be checked exactly.
             spec = replace(simulation._scan_camera.spec, noise=False)
-            simulation._scan_camera = SimulatedDepthCamera(self.model, simulation.ids.root_joint, spec)
+            simulation._scan_camera = SimulatedDepthCamera(
+                self.model, simulation.ids.root_joint, spec,
+                ray_caster=simulation._terrain_ray_caster(),  # sees the target object too
+            )
             camera = simulation._scan_camera
             original_capture = camera.capture
             captures = []
@@ -395,15 +417,23 @@ class SimulationTests(unittest.TestCase):
             self.assertLessEqual(max(error for _, error in captures), math.radians(5))
             cloud = read_ply(path)
             self.assertEqual(sorted(set(cloud["jump"].tolist())), [1, 2])
-            self.assertGreater(len(cloud), 10000)
             xyz = np.column_stack([cloud["x"], cloud["y"], cloud["z"]]).astype(float)
+            # Only points within the target object's length of its centre are
+            # kept: the bunny and the ground right around it.
+            centre, length = simulation._target_centre, simulation._target_length
+            self.assertAlmostEqual(length, 0.3, delta=0.02)
+            self.assertGreater(len(cloud), 50)
+            self.assertLessEqual(float(np.max(np.linalg.norm(xyz - centre, axis=1))), length + 1e-5)
             ground = HeightfieldRayCaster(self.model).height(xyz[:, 0], xyz[:, 1])
-            self.assertLess(float(np.max(np.abs(xyz[:, 2] - ground))), 1e-3)
+            on_object = xyz[:, 2] - ground > 0.02
+            self.assertTrue(np.any(on_object))  # the bunny itself
+            self.assertTrue(np.any(~on_object))  # and the ground at its foot
             self.assertTrue(any("[SCAN] Jump 2" in e for e in simulation.flight_events))
 
     def test_target_scan_needs_the_hop_reference(self) -> None:
         recorder = PointCloudRecorder(Path(tempfile.gettempdir()) / "unused.ply")
-        simulation = JumperSimulation(self.model, self.data, "pid", target_scan=recorder)
+        simulation = JumperSimulation(self.model, self.data, "pid", flight_reference=False,
+                                      target_scan=recorder)
         self.assertIsNone(simulation.target_scan)
 
     def test_estimated_vertical_velocity_matches_truth_in_flight(self) -> None:
@@ -420,9 +450,6 @@ class SimulationTests(unittest.TestCase):
             if not simulation.in_contact:
                 worst = max(worst, abs(simulation.flight_phase.vertical_velocity - velocity_before))
         self.assertLess(worst, 0.05)
-
-    def test_pid_has_no_flight_reference(self) -> None:
-        self.assertIsNone(self.simulation.flight_reference)
 
     def test_model_loads_and_steps_headlessly(self) -> None:
         self.simulation.step()

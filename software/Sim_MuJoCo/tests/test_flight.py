@@ -161,16 +161,39 @@ class FlightReferenceTests(unittest.TestCase):
         negated = tuple(-v for v in target)
         np.testing.assert_allclose(slew_quaternion(target, negated, 0.01), target, atol=1e-12)
 
-    def test_default_target_is_ahead_at_ground_height(self) -> None:
-        config = FlightReferenceConfig(default_target_distance=3.0, standing_height=0.27)
+    def test_default_target_is_ahead_of_take_off(self) -> None:
+        config = FlightReferenceConfig(default_target_distance=3.0)
         np.testing.assert_allclose(
-            default_target(np.array([1.0, 2.0, 0.5]), math.pi / 2, config), (1.0, 5.0, 0.23),
+            default_target(np.array([1.0, 2.0, 0.5]), math.pi / 2, config), (1.0, 5.0),
             atol=1e-12,
         )
 
+    def test_target_is_tracked_just_above_the_ground(self) -> None:
+        def slope(x: float, y: float) -> float:
+            return 0.5 * x if abs(x) < 50.0 else math.nan  # off the terrain beyond 50 m
+
+        config = FlightReferenceConfig(default_target_distance=3.0, aim_height=0.15,
+                                       standing_height=0.27)
+        reference = FlightReference(config, target=(4.0, 1.0), ground_height=slope)
+        np.testing.assert_allclose(reference.target_setting, (4.0, 1.0, 2.15))
+        reference.start_flight(LEVEL, np.array([0.0, 0.0, 0.27]), 0.0, track=True)
+        np.testing.assert_allclose(reference.active_target, (4.0, 1.0, 2.15))
+        # The default point 3 m ahead is on the ground there, not at take-off height.
+        reference.set_target(None)
+        reference.start_flight(LEVEL, np.array([0.0, 0.0, 0.27]), 0.0, track=True)
+        np.testing.assert_allclose(reference.active_target, (3.0, 0.0, 1.65))
+        # Off the terrain: the take-off ground.
+        reference.set_target((60.0, 0.0))
+        np.testing.assert_allclose(reference.target_setting, (60.0, 0.0, 0.15))
+        reference.start_flight(LEVEL, np.array([48.0, 0.0, 24.27]), 0.0, track=True)
+        np.testing.assert_allclose(reference.active_target, (60.0, 0.0, 0.15))
+        reference.set_target(None)
+        reference.start_flight(LEVEL, np.array([48.0, 0.0, 24.27]), 0.0, track=True)
+        np.testing.assert_allclose(reference.active_target, (51.0, 0.0, 24.15))
+
     def test_ascent_tracks_descent_follows_landing_reference(self) -> None:
         reference = FlightReference(FlightReferenceConfig(slew_rate=math.radians(1e6)),
-                                    target=(2.0, 0.0, 0.0))
+                                    target=(2.0, 0.0))
         reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
         camera = np.array([0.0, 0.0, 2.0])
         q = reference.update(FlightPhase.ASCENT, camera, 0.0, LEVEL, DT)
