@@ -30,7 +30,7 @@
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
     <geom name="terrain_visual" type="mesh" mesh="terrain_mesh" pos="0 0 0"
           contype="0" conaffinity="0" rgba="0.45 0.5 0.4 1"/>
-    <!-- group 2: the only group the downward depth camera's rays can hit -->
+    <!-- group 2: the terrain the downward lidar sees (with the target object) -->
     <!-- Ground contact. priority="1" makes these settings apply to the legs and
          body (the jumping foot overrides them with its own, priority 2):
          - solref 0.005 s / damping ratio 1.5: firm and overdamped, so landings
@@ -44,8 +44,8 @@
           friction="0.7 0.01 0.001" priority="1" solref="0.005 1.5" solimp="0.9 0.95 0.01 0.5 2"/>
 
     <!-- Scan target: moved onto the terrain at --track-target by the
-         simulator, parked out of sight below the terrain otherwise. The depth
-         camera sees it (MeshRayCaster); the robot collides with its convex hull. -->
+         simulator, parked out of sight below the terrain otherwise. The
+         lidar sees it (MeshRayCaster); the robot collides with its convex hull. -->
     <geom name="target_object" type="mesh" mesh="target_mesh" pos="0 0 0"
           rgba="1 0.45 0 1"/>  <!-- bright orange -->
 
@@ -59,9 +59,20 @@
       <inertial pos="0 0 0" mass="5.0" diaginertia="0.075 0.075 0.075"/>
       <geom name="body_box" type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.8 0.8"/>
 
-      <!-- DOWNWARD DEPTH CAMERA (RealSense D435 stand-in). Looks along the
-           site's -z axis; offset from the central foot so it is not occluded. -->
-      <site name="realsense" pos="0.06 -0.06 -0.151" size="0.012" rgba="0.1 0.1 0.1 1"/>
+      <!-- LIDAR (Livox Mid-360S, 65x65x60 mm) on the +x side face, flush with
+           the bottom. Its rotation axis is the site's -z axis: pointing out of
+           the face, tilted 22.5 deg down, so straight down (body -z) is in the
+           middle of its -7..52 deg band and it can look straight at the target
+           with the robot's bottom. The blind cone (38 deg around that axis)
+           points out and slightly down from this face. -->
+      <site name="lidar" pos="0.185 0 -0.1175" euler="0 -67.5 0" size="0.03" rgba="0.1 0.1 0.1 1"/>
+
+      <!-- LIDAR (Sony AS-DT1, 29x29x31 mm, --lidar as-dt1 or --spin) under the bottom face,
+           its axis (site -z) tilted 10 deg from body -z towards +x: the 30 deg
+           grid still holds the point the robot's bottom tracks (5 deg inside
+           its edge), and the slow heading spin in flight sweeps it round a
+           cone, ~25 deg around body -z. -->
+      <site name="lidar_down" pos="0.1 0 -0.165" euler="0 -10 0" size="0.015" rgba="0.1 0.1 0.1 1"/>
 
       <!-- REACTION WHEELS (Housed inside the box on their respective axes) -->
       <body name="rw_x" pos="0.125 0 0">

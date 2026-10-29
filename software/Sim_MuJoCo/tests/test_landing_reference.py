@@ -4,20 +4,15 @@ import unittest
 import numpy as np
 
 from jumper_sim.controller import quaternion_error
-from jumper_sim.depth_camera import CameraMount, DepthCameraSpec, DepthFrame
 from jumper_sim.landing_reference import (
+    GroundMap,
     LandingReference,
     LandingReferenceConfig,
     PlaneEstimate,
-    estimate_ground_plane,
+    fit_ground_plane,
     matrix_to_quaternion,
     quaternion_to_matrix,
     tilted_reference_quaternion,
-)
-
-MOUNT = CameraMount(
-    position=(0.06, -0.06, -0.151),
-    rotation=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
 )
 
 
@@ -26,33 +21,20 @@ def axis_angle_quaternion(axis, angle):
     return (math.cos(angle / 2), *(math.sin(angle / 2) * axis))
 
 
-def plane_frame(slope_x, slope_y, height, body_quaternion, spec=DepthCameraSpec(noise=False),
-                rock=None):
-    """Exact depth image of the plane z = slope_x*x + slope_y*y - height.
-
-    Coordinates are world-oriented and relative to the robot origin. ``rock``
-    = (x, y, radius, bump) raises the ground inside a disc.
-    """
-    rays = spec.optical_rays()
-    r_wb = quaternion_to_matrix(body_quaternion)
-    origin = r_wb @ np.array(MOUNT.position)
-    d = rays @ (r_wb @ MOUNT.body_from_optical).T
-    t = (slope_x * origin[0] + slope_y * origin[1] - height - origin[2]) / (
-        d[:, 2] - slope_x * d[:, 0] - slope_y * d[:, 1]
-    )
+def plane_points(slope_x, slope_y, centre=(0.0, 0.0), ground=0.0, count=1000, radius=0.5,
+                 sigma=0.0, rock=None, seed=0):
+    """Points of the plane through (centre, ground) with the given slopes, even
+    over a disc of ``radius``. ``rock`` = (x, y, radius, bump) raises the
+    ground inside a disc (offsets from the centre)."""
+    rng = np.random.default_rng(seed)
+    r = radius * np.sqrt(rng.random(count))
+    a = rng.uniform(0.0, 2.0 * math.pi, count)
+    dx, dy = r * np.cos(a), r * np.sin(a)
+    z = ground + slope_x * dx + slope_y * dy + rng.standard_normal(count) * sigma
     if rock is not None:
-        rx, ry, radius, bump = rock
-        hit = origin + d * t[:, None]
-        inside = np.hypot(hit[:, 0] - rx, hit[:, 1] - ry) < radius
-        t2 = (slope_x * origin[0] + slope_y * origin[1] - height + bump - origin[2]) / (
-            d[:, 2] - slope_x * d[:, 0] - slope_y * d[:, 1]
-        )
-        hit2 = origin + d * t2[:, None]
-        inside2 = np.hypot(hit2[:, 0] - rx, hit2[:, 1] - ry) < radius
-        t = np.where(inside | inside2, np.minimum(t, t2), t)
-    depth = t * rays[:, 2]
-    depth[(t <= 0) | (depth < spec.min_range) | (depth > spec.max_range)] = np.nan
-    return DepthFrame(depth.reshape(spec.height, spec.width), spec, 0.0, tuple(body_quaternion))
+        rx, ry, rr, bump = rock
+        z = z + np.where(np.hypot(dx - rx, dy - ry) < rr, bump, 0.0)
+    return np.column_stack([centre[0] + dx, centre[1] + dy, z])
 
 
 def normal_of(slope_x, slope_y):
@@ -65,51 +47,72 @@ def angle_between(a, b):
 
 
 class PlaneFitTests(unittest.TestCase):
-    def test_recovers_tilted_plane_from_tilted_robot(self) -> None:
+    def test_recovers_the_plane_and_the_height_above_it(self) -> None:
         for slope in ((0.0, 0.0), (0.2, -0.1), (-0.3, 0.25)):
-            for attitude in ((1.0, 0.0, 0.0, 0.0),
-                             axis_angle_quaternion((1, 2, 0.5), math.radians(20))):
-                frame = plane_frame(*slope, 2.0, attitude)
-                estimate = estimate_ground_plane(frame, MOUNT)
-                self.assertTrue(estimate.valid)
-                self.assertLess(angle_between(estimate.normal, normal_of(*slope)), 0.05)
-                self.assertAlmostEqual(estimate.height, 2.0, places=2)
-
-    def test_robot_yaw_does_not_change_world_normal(self) -> None:
-        slope = (0.15, 0.05)
-        normals = [
-            estimate_ground_plane(
-                plane_frame(*slope, 2.0, axis_angle_quaternion((0, 0, 1), yaw)), MOUNT
-            ).normal
-            for yaw in (0.0, 1.0, 2.5)
-        ]
-        for n in normals:
-            self.assertLess(angle_between(n, normal_of(*slope)), 0.05)
+            points = plane_points(*slope, centre=(4.0, -2.0), ground=1.5)
+            estimate = fit_ground_plane(points, (4.0, -2.0), robot_z=6.5, point_sigma=0.02,
+                                        timestamp=0.0)
+            self.assertTrue(estimate.valid)
+            self.assertLess(angle_between(estimate.normal, normal_of(*slope)), 0.05)
+            self.assertAlmostEqual(estimate.height, 5.0, places=3)  # 6.5 - 1.5
 
     def test_rock_is_rejected_as_outlier(self) -> None:
-        clean = estimate_ground_plane(plane_frame(0.1, 0.0, 1.5, (1, 0, 0, 0)), MOUNT)
-        rocky = estimate_ground_plane(
-            plane_frame(0.1, 0.0, 1.5, (1, 0, 0, 0), rock=(0.25, 0.1, 0.12, 0.15)), MOUNT
-        )
+        clean = fit_ground_plane(plane_points(0.1, 0.0), (0.0, 0.0), 3.0, 0.02, 0.0)
+        rocky = fit_ground_plane(plane_points(0.1, 0.0, rock=(0.25, 0.1, 0.12, 0.15)),
+                                 (0.0, 0.0), 3.0, 0.02, 0.0)
         self.assertTrue(rocky.valid)
         self.assertLess(angle_between(rocky.normal, clean.normal), 0.3)
 
-    def test_out_of_range_ground_is_invalid(self) -> None:
-        too_close = estimate_ground_plane(plane_frame(0.0, 0.0, 0.3, (1, 0, 0, 0)), MOUNT)
-        too_far = estimate_ground_plane(plane_frame(0.0, 0.0, 30.0, (1, 0, 0, 0)), MOUNT)
-        self.assertFalse(too_close.valid)
-        self.assertFalse(too_far.valid)
+    def test_too_few_points_is_invalid(self) -> None:
+        self.assertFalse(fit_ground_plane(plane_points(0.0, 0.0, count=5), (0.0, 0.0),
+                                          3.0, 0.02, 0.0).valid)
+        self.assertFalse(fit_ground_plane(np.zeros((0, 3)), (0.0, 0.0), 3.0, 0.02, 0.0).valid)
 
-    def test_uncertainty_grows_with_noise_and_altitude(self) -> None:
-        noisy = DepthCameraSpec()
-        sigmas = []
-        for height in (2.0, 6.0):
-            frame = plane_frame(0.1, 0.0, height, (1, 0, 0, 0))
-            rng = np.random.default_rng(0)
-            depth = frame.depth + rng.standard_normal(frame.depth.shape) * noisy.depth_sigma(frame.depth)
-            frame = DepthFrame(depth, noisy, 0.0, frame.body_quaternion)
-            sigmas.append(estimate_ground_plane(frame, MOUNT).normal_sigma)
-        self.assertGreater(sigmas[1], 2.0 * sigmas[0])
+    def test_uncertainty_grows_with_noise_and_with_less_coverage(self) -> None:
+        def sigma(**kwargs):
+            points = plane_points(0.1, 0.0, **kwargs)
+            noise = kwargs.get("sigma", 0.02)
+            return fit_ground_plane(points, (0.0, 0.0), 3.0, noise, 0.0).normal_sigma
+        self.assertGreater(sigma(sigma=0.08), 2.0 * sigma(sigma=0.02))
+        self.assertGreater(sigma(sigma=0.02, radius=0.25), sigma(sigma=0.02))
+
+
+class GroundMapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Flat ground at z = 1 seen over x, y in [-1, 12] x [-3, 3].
+        rng = np.random.default_rng(1)
+        xy = rng.uniform((-1.0, -3.0), (12.0, 3.0), size=(40000, 2))
+        self.map = GroundMap(0.5)
+        for chunk in np.array_split(np.column_stack([xy, np.ones(len(xy))]), 20):
+            self.map.add(chunk)  # added in batches, as the lidar does
+
+    def test_landing_is_where_the_trajectory_meets_the_ground(self) -> None:
+        g, clearance = 1.62, 0.3
+        landing = self.map.predict_landing((0.0, 0.0, 5.0), (2.0, 0.0, 1.0), g, clearance,
+                                           step=0.001)
+        self.assertIsNotNone(landing)
+        spot, time = landing
+        # 5 + t - g t^2 / 2 = 1 + clearance
+        expected = (1.0 + math.sqrt(1.0 + 2.0 * g * (5.0 - 1.0 - clearance))) / g
+        self.assertAlmostEqual(time, expected, delta=0.002)
+        np.testing.assert_allclose(spot, (2.0 * expected, 0.0), atol=0.005)
+
+    def test_no_landing_over_ground_it_has_not_seen(self) -> None:
+        self.assertIsNone(self.map.predict_landing((0.0, 0.0, 5.0), (0.0, 4.0, 0.0), 1.62, 0.3))
+
+    def test_points_near_takes_at_most_max_points_from_the_disc(self) -> None:
+        near = self.map.points_near((5.0, 0.0), 0.5, 200)
+        self.assertEqual(len(near), 200)  # ~400 points in the disc
+        self.assertLessEqual(float(np.hypot(near[:, 0] - 5.0, near[:, 1]).max()), 0.5)
+        every = self.map.points_near((5.0, 0.0), 0.5, 100000)
+        self.assertGreater(len(every), 300)
+        self.assertLessEqual(float(np.hypot(every[:, 0] - 5.0, every[:, 1]).max()), 0.5)
+        self.assertEqual(len(self.map.points_near((50.0, 0.0), 0.5, 1000)), 0)
+
+    def test_clear_forgets_the_jump(self) -> None:
+        self.map.clear()
+        self.assertEqual(self.map.count, 0)
+        self.assertTrue(math.isnan(self.map.height(5.0, 0.0)))
 
 
 class LandingReferenceFilterTests(unittest.TestCase):

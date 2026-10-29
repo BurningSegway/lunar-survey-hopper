@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from collections.abc import Sequence
 from contextlib import closing
 import math
@@ -15,12 +16,21 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from .pointcloud import PointCloudRecorder, ScanConfig
+from .gpu_ray_caster import gpu_available
+from .lidar import LIDARS, SONY_AS_DT1
+from .pointcloud import PointCloudRecorder
 from .simulation import MOON_GRAVITY, JumperSimulation
 from .telemetry import UdpTelemetry
-from .visualization import draw_flight_target, draw_landing_plane, draw_target_scan
+from .visualization import (
+    draw_flight_target, draw_height_label, draw_landing_plane, draw_target_scan,
+)
 
-FRAME_PERIOD = 1.0 / 60.0
+# The viewer draws in its own thread at the display rate; hand it new state
+# more often than that so every drawn frame is fresh.
+SYNC_PERIOD = 1.0 / 120.0  # s of wall time between viewer syncs
+# Most sim time one sync may catch up on; if a slow stretch puts the sim
+# further behind the wall clock, it runs slower than real time instead.
+MAX_CATCH_UP = 0.05  # s
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 SCAN_PATH = Path(__file__).resolve().parents[1] / "pointclouds" / "target_scan.ply"
 # Default track target: a random ground position this far from the spawn, at
@@ -52,28 +62,41 @@ def build_argument_parser() -> argparse.ArgumentParser:
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
         "--track-target", type=float, nargs=2, metavar=("X", "Y"), default=None,
-        help="ground position the camera tracks during a jump's ascent, 0.15 m "
+        help="ground position the lidar tracks during a jump's ascent, 0.15 m "
         "above the terrain there (default: a random point within "
         f"{RANDOM_TARGET_RADIUS:g} m of the spawn)",
     )
     target.add_argument(
         "--no-target", action="store_true",
-        help="no target: no target object, and the camera tracks a point 3 m "
+        help="no target: no target object, and the lidar tracks a point 3 m "
         "ahead of the take-off point",
     )
     parser.add_argument(
         "--scan-file", type=Path, default=SCAN_PATH,
-        help="PLY file for the target point cloud collected during tracked ascents; "
-        "emptied at start-up, every jump of the run adds to it ("
+        help="PLY file for the lidar point cloud of every tracked jump (lift-off to "
+        "touchdown); emptied at start-up, every jump of the run adds to it ("
         f"default: {SCAN_PATH})",
     )
     parser.add_argument(
-        "--scan-margin", type=float, default=5.0, metavar="DEG",
-        help="only frames with the camera axis within this angle of the target "
-        "count (skips the initial turn; default: 5)",
+        "--no-scan", action="store_true", help="do not collect the lidar point cloud",
     )
     parser.add_argument(
-        "--no-scan", action="store_true", help="do not collect the target point cloud",
+        "--lidar", choices=sorted(LIDARS), default=None,
+        help="lidar: the Livox Mid-360S on the +x side face (default, used for "
+        "development), or the Sony AS-DT1 (24x24 grid, 30 deg) under the bottom "
+        "face, the robot facing its direction of travel in flight",
+    )
+    parser.add_argument(
+        "--spin", action="store_true",
+        help="Sony AS-DT1 (implies --lidar as-dt1), the robot spinning slowly "
+        "(45 deg/s) about the vertical in flight to sweep it round a cone, "
+        "instead of facing its direction of travel",
+    )
+    parser.add_argument(
+        "--lidar-fraction", type=float, default=None, metavar="F",
+        help="fraction of the lidar's real point rate that is simulated "
+        "(default: 1; for the Mid-360S 0.1 without an NVIDIA GPU, since the CPU "
+        "caster runs its full rate 2-10x slower than real time)",
     )
     parser.add_argument(
         "--no-scan-window", action="store_true",
@@ -82,8 +105,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def selected_lidar(lidar: str | None, spin: bool) -> str:
+    """The ``LIDARS`` name to use: the Mid-360S unless asked otherwise;
+    ``--spin`` is the AS-DT1's."""
+    if spin and lidar == "mid360s":
+        raise ValueError("--spin is for the AS-DT1 (the Mid-360S scans by itself)")
+    return lidar or ("as-dt1" if spin else "mid360s")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_argument_parser().parse_args(argv)
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    try:
+        lidar_name = selected_lidar(args.lidar, args.spin)
+    except ValueError as error:
+        parser.error(str(error))
     model_path = args.model.expanduser().resolve()
     if not model_path.is_file():
         raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
@@ -104,11 +140,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
+    fraction = args.lidar_fraction
+    spec = LIDARS[lidar_name]
+    if fraction is None:
+        # The AS-DT1's 8640 points/s are cheap on any hardware.
+        fraction = 1.0 if gpu_available() or spec is SONY_AS_DT1 else 0.1
+    lidar = replace(spec, point_fraction=fraction)
+    print(f"[LIDAR] {lidar.name}: {fraction:.0%} of the point rate, rays cast on the "
+          f"{'GPU (Warp)' if gpu_available() else 'CPU'}")
     target_scan = None
     if not args.no_scan:
-        target_scan = PointCloudRecorder(
-            args.scan_file.expanduser().resolve(), ScanConfig(math.radians(args.scan_margin))
-        )
+        target_scan = PointCloudRecorder(args.scan_file.expanduser().resolve())
     track_target = None if args.track_target is None else tuple(args.track_target)
     random_target = track_target is None and not args.no_target
     if random_target:
@@ -117,12 +159,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         model, data, args.controller,
         track_target=track_target,
         target_scan=target_scan,
+        lidar=lidar,
+        spin=args.spin,
     )
     if simulation.target_scan is not None:
         simulation.target_scan.start_run()  # this run starts a fresh cloud
     scan_window = None
     if simulation.target_scan is not None and not args.no_scan_window:
-        scan_window = open_scan_window(simulation.target_scan.path, simulation.track_target_point)
+        scan_window = open_scan_window(
+            simulation.target_scan.path, simulation.track_target_point,
+        )
     state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
     last_state = np.empty(mujoco.mj_stateSize(model, state_spec))
     mujoco.mj_getState(model, data, last_state, state_spec)
@@ -146,8 +192,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[CONTACT] {args.controller.upper()} is gated: attitude control in flight, wheel bleed-off in contact")
     if simulation.landing_reference is not None:
         print(
-            "[CAMERA] Landing plane overlay: disc = latest fit (orange = used, "
-            "grey = not used/held), green arrow = reference normal, blue dots = depth points"
+            "[LANDING] Landing plane overlay at the predicted landing spot: disc = latest fit "
+            "(orange = used, grey = not used/held), green arrow = reference normal, "
+            "blue dots = lidar points it used"
         )
     if simulation.flight_reference is not None:
         target = (
@@ -155,8 +202,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             else "({:.2f}, {:.2f}, {:.2f})".format(*simulation.track_target_point)
         )
         print(
-            f"[FLIGHT] Jumps: camera tracks {target} on the way up (red sphere), "
-            "then levels and aligns with the ground seen on the way down"
+            f"[FLIGHT] Jumps: the robot's bottom tracks {target} on the way up (red sphere), "
+            "then levels and aligns with the predicted landing spot's ground"
         )
     if random_target:
         print(
@@ -165,9 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if simulation.target_scan is not None:
         print(
-            f"[SCAN] Target point cloud (frames within {args.scan_margin:g} deg of the "
-            f"target, cyan dots) -> {simulation.target_scan.path}; emptied now, "
-            "saved after every jump's ascent"
+            f"[SCAN] Lidar point cloud of every jump (cyan dots) -> "
+            f"{simulation.target_scan.path}; emptied now, saved at every touchdown"
         )
 
     try:
@@ -213,17 +259,46 @@ def open_scan_window(path: Path, target: Sequence[float] | None) -> subprocess.P
     except OSError as error:
         print(f"[SCAN] Could not open the point cloud window: {error}")
         return None
-    print("[SCAN] Point cloud window opened; it updates after every jump's ascent")
+    print("[SCAN] Point cloud window opened; it updates at every touchdown")
     return window
 
 
-def track_robot(viewer, base_body_id: int) -> None:
-    """Point the viewer's camera at the robot and follow it."""
-    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    viewer.cam.trackbodyid = base_body_id
-    viewer.cam.distance = 3.0
-    viewer.cam.azimuth = 135.0
-    viewer.cam.elevation = -20.0
+class RobotFollower:
+    """Keeps the viewer camera centred on the robot.
+
+    MuJoCo's own tracking camera moves its centre 20 % of the way to the body
+    on every drawn frame. The viewer draws in its own thread, so with a fast
+    robot the camera glides while the robot jumps at each sync: visible
+    stutter. Here the free camera's centre is set to the robot in the same
+    locked update that moves the robot, so both always move together. Mouse
+    rotate and zoom still work; panning (or picking another camera) hands
+    the camera to the user until ``start`` is called again (R).
+    """
+
+    def __init__(self, base_body_id: int) -> None:
+        self.base_body_id = base_body_id
+        self.active = False
+        self._lookat: np.ndarray | None = None
+
+    def start(self, viewer, data) -> None:
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        viewer.cam.distance = 3.0
+        viewer.cam.azimuth = 135.0
+        viewer.cam.elevation = -20.0
+        self.active = True
+        self._lookat = None
+        self.update(viewer, data)
+
+    def update(self, viewer, data) -> None:
+        if not self.active:
+            return
+        cam = viewer.cam
+        moved_by_user = self._lookat is not None and not np.allclose(cam.lookat, self._lookat)
+        if cam.type != mujoco.mjtCamera.mjCAMERA_FREE or moved_by_user:
+            self.active = False
+            return
+        cam.lookat[:] = data.xpos[self.base_body_id]
+        self._lookat = cam.lookat.copy()
 
 
 def run_viewer(model, data, simulation, key_queue, on_key, last_state, state_spec) -> None:
@@ -236,12 +311,15 @@ def run_viewer(model, data, simulation, key_queue, on_key, last_state, state_spe
             )
             if base_body_id < 0:
                 raise ValueError("MuJoCo model is missing required body 'base_link'")
+            follower = RobotFollower(base_body_id)
             with viewer.lock():
-                track_robot(viewer, base_body_id)
+                follower.start(viewer, data)
             overlay_scene = getattr(viewer, "user_scn", None)
+            # Sim time follows the wall clock from this anchor.
+            wall_anchor, sim_anchor = time.perf_counter(), float(data.time)
 
             while viewer.is_running():
-                frame_started = time.perf_counter()
+                sync_started = time.perf_counter()
                 with viewer.lock():
                     while not key_queue.empty():
                         key = key_queue.get()
@@ -254,10 +332,13 @@ def run_viewer(model, data, simulation, key_queue, on_key, last_state, state_spe
                         if message:
                             print(message)
                         if key == "r":
-                            track_robot(viewer, base_body_id)  # follow the robot again
-
-                    frame_end = float(data.time) + FRAME_PERIOD
-                    while data.time < frame_end:
+                            follower.start(viewer, data)  # follow the robot again
+                    target = sim_anchor + (sync_started - wall_anchor)
+                    if target < float(data.time) - 1e-9 or target - float(data.time) > MAX_CATCH_UP:
+                        # Reset (time went back) or too far behind: re-anchor.
+                        target = min(max(target, float(data.time)), float(data.time) + MAX_CATCH_UP)
+                        wall_anchor, sim_anchor = sync_started, target
+                    while data.time < target:
                         simulation.step()
                         for event in simulation.flight_events:
                             print(event)
@@ -267,14 +348,15 @@ def run_viewer(model, data, simulation, key_queue, on_key, last_state, state_spe
                         draw_landing_plane(overlay_scene, simulation)
                         draw_flight_target(overlay_scene, simulation)
                         draw_target_scan(overlay_scene, simulation)
+                        draw_height_label(overlay_scene, simulation)
+                    follower.update(viewer, data)
                     telemetry.send(simulation.telemetry_payload())
                     mujoco.mj_getState(model, data, last_state, state_spec)
 
                 viewer.sync()
-                remaining = FRAME_PERIOD - (time.perf_counter() - frame_started)
+                remaining = SYNC_PERIOD - (time.perf_counter() - sync_started)
                 if remaining > 0.0:
                     time.sleep(remaining)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

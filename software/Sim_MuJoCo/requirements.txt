@@ -1,3 +1,5 @@
 mujoco==3.2.3
 glfw>=2.7,<3
 open3d>=0.19
+mujoco-lidar==0.3.5  # recorded Livox scan patterns (lidar.py)
+warp-lang==1.18.0  # GPU lidar ray casting; falls back to numpy without an NVIDIA GPU

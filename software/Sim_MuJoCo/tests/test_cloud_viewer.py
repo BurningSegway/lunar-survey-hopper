@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from jumper_sim.cloud_viewer import JUMP_COLOURS, CloudFile, jump_colours
-from jumper_sim.pointcloud import PLY_DTYPE, write_ply
+from jumper_sim.pointcloud import PLY_DTYPE, touchdown_path, write_ply
 
 
 def cloud(count, jumps=1):
@@ -64,6 +64,28 @@ class CloudFileTests(unittest.TestCase):
 
     def test_jump_colours_cycle(self) -> None:
         np.testing.assert_allclose(jump_colours([1, 11]), JUMP_COLOURS[[0, 0]])
+
+
+class HighlightAndTouchdownTests(unittest.TestCase):
+    def test_points_near_the_target_and_touchdowns(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "scan.ply"
+            write_ply(path, cloud(300))  # x 0..2, y -1..1, z 0
+            source = CloudFile(path, target=(1.0, 0.0, 0.0))
+            self.assertTrue(source.poll())
+            near_target = np.linalg.norm(source.points - (1.0, 0.0, 0.0), axis=1) <= 0.3
+            np.testing.assert_array_equal(source.highlight, near_target)
+            self.assertTrue(source.highlight.any() and not source.highlight.all())
+            self.assertEqual(source.touchdowns, [])
+            touchdown_path(path).write_text('[{"jump": 1, "position": [1, 2, 3]}]')
+            self.assertTrue(source.poll())  # only the touchdowns changed
+            self.assertEqual(source.touchdowns[0][0], 1)
+            np.testing.assert_allclose(source.touchdowns[0][1], (1.0, 2.0, 3.0))
+            self.assertFalse(source.poll())
+            # Without a target nothing is highlighted.
+            plain = CloudFile(path)
+            plain.poll()
+            self.assertFalse(plain.highlight.any())
 
 
 if __name__ == "__main__":

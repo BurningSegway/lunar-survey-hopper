@@ -46,7 +46,8 @@ class DepthCameraSpec:
     Native depth is 848x480 at 87 x 58 deg; the default 8x decimation keeps the
     field of view and gives 106x60 rays. Noise follows the stereo model
     sigma_z = z^2 * subpixel / (f * baseline) at the native focal length, which
-    is about 0.7 % at 2 m (Intel specifies < 2 %).
+    is about 0.2 % at 2 m (a well-calibrated unit with good texture; Intel
+    specifies < 2 %).
     """
 
     width: int = 106
@@ -59,7 +60,7 @@ class DepthCameraSpec:
     latency: float = 0.05  # s from exposure until the frame is usable
     native_width: int = 848
     baseline: float = 0.050  # m
-    subpixel_rms: float = 0.08  # disparity noise [px]
+    subpixel_rms: float = 0.02  # disparity noise [px]
     dropout_probability: float = 0.02  # random invalid pixels
     noise: bool = True
 
@@ -267,9 +268,11 @@ class MeshRayCaster:
     def __init__(self, vertices: np.ndarray, faces: np.ndarray) -> None:
         vertices = np.asarray(vertices, float)
         faces = np.asarray(faces, int)
+        self.vertices, self.faces = vertices, faces
         self._v0 = vertices[faces[:, 0]]
         self._e1 = vertices[faces[:, 1]] - self._v0
         self._e2 = vertices[faces[:, 2]] - self._v0
+        self._det_axis = np.cross(self._e2, self._e1)
         lower, upper = vertices.min(axis=0), vertices.max(axis=0)
         self.centre = 0.5 * (lower + upper)
         self.radius = float(np.linalg.norm(vertices - self.centre, axis=1).max())
@@ -300,18 +303,26 @@ class MeshRayCaster:
         along = directions @ to_centre
         miss_sq = float(to_centre @ to_centre) - along**2
         candidates = np.flatnonzero((miss_sq <= self.radius**2) & (along + self.radius > 0.0))
+        if not len(candidates):
+            return result
+        # Moller-Trumbore with the triple products rewritten so that only the
+        # ray direction d varies: det = d.(e2 x e1), u*det = d.(e2 x s),
+        # v*det = d.(s x e1), t*det = e2.(s x e1). Each is then one matrix
+        # product per chunk of rays instead of (rays, faces, 3) cross products.
+        # (einsum, not @: OpenBLAS threads these small products and that is slower.)
+        s = origin - self._v0  # (f, 3)
+        q = np.cross(s, self._e1)
+        u_axis = np.cross(self._e2, s)
+        t_num = np.einsum("fk,fk->f", self._e2, q)
         for start in range(0, len(candidates), self.CHUNK):
             rays = candidates[start : start + self.CHUNK]
-            d = directions[rays][:, None, :]  # (r, 1, 3)
-            p = np.cross(d, self._e2[None])  # (r, f, 3)
-            det = np.einsum("fk,rfk->rf", self._e1, p)
+            d = directions[rays]
+            det = np.einsum("rk,fk->rf", d, self._det_axis)
             with np.errstate(divide="ignore", invalid="ignore"):
                 inv = 1.0 / det
-                s = origin - self._v0  # (f, 3)
-                u = np.einsum("fk,rfk->rf", s, p) * inv
-                q = np.cross(s, self._e1)  # (f, 3)
-                v = np.einsum("rk,fk->rf", directions[rays], q) * inv
-                t = np.einsum("fk,fk->f", self._e2, q)[None] * inv
+                u = np.einsum("rk,fk->rf", d, u_axis) * inv
+                v = np.einsum("rk,fk->rf", d, q) * inv
+                t = t_num[None] * inv
             ok = (np.abs(det) > 1e-12) & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 0) & (t <= max_range)
             t = np.where(ok, t, np.inf).min(axis=1)
             result[rays] = np.where(np.isfinite(t), t, np.nan)
@@ -340,37 +351,55 @@ class SimulatedDepthCamera:
         self._site_rays = self._optical_rays @ SITE_FROM_OPTICAL.T
         self._rng = np.random.default_rng(seed)
 
-    def capture(self, data: mujoco.MjData, roi_radius: float | None = None) -> DepthFrame:
+    def capture(self, data: mujoco.MjData, roi_radius: float | None = None,
+                look_at: tuple[np.ndarray, float] | None = None) -> DepthFrame:
         """Render one depth frame.
 
-        ``roi_radius`` is a simulation-only speed-up: only pixels whose rays
-        can reach the ground within ``roi_radius`` (horizontally) of the point
-        straight below the camera are cast; all others are NaN. The plane fit
-        only reads that region, so its result is unchanged. A real camera
-        delivers the full frame at no cost, so leave it None there.
+        ``roi_radius`` and ``look_at`` are simulation-only speed-ups that cast
+        only part of the frame; all other pixels are NaN. A real camera
+        delivers the full frame at no cost, so leave them None there.
+
+        ``roi_radius``: only pixels whose rays can reach the ground within
+        ``roi_radius`` (horizontally) of the point straight below the camera.
+        The plane fit only reads that region, so its result is unchanged.
+
+        ``look_at`` = (centre, radius): only pixels whose rays pass within
+        ``radius`` of the world point ``centre``. This makes a full-resolution
+        frame of a small distant object (the scan target) affordable.
         """
         site_rotation = data.site_xmat[self._site_id].reshape(3, 3)
         origin = data.site_xpos[self._site_id]
-        directions = self._site_rays @ site_rotation.T
-        selected = np.arange(len(directions))
+        selected = np.arange(len(self._site_rays))
         if roi_radius is not None and isinstance(self._ray_caster, HeightfieldRayCaster):
             reach = 1.5 * roi_radius
             top = self._ray_caster.max_height_near(origin[0], origin[1], reach)
             drop = origin[2] - top
             if drop > 0.0:
+                directions = self._site_rays @ site_rotation.T
                 horizontal = np.hypot(directions[:, 0], directions[:, 1])
                 down = -directions[:, 2]
                 with np.errstate(divide="ignore", invalid="ignore"):
                     selected = np.flatnonzero((down > 0) & (horizontal / down <= reach / drop))
-        distance = np.full(len(directions), np.nan)
+        elif look_at is not None:
+            # Cone around the direction to the sphere, in the site frame so
+            # only the selected rays need rotating.
+            offset = (np.asarray(look_at[0], float) - origin) @ site_rotation
+            span = float(np.linalg.norm(offset))
+            radius = float(look_at[1])
+            if span > radius:
+                cos_cone = math.sqrt(1.0 - (radius / span) ** 2)
+                selected = np.flatnonzero(self._site_rays @ (offset / span) >= cos_cone)
+        distance = np.full(len(self._site_rays), np.nan)
         distance[selected] = self._ray_caster.cast(
-            origin, directions[selected], self.spec.max_range * 1.6
+            origin, self._site_rays[selected] @ site_rotation.T, self.spec.max_range * 1.6
         )
         depth = distance * self._optical_rays[:, 2]
         if self.spec.noise:
-            valid = np.isfinite(depth)
-            depth[valid] += self._rng.standard_normal(valid.sum()) * self.spec.depth_sigma(depth[valid])
-            depth[self._rng.random(depth.shape) < self.spec.dropout_probability] = np.nan
+            values = depth[selected]
+            valid = np.isfinite(values)
+            values[valid] += self._rng.standard_normal(valid.sum()) * self.spec.depth_sigma(values[valid])
+            values[self._rng.random(len(values)) < self.spec.dropout_probability] = np.nan
+            depth[selected] = values
         with np.errstate(invalid="ignore"):
             depth[(depth < self.spec.min_range) | (depth > self.spec.max_range)] = np.nan
         # Tag the frame with the pose the rays were cast from: the body's
@@ -390,3 +419,4 @@ def _required(model: mujoco.MjModel, object_type: int, name: str) -> int:
     if object_id < 0:
         raise ValueError(f"Model is missing required MuJoCo object {name!r}")
     return object_id
+

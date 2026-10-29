@@ -95,7 +95,7 @@ class ViewerApplicationTests(unittest.TestCase):
                 self._model = model
                 self._data = data
                 self._key_callback = key_callback
-                self.cam = SimpleNamespace()
+                self.cam = mujoco.MjvCamera()
 
             def is_running(self) -> bool:
                 self._iterations += 1
@@ -174,20 +174,6 @@ class ViewerApplicationTests(unittest.TestCase):
             def terminate(self) -> None:
                 self.terminated = True
 
-        windows = []
-
-        class FakeWindow:
-            def __init__(self, command, **kwargs) -> None:
-                self.command = command
-                self.terminated = False
-                windows.append(self)
-
-            def poll(self):
-                return None
-
-            def terminate(self) -> None:
-                self.terminated = True
-
         with (
             patch.object(app.mujoco.viewer, "launch_passive", launch_passive),
             patch.object(app, "UdpTelemetry", FakeTelemetry),
@@ -205,6 +191,8 @@ class ViewerApplicationTests(unittest.TestCase):
             self.assertEqual(len(read_ply(scan_file)), 0)
         # The live point cloud window is started on the scan file and closed
         # again when the viewer exits.
+        # (Warp's first init also runs `uname -p` through Popen.)
+        windows = [w for w in windows if "jumper_sim.cloud_viewer" in w.command]
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].command[1:4], ["-m", "jumper_sim.cloud_viewer", str(scan_file)])
         self.assertTrue(windows[0].terminated)
@@ -213,19 +201,14 @@ class ViewerApplicationTests(unittest.TestCase):
         self.assertEqual(windows[0].command[4], "--target")
         x, y, _ = (float(v) for v in windows[0].command[5:8])
         self.assertLessEqual(np.hypot(x, y), app.RANDOM_TARGET_RADIUS)
-        # The live point cloud window is started on the scan file and closed
-        # again when the viewer exits.
-        self.assertEqual(len(windows), 1)
-        self.assertEqual(windows[0].command[1:4], ["-m", "jumper_sim.cloud_viewer", str(scan_file)])
-        self.assertTrue(windows[0].terminated)
 
         self.assertEqual(result, 0)
         self.assertGreater(simulated_data[0].time, 0.0)
-        self.assertEqual(
-            viewer_cameras[0].type, mujoco.mjtCamera.mjCAMERA_TRACKING
-        )
-        self.assertEqual(
-            viewer_cameras[0].trackbodyid, base_body_ids[0]
+        # The robot is followed with a free camera centred on it (MuJoCo's
+        # tracking camera lags and stutters with a fast robot).
+        self.assertEqual(viewer_cameras[0].type, mujoco.mjtCamera.mjCAMERA_FREE)
+        np.testing.assert_allclose(
+            viewer_cameras[0].lookat, simulated_data[0].xpos[base_body_ids[0]]
         )
         self.assertEqual(viewer_cameras[0].distance, 3.0)
         self.assertEqual(viewer_cameras[0].azimuth, 135.0)
@@ -251,12 +234,63 @@ class ViewerApplicationTests(unittest.TestCase):
             "[CONTROLLER] Disabled",
             "[CONTROLLER] Attitude stabilization enabled",
             "[RESET] Simulation reset",
-            "[SCAN] Target point cloud",
+            "[LIDAR] Livox Mid-360S",
+            "[SCAN] Lidar point cloud",
             "[TARGET] Random target",
-            "[SCAN] Point cloud window opened",
             "[SCAN] Point cloud window opened",
         ):
             self.assertIn(expected, messages[0])
+
+
+class LidarOptionTests(unittest.TestCase):
+    def test_lidar_fraction_defaults_to_the_hardware(self) -> None:
+        parser = app.build_argument_parser()
+        self.assertIsNone(parser.parse_args([]).lidar_fraction)  # 1 with a GPU, 0.1 without
+        self.assertEqual(parser.parse_args(["--lidar-fraction", "0.05"]).lidar_fraction, 0.05)
+
+    def test_lidar_defaults_to_the_mid360s_with_the_as_dt1_as_an_option(self) -> None:
+        parser = app.build_argument_parser()
+        self.assertIsNone(parser.parse_args([]).lidar)  # the Mid-360S
+        self.assertEqual(parser.parse_args(["--lidar", "as-dt1"]).lidar, "as-dt1")
+        self.assertEqual(app.selected_lidar(None, spin=False), "mid360s")
+        self.assertEqual(app.selected_lidar("as-dt1", spin=False), "as-dt1")
+        self.assertEqual(app.selected_lidar(None, spin=True), "as-dt1")  # --spin alone
+        with self.assertRaises(ValueError):
+            app.selected_lidar("mid360s", spin=True)
+        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            parser.parse_args(["--lidar", "avia"])
+
+
+class RobotFollowerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.viewer = SimpleNamespace(cam=mujoco.MjvCamera())
+        self.data = SimpleNamespace(xpos=np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]))
+        self.follower = app.RobotFollower(1)
+
+    def test_camera_centre_moves_with_the_robot_without_lag(self) -> None:
+        self.follower.start(self.viewer, self.data)
+        self.assertEqual(self.viewer.cam.type, mujoco.mjtCamera.mjCAMERA_FREE)
+        np.testing.assert_allclose(self.viewer.cam.lookat, (1.0, 2.0, 3.0))
+        self.data.xpos[1] = (1.0, 2.0, 9.0)  # a fast climb
+        self.viewer.cam.azimuth = 40.0  # the user rotates: still following
+        self.follower.update(self.viewer, self.data)
+        np.testing.assert_allclose(self.viewer.cam.lookat, (1.0, 2.0, 9.0))
+
+    def test_panning_hands_the_camera_to_the_user_until_restarted(self) -> None:
+        self.follower.start(self.viewer, self.data)
+        self.viewer.cam.lookat[:] = (5.0, 5.0, 0.0)  # user pans
+        self.data.xpos[1] = (1.0, 2.0, 9.0)
+        self.follower.update(self.viewer, self.data)
+        np.testing.assert_allclose(self.viewer.cam.lookat, (5.0, 5.0, 0.0))
+        self.assertFalse(self.follower.active)
+        self.follower.start(self.viewer, self.data)  # R
+        np.testing.assert_allclose(self.viewer.cam.lookat, (1.0, 2.0, 9.0))
+
+    def test_another_camera_stops_following(self) -> None:
+        self.follower.start(self.viewer, self.data)
+        self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+        self.follower.update(self.viewer, self.data)
+        self.assertFalse(self.follower.active)
 
 
 if __name__ == "__main__":

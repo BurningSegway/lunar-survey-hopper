@@ -1,17 +1,20 @@
-"""Viewer overlays: the camera's estimated landing plane.
+"""Viewer overlays: the lidar's estimated landing plane.
 
 Drawn into a ``mujoco.MjvScene`` (the passive viewer's ``user_scn``):
 
-* a translucent disc on the latest single-frame plane fit, the size of the
-  fitting region: orange when that fit updated the reference, grey when it
-  did not (too far away to trust, frozen just before touchdown, rejected as
-  an outlier) or while the robot is in contact and the estimate is held;
+* a translucent disc on the latest plane fit at the predicted landing spot,
+  the size of the fitting region: orange when that fit updated the
+  reference, grey when it did not (too noisy, frozen just before touchdown,
+  rejected as an outlier) or while the robot is in contact and the estimate
+  is held;
 * a green arrow along the filtered reference normal the controller aligns body z to;
-* small blue dots: a sample of the depth points the fit used;
-* the camera's tracking target (red sphere) while a hop is under way, with a
-  red line from the camera to it during the ascent;
-* cyan dots: a sample of the target point cloud collected so far (with
-  ``--scan-file`` scanning on), refreshed after each jump's ascent.
+* small blue dots: a sample of the lidar points the fit used;
+* the lidar's tracking target (red sphere) while a hop is under way, with a
+  red line from the lidar to it during the ascent;
+* cyan dots: a sample of the point cloud collected so far (with scanning
+  on), refreshed at each touchdown;
+* a text label above the robot: its height above where it last touched the
+  ground.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ ARROW_LENGTH = 0.45
 POINT_RADIUS = 0.008
 SCAN_RGBA = np.array([0.1, 0.9, 0.9, 0.8], dtype=np.float32)
 SCAN_POINT_RADIUS = 0.01
+HEIGHT_LABEL_OFFSET = 0.4  # m above the robot's base
+HEIGHT_LABEL_RGBA = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
 
 def frame_from_normal(normal: np.ndarray) -> np.ndarray:
@@ -107,13 +112,13 @@ def draw_flight_target(scene: mujoco.MjvScene, simulation: JumperSimulation) -> 
             mujoco.mjv_initGeom(line, mujoco.mjtGeom.mjGEOM_LINE, np.zeros(3), np.zeros(3),
                                 np.eye(3).ravel(), SIGHT_RGBA)
             mujoco.mjv_connector(line, mujoco.mjtGeom.mjGEOM_LINE, 2.0,
-                                 simulation.data.site_xpos[simulation._camera_site],
+                                 simulation.data.site_xpos[simulation._lidar_site],
                                  reference.active_target)
     return scene.ngeom - start
 
 
 def draw_target_scan(scene: mujoco.MjvScene, simulation: JumperSimulation) -> int:
-    """Append an even sample of the target point cloud collected so far."""
+    """Append an even sample of the point cloud collected so far."""
     scan = simulation.target_scan
     if scan is None:
         return 0
@@ -126,3 +131,19 @@ def draw_target_scan(scene: mujoco.MjvScene, simulation: JumperSimulation) -> in
                             np.array([SCAN_POINT_RADIUS, 0.0, 0.0]), point,
                             np.eye(3).ravel(), SCAN_RGBA)
     return scene.ngeom - start
+
+
+def draw_height_label(scene: mujoco.MjvScene, simulation: JumperSimulation) -> int:
+    """Append a label with the height above the last ground contact."""
+    height = simulation.height_above_last_ground
+    if height is None:
+        return 0
+    geom = _add_geom(scene)
+    if geom is None:
+        return 0
+    body = simulation.model.jnt_bodyid[simulation.ids.root_joint]
+    position = simulation.data.xpos[body] + (0.0, 0.0, HEIGHT_LABEL_OFFSET)
+    mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_LABEL, np.zeros(3), position,
+                        np.eye(3).ravel(), HEIGHT_LABEL_RGBA)
+    geom.label = f"h = {height:.2f} m"
+    return 1

@@ -196,16 +196,75 @@ class FlightReferenceTests(unittest.TestCase):
                                     target=(2.0, 0.0))
         reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
         camera = np.array([0.0, 0.0, 2.0])
-        q = reference.update(FlightPhase.ASCENT, camera, 0.0, LEVEL, DT)
-        self.assertLess(reference.camera_pointing_error(q, camera), 1e-6)
+        q = reference.update(FlightPhase.ASCENT, camera, 0.0, lambda yaw: LEVEL, DT)
+        self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
         plane = (math.cos(0.05), math.sin(0.05), 0.0, 0.0)
-        q = reference.update(FlightPhase.DESCENT, camera, 0.0, plane, DT)
+        q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
         np.testing.assert_allclose(q, plane, atol=1e-12)
         # Flights not started by a jump (bounces) never track.
         reference.start_flight(LEVEL, np.zeros(3), 0.0, track=False)
-        q = reference.update(FlightPhase.ASCENT, camera, 0.0, LEVEL, DT)
+        q = reference.update(FlightPhase.ASCENT, camera, 0.0, lambda yaw: LEVEL, DT)
         np.testing.assert_allclose(q, LEVEL, atol=1e-12)
 
+
+    def test_slow_spin_turns_the_heading_and_stops_before_touchdown(self) -> None:
+        config = FlightReferenceConfig(slew_rate=math.radians(1e6), spin=True, face_travel=True)
+        reference = FlightReference(config, target=(2.0, 0.0))
+        reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
+        camera = np.array([0.0, 0.0, 2.0])
+        for _ in range(int(2.0 / DT)):
+            q = reference.update(FlightPhase.ASCENT, camera, 0.0, lambda yaw: LEVEL, DT)
+        # Up to speed (ramped at 90 deg/s^2), still tracking with body -z.
+        self.assertAlmostEqual(math.degrees(reference.heading_rate), 45.0)
+        self.assertAlmostEqual(math.degrees(reference.heading_offset), 45.0 * 2.0 - 0.5 * 45.0 * 0.5,
+                               delta=0.5)
+        self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
+        # Descent: keeps spinning while touchdown is far or unknown ...
+        reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: LEVEL, DT, touchdown_in=3.0)
+        self.assertAlmostEqual(math.degrees(reference.heading_rate), 45.0)
+        # ... and stops within 0.5 s once it is near, keeping the heading reached.
+        for _ in range(int(0.5 / DT) + 1):
+            reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: LEVEL, DT,
+                             touchdown_in=0.9)
+        self.assertEqual(reference.heading_rate, 0.0)
+        angle = reference.heading_offset
+        q = reference.update(FlightPhase.LANDING, camera, 0.3,
+                             lambda yaw: (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)), DT)
+        self.assertEqual(reference.heading_offset, angle)
+        np.testing.assert_allclose(q, (math.cos((0.3 + angle) / 2), 0.0, 0.0,
+                                       math.sin((0.3 + angle) / 2)), atol=1e-9)
+        # A new flight starts from no spin.
+        reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
+        self.assertEqual((reference.heading_offset, reference.heading_rate), (0.0, 0.0))
+
+    def test_faces_the_direction_of_travel_and_stops_on_it(self) -> None:
+        config = FlightReferenceConfig(slew_rate=math.radians(1e6), face_travel=True)
+        reference = FlightReference(config, target=(2.0, 0.0))
+        reference.start_flight(LEVEL, np.zeros(3), 0.3, track=True)
+        camera = np.array([0.0, 0.0, 2.0])
+        velocity = np.array([-1.0, -1.0, 3.0])  # travelling towards -135 deg
+        peak = 0.0
+        for _ in range(int(4.0 / DT)):
+            q = reference.update(FlightPhase.ASCENT, camera, 0.3, lambda yaw: LEVEL, DT,
+                                 velocity=velocity)
+            peak = max(peak, abs(reference.heading_rate))
+        # Turned the short way (-152 deg), at <= 90 deg/s, and stopped there.
+        self.assertAlmostEqual(math.degrees(reference.heading_offset), -135.0 - math.degrees(0.3),
+                               delta=0.5)
+        self.assertLessEqual(math.degrees(peak), 90.0 + 1e-6)
+        self.assertLess(abs(math.degrees(reference.heading_rate)), 1.0)
+        self.assertLess(reference.axis_target_angle(q, camera), 1e-6)  # still tracking
+        # Level on the way down: body +x (the lidar's tilt) along the travel.
+        q = reference.update(FlightPhase.DESCENT, camera, 0.3,
+                             lambda yaw: (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)), DT,
+                             velocity=velocity)
+        x_axis = quaternion_to_matrix(q)[:, 0]
+        np.testing.assert_allclose(x_axis, (-math.sqrt(0.5), -math.sqrt(0.5), 0.0), atol=0.01)
+        # Straight up/down (no horizontal speed): holds its heading.
+        held = reference.heading_offset
+        reference.update(FlightPhase.DESCENT, camera, 0.3, lambda yaw: LEVEL, DT,
+                         velocity=np.array([0.0, 0.0, -2.0]))
+        self.assertAlmostEqual(reference.heading_offset, held, places=3)
 
 class JumpAimTests(unittest.TestCase):
     FEET = np.array([[0.2, 0.2, 0], [0.2, -0.2, 0], [-0.2, 0.2, 0], [-0.2, -0.2, 0]])

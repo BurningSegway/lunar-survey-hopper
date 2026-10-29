@@ -24,16 +24,13 @@ from jumper_sim.controller import (
     robot_inertia,
     wheel_effective_inertia,
 )
-from jumper_sim.depth_camera import (
-    TERRAIN_GEOM_GROUP,
-    DepthCameraSpec,
-    HeightfieldRayCaster,
-    SimulatedDepthCamera,
-)
+from jumper_sim.ray_casting import TERRAIN_GEOM_GROUP, HeightfieldRayCaster
 from jumper_sim.flight_phase import FlightPhase
-from jumper_sim.pointcloud import PointCloudRecorder, ScanConfig, read_ply
+from jumper_sim.pointcloud import PointCloudRecorder, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
-from jumper_sim.visualization import draw_landing_plane
+from jumper_sim.lidar import LIVOX_MID360, SONY_AS_DT1, effective_range_sigma
+from jumper_sim.recovery import RecoveryStage, righting_axis
+from jumper_sim.visualization import draw_height_label, draw_landing_plane
 
 def mujoco_ray_distances(model, data, origin, directions, max_range):
     """Reference distances from MuJoCo's mj_multiRay (NaN for no hit)."""
@@ -101,58 +98,81 @@ class SimulationTests(unittest.TestCase):
             np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
             np.testing.assert_allclose(a[np.isfinite(a)], b[np.isfinite(b)], atol=1e-6)
 
-    def test_depth_camera_sees_ground_only_within_d435_range(self) -> None:
-        camera = SimulatedDepthCamera(
-            self.model, self.simulation.ids.root_joint, DepthCameraSpec(noise=False)
-        )
-        caster = HeightfieldRayCaster(self.model)
-        ground = float(caster.height(np.array([0.0]), np.array([0.0]))[0])
-        for height, expect_valid in ((2.0, True), (0.35, False)):
-            self.data.qpos[:3] = (0.0, 0.0, ground + height)
-            self.data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
-            mujoco.mj_forward(self.model, self.data)
-            frame = camera.capture(self.data)
-            self.assertEqual(frame.depth.shape, (60, 106))
-            centre = frame.depth[30, 53]
-            if expect_valid:
-                self.assertAlmostEqual(centre, height - 0.151, delta=0.15)
-            else:
-                self.assertTrue(np.isnan(frame.depth).mean() > 0.9)
-
-    def test_landing_reference_updates_only_in_flight(self) -> None:
+    def test_landing_reference_fits_the_ground_at_the_predicted_landing_spot(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
         self.assertIsNotNone(simulation.landing_reference)
-        caster = HeightfieldRayCaster(self.model)
-        x, y = 5.0, -3.0  # sloped spot
-        ground = float(caster.height(np.array([x]), np.array([y]))[0])
-        self.model.opt.gravity[2] = -MOON_GRAVITY
-        self.data.qpos[:3] = (x, y, ground + 3.0)
-        mujoco.mj_forward(self.model, self.data)
-        simulation.landing_reference.reset(float(self.data.time))
-        self.assertFalse(simulation.robot_touches_terrain())
-        while not simulation.robot_touches_terrain() and self.data.time < 4.0:
+        x, y = -4.0, 7.47  # ~17 deg slope
+        truth = self._throw(simulation, x, y, apex=6.0)
+        scans_in_contact = []
+        original_scan = simulation.lidar.scan
+
+        def scan(data, duration):
+            scans_in_contact.append(simulation.in_contact)
+            return original_scan(data, duration)
+
+        simulation.lidar.scan = scan
+        while not simulation.robot_touches_terrain() and self.data.time < 8.0:
             simulation.step()
         filt = simulation.landing_reference.filter
-        self.assertGreater(filt.accepted, 5)
-        self.assertGreater(math.degrees(math.acos(filt.normal[2])), 5.0)
-        # No depth frame is ever captured while the robot is in contact
-        # (bounces are flights and may capture).
-        camera = simulation.landing_reference.camera
-        original_capture = camera.capture
-        captures_in_contact = []
-
-        def capture(data, roi_radius=None):
-            captures_in_contact.append(simulation.in_contact)
-            return original_capture(data, roi_radius)
-
-        camera.capture = capture
+        self.assertGreater(filt.accepted, 10)
+        # The jump's points around the predicted spot give its slope.
+        self.assertGreater(math.degrees(math.acos(filt.normal[2])), 10.0)
+        self.assertLess(math.degrees(math.acos(min(1.0, float(filt.normal @ truth)))), 3.0)
+        body_z = self.data.xmat[self.model.jnt_bodyid[simulation.ids.root_joint]].reshape(3, 3)[:, 2]
+        self.assertLess(math.degrees(math.acos(min(1.0, float(body_z @ truth)))), 3.0)
+        visual = simulation.landing_reference.visual
+        self.assertLess(math.hypot(visual.anchor[0] - x, visual.anchor[1] - y), 0.5)
+        self.assertLessEqual(len(visual.points), 150)
+        # The lidar only scans while airborne (bounces are flights).
         for _ in range(1500):
             simulation.step()
-        self.assertNotIn(True, captures_in_contact)
+        self.assertTrue(scans_in_contact)
+        self.assertNotIn(True, scans_in_contact)
         telemetry = simulation.telemetry_payload()
         self.assertNotEqual((telemetry["roll_ref"], telemetry["pitch_ref"]), (0.0, 0.0))
+        # A new jump starts from "level" with an empty map.
         simulation.handle_key("space")
         np.testing.assert_allclose(filt.normal, (0.0, 0.0, 1.0))
+        self.assertEqual(simulation.landing_reference.map.count, 0)
+
+    def test_as_dt1_casts_from_the_bottom_site_for_the_landing_reference(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr", lidar=SONY_AS_DT1)
+        self.assertEqual(simulation._lidar_site, self.model.site("lidar_down").id)
+        self.assertAlmostEqual(simulation.landing_reference._point_sigma,
+                               effective_range_sigma(SONY_AS_DT1))
+        self._throw(simulation, -4.0, 7.47, apex=6.0)
+        while not simulation.robot_touches_terrain() and self.data.time < 8.0:
+            simulation.step()
+        # Whole 576-point frames at 15 fps went into the ground map.
+        self.assertGreater(simulation.landing_reference.map.count, 576 * 15)
+
+    def _throw(self, simulation, x, y, apex, distance=5.0, heading=0.0):
+        """Launch the robot as a hop that lands on (x, y), apex ``apex`` above
+        it, Moon gravity; returns the true ground normal there (0.5 m disc)."""
+        caster = HeightfieldRayCaster(self.model)
+        g = MOON_GRAVITY
+        self.model.opt.gravity[2] = -g
+        direction = np.array([math.cos(heading), math.sin(heading)])
+        start = np.array([x, y]) - distance * direction
+        start_z = float(caster.height(start[:1], start[1:])[0]) + 0.6
+        ground = float(caster.height(np.array([x]), np.array([y]))[0])
+        up = math.sqrt(2.0 * g * (ground + apex - start_z))
+        flight = up / g + math.sqrt(2.0 * (apex - 0.3) / g)
+        self.data.qpos[:3] = (*start, start_z)
+        self.data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+        self.data.qvel[:3] = (*(distance / flight * direction), up)
+        mujoco.mj_forward(self.model, self.data)
+        # As after a real lift-off: in ASCENT, the IMU's vertical velocity known.
+        simulation.flight_phase.phase = FlightPhase.ASCENT
+        simulation.flight_phase.estimator.vertical_velocity = up
+        simulation.landing_reference.reset(float(self.data.time))
+        g_ = np.linspace(-0.5, 0.5, 41)
+        gx, gy = np.meshgrid(g_, g_)
+        inside = gx**2 + gy**2 <= 0.25
+        a, b, _ = np.linalg.lstsq(np.column_stack([gx[inside], gy[inside], np.ones(inside.sum())]),
+                                  caster.height(gx[inside] + x, gy[inside] + y), rcond=None)[0]
+        normal = np.array([-a, -b, 1.0])
+        return normal / np.linalg.norm(normal)
 
     def _drop(self, simulation, height=1.5, x=0.0, y=0.0):
         caster = HeightfieldRayCaster(self.model)
@@ -177,12 +197,15 @@ class SimulationTests(unittest.TestCase):
             simulation.step()
         self.assertTrue(simulation.in_contact)
         self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
-        # In contact only the rest torque acts: it opposes each wheel's spin.
-        simulation.step()
-        for actuator_id, joint_id in zip(simulation.ids.wheel_actuators, simulation.ids.wheel_joints):
-            speed = self.data.qvel[self.model.jnt_dofadr[joint_id]]
-            if abs(speed) > 1.0:
-                self.assertLessEqual(self.data.ctrl[actuator_id] * speed, 0.0)
+        # In contact only the rest controller acts: it ramps every wheel down.
+        # (It tracks a speed ramp, so while a wheel slows faster than the ramp
+        # its torque can briefly push along the spin.)
+        at_contact = np.abs(astuple(simulation.read_wheel_speeds()))
+        for _ in range(500):
+            simulation.step()
+        if simulation.in_contact:
+            later = np.abs(astuple(simulation.read_wheel_speeds()))
+            self.assertTrue(np.all(later[at_contact > 1.0] < at_contact[at_contact > 1.0]))
         for _ in range(6000):
             simulation.step()
         if simulation.in_contact:
@@ -222,7 +245,7 @@ class SimulationTests(unittest.TestCase):
         self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
 
     def test_both_controllers_run_the_same_hop_process(self) -> None:
-        # PID and LQR are compared on the same chain: camera landing plane,
+        # PID and LQR are compared on the same chain: lidar landing plane,
         # contact gating, target tracking on ascent and leaning to the target.
         for controller in ("pid", "lqr"):
             with self.subTest(controller=controller):
@@ -238,11 +261,10 @@ class SimulationTests(unittest.TestCase):
 
     def test_landing_plane_overlay_is_drawn(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
-        self.model.opt.gravity[2] = -MOON_GRAVITY
-        self._drop(simulation, height=2.5, x=5.0, y=-3.0)
+        self._throw(simulation, -4.0, 7.47, apex=3.0)
         scene = mujoco.MjvScene(self.model, maxgeom=500)
         self.assertEqual(draw_landing_plane(scene, simulation), 0)  # nothing fitted yet
-        while self.data.time < 0.5:
+        while simulation.landing_reference.visual is None and self.data.time < 6.0:
             simulation.step()
         added = draw_landing_plane(scene, simulation)
         self.assertGreater(added, 2)
@@ -253,6 +275,27 @@ class SimulationTests(unittest.TestCase):
         )
         small = mujoco.MjvScene(self.model, maxgeom=3)
         self.assertLessEqual(draw_landing_plane(small, simulation), 3)
+
+    def test_height_above_last_ground_contact_is_labelled(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
+        scene = mujoco.MjvScene(self.model, maxgeom=10)
+        self.assertIsNone(simulation.height_above_last_ground)  # spawn: not landed yet
+        self.assertEqual(draw_height_label(scene, simulation), 0)
+        while self.data.time < 2.0:
+            simulation.step()
+        self.assertAlmostEqual(simulation.height_above_last_ground, 0.0, delta=0.01)
+        simulation.handle_key("space")
+        apex = 0.0
+        while self.data.time < 4.0:
+            simulation.step()
+            if not simulation.in_contact:
+                apex = max(apex, simulation.height_above_last_ground)
+        self.assertGreater(apex, 1.0)  # an Earth hop (~3 m apex)
+        self.assertEqual(draw_height_label(scene, simulation), 1)
+        self.assertEqual(scene.geoms[0].type, mujoco.mjtGeom.mjGEOM_LABEL)
+        self.assertTrue(scene.geoms[0].label.startswith("h = "))
+        simulation.reset()
+        self.assertIsNone(simulation.height_above_last_ground)
 
     def test_terrain_is_firm_and_overdamped(self) -> None:
         terrain = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_collision")
@@ -280,11 +323,11 @@ class SimulationTests(unittest.TestCase):
             simulation._leg_stiffness * simulation.leg_shortening,
         )
 
-    def test_target_object_stands_at_target_and_the_camera_sees_it(self) -> None:
+    def test_target_object_stands_at_target_and_the_lidar_sees_it(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr", track_target=(8.0, 3.0))
         mujoco.mj_forward(self.model, self.data)
         target = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "target_object")
-        caster = simulation._terrain_ray_caster()
+        caster = simulation._terrain
         self.assertEqual(len(caster.objects), 1)
         # Same distances as MuJoCo's own ray cast against the object.
         groups = self.model.geom_group.copy()
@@ -332,7 +375,55 @@ class SimulationTests(unittest.TestCase):
         forces = self.data.ctrl[list(simulation.ids.leg_actuators)]
         np.testing.assert_allclose(forces, 1500.0 * 0.12 * 1.2)
 
-    def test_hop_tracks_target_on_ascent_and_fits_ground_only_on_descent(self) -> None:
+    def _tip_over(self, simulation, euler_deg) -> None:
+        quaternion = np.zeros(4)
+        mujoco.mju_euler2Quat(quaternion, np.radians(euler_deg), "xyz")
+        self.data.qpos[3:7] = quaternion
+        self.data.qpos[2] = 0.4
+        while self.data.time < 6.0:
+            simulation.step()
+        self.assertTrue(simulation.tipped)
+
+    def test_space_while_tipped_attempts_a_recovery(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self._tip_over(simulation, (90.0, 0.0, 0.0))
+        self.assertIn("[RECOVERY]", simulation.handle_key("space"))
+        self.assertIsNone(simulation.handle_key("space"))  # one attempt at a time
+        start = float(self.data.time)
+        body = self.model.jnt_bodyid[simulation.ids.root_joint]
+        simulation.step()
+        # Spin-up: wheel torque along the righting axis, i.e. the body is
+        # pushed away from upright (into the ground).
+        torque = np.array([self.data.ctrl[a] for a in simulation.ids.wheel_actuators])
+        axis = righting_axis(self.data.xmat[body].reshape(3, 3))
+        self.assertGreater(float(torque @ axis), 1.0)
+        self.assertFalse(simulation.jump_triggered)
+        while simulation.recovery.stage is RecoveryStage.SPIN_UP:
+            simulation.step()
+        self.assertTrue(simulation.jump_triggered)  # spring released ...
+        self.assertAlmostEqual(simulation.jump_start_time - start, 0.15, delta=0.002)  # ... after 0.15 s
+        levelled = False
+        while simulation.recovery is not None and self.data.time < start + 10.0:
+            simulation.step()
+            if not simulation.in_contact:
+                # In the air the controller aims for level.
+                q = simulation.reference_quaternion()
+                levelled = levelled or (abs(q[1]) < 1e-9 and abs(q[2]) < 1e-9)
+        self.assertTrue(levelled)
+        self.assertIsNone(simulation.recovery)
+        self.assertFalse(simulation.tipped)
+        self.assertTrue(any(e == "[RECOVERY] Upright." for e in simulation.flight_events))
+        # A recovery hop neither tracks the target nor counts as a scan jump.
+        self.assertFalse(simulation.flight_reference.tracking)
+
+    def test_recovery_needs_the_wheels(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self._tip_over(simulation, (90.0, 0.0, 0.0))
+        simulation.handle_key("x")
+        self.assertIn("press C", simulation.handle_key("space"))
+        self.assertIsNone(simulation.recovery)
+
+    def test_hop_tracks_target_on_ascent_and_fits_landing_plane_only_on_descent(self) -> None:
         for controller in ("lqr", "pid"):
             with self.subTest(controller=controller):
                 self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
@@ -344,18 +435,18 @@ class SimulationTests(unittest.TestCase):
         simulation = JumperSimulation(self.model, self.data, controller, track_target=target,
                                       gravity=EARTH_GRAVITY)  # hop fits the test window
         self.assertIsNotNone(simulation.flight_reference)
-        camera = simulation.landing_reference.camera
-        original_capture = camera.capture
-        capture_phases = []
+        reference = simulation.landing_reference
+        original_step = reference.step
+        fit_phases = []
 
-        def capture(data, roi_radius=None):
-            capture_phases.append(simulation.phase)
-            return original_capture(data, roi_radius)
+        def step(*args):
+            fit_phases.append(simulation.phase)
+            return original_step(*args)
 
-        camera.capture = capture
+        reference.step = step
         while self.data.time < 2.0:
             simulation.step()
-        capture_phases.clear()
+        fit_phases.clear()
         simulation.handle_key("space")
         phases, errors = [], []
         while self.data.time < 6.0:
@@ -363,45 +454,30 @@ class SimulationTests(unittest.TestCase):
             if not phases or phases[-1] is not simulation.phase:
                 phases.append(simulation.phase)
             if simulation.phase is FlightPhase.ASCENT:
-                errors.append(simulation.flight_reference.camera_pointing_error(
-                    tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._camera_site]))
+                errors.append(simulation.flight_reference.axis_target_angle(
+                    tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._lidar_site]))
         self.assertEqual(phases[:4], [FlightPhase.TAKEOFF, FlightPhase.ASCENT,
                                       FlightPhase.DESCENT, FlightPhase.LANDING])
         ground = simulation._ground_height(*target)
         np.testing.assert_allclose(simulation.flight_reference.active_target, (*target, ground + 0.15))
-        # On target at the apex. The PID tracks less tightly: 7.6 deg on this
-        # short Earth hop (2.7-4.6 deg on Moon hops) against ~0 for the LQR.
+        # On target at the apex (the robot's bottom, in the middle of the
+        # side lidar's band). The PID tracks less tightly: 7.5 deg on this
+        # short Earth hop against ~0.3 for the LQR.
         self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
-        self.assertTrue(capture_phases)
-        self.assertEqual(set(capture_phases), {FlightPhase.DESCENT})
+        self.assertTrue(fit_phases)
+        self.assertEqual(set(fit_phases), {FlightPhase.DESCENT})
         self.assertGreater(simulation.landing_reference.filter.accepted, 0)
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))
 
-    def test_target_scan_collects_on_target_ascent_points_across_jumps(self) -> None:
+    def test_scan_keeps_every_lidar_point_of_each_jump(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "scan.ply"
-            recorder = PointCloudRecorder(path, ScanConfig(margin=math.radians(5)))
+            recorder = PointCloudRecorder(Path(folder) / "scan.ply")
+            lidar = replace(LIVOX_MID360, point_fraction=0.02)
             simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY,
-                                          track_target=(2.0, 0.5), target_scan=recorder)
+                                          track_target=(2.0, 0.5), target_scan=recorder,
+                                          lidar=lidar)
             self.assertIs(simulation.target_scan, recorder)
-            # Noise-free so the geometry can be checked exactly.
-            spec = replace(simulation._scan_camera.spec, noise=False)
-            simulation._scan_camera = SimulatedDepthCamera(
-                self.model, simulation.ids.root_joint, spec,
-                ray_caster=simulation._terrain_ray_caster(),  # sees the target object too
-            )
-            camera = simulation._scan_camera
-            original_capture = camera.capture
-            captures = []
-
-            def capture(data, roi_radius=None):
-                body = self.model.jnt_bodyid[simulation.ids.root_joint]
-                captures.append((simulation.phase, simulation.flight_reference.camera_pointing_error(
-                    tuple(data.xquat[body]), data.site_xpos[simulation._camera_site])))
-                return original_capture(data, roi_radius)
-
-            camera.capture = capture
             recorder.start_run()
             for jump in (1, 2):
                 if jump == 2:
@@ -409,26 +485,24 @@ class SimulationTests(unittest.TestCase):
                 while self.data.time < 2.0:
                     simulation.step()
                 simulation.handle_key("space")
-                while self.data.time < 4.0:
+                while self.data.time < 4.5:
                     simulation.step()
-                self.assertEqual(len(read_ply(path)), recorder.point_count)  # saved after ascent
-            self.assertTrue(captures)
-            self.assertEqual({phase for phase, _ in captures}, {FlightPhase.ASCENT})
-            self.assertLessEqual(max(error for _, error in captures), math.radians(5))
-            cloud = read_ply(path)
+                self.assertEqual(len(read_ply(recorder.path)), recorder.point_count)  # saved at touchdown
+            cloud = read_ply(recorder.path)
             self.assertEqual(sorted(set(cloud["jump"].tolist())), [1, 2])
             xyz = np.column_stack([cloud["x"], cloud["y"], cloud["z"]]).astype(float)
-            # Only points within the target object's length of its centre are
-            # kept: the bunny and the ground right around it.
-            centre, length = simulation._target_centre, simulation._target_length
-            self.assertAlmostEqual(length, 0.3, delta=0.02)
-            self.assertGreater(len(cloud), 50)
-            self.assertLessEqual(float(np.max(np.linalg.norm(xyz - centre, axis=1))), length + 1e-5)
-            ground = HeightfieldRayCaster(self.model).height(xyz[:, 0], xyz[:, 1])
-            on_object = xyz[:, 2] - ground > 0.02
-            self.assertTrue(np.any(on_object))  # the bunny itself
-            self.assertTrue(np.any(~on_object))  # and the ground at its foot
-            self.assertTrue(any("[SCAN] Jump 2" in e for e in simulation.flight_events))
+            # Everything the lidar saw, not only the target: points well away from it too.
+            far = np.linalg.norm(xyz - simulation._target_centre, axis=1)
+            self.assertGreater(float(far.max()), 5.0)
+            self.assertGreater(len(cloud), 1000)
+            self.assertTrue(any("[SCAN] Jump 2: +" in e and "lidar points" in e
+                                for e in simulation.flight_events))
+            # Where it touched down: the ground under the robot at first contact.
+            touchdowns = read_touchdowns(recorder.path)
+            self.assertEqual([jump for jump, _ in touchdowns], [1, 2])
+            _, position = touchdowns[-1]
+            self.assertAlmostEqual(position[2], simulation._ground_height(*position[:2]), places=6)
+            self.assertTrue(any("touched down at" in e for e in simulation.flight_events))
 
     def test_target_scan_needs_the_hop_reference(self) -> None:
         recorder = PointCloudRecorder(Path(tempfile.gettempdir()) / "unused.ply")
@@ -605,7 +679,7 @@ class SimulationTests(unittest.TestCase):
         self.assertFalse(self.simulation.wheel_rest_controller.active)
 
     def test_relaxation_slows_wheels_and_telemetry_reports_joint_velocity(self) -> None:
-        # Ground-rest behaviour only; the camera's landing reference (which the
+        # Ground-rest behaviour only; the lidar landing reference (which the
         # spawn drop would pick up) is covered by the landing tests.
         self.simulation = JumperSimulation(
             self.model, self.data, "lqr", landing_reference=False

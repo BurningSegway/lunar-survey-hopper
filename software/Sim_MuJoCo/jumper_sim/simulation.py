@@ -26,22 +26,19 @@ from .controller import (
 from .flight_phase import FlightPhase, FlightPhaseDetector, gravity_magnitude
 from .flight_reference import FlightReference, FlightReferenceConfig
 from .jump_aim import JumpAim
-from .depth_camera import (
-    CAMERA_SITE,
-    TERRAIN_GEOM,
-    DepthCameraSpec,
-    HeightfieldRayCaster,
-    MeshRayCaster,
-    SimulatedDepthCamera,
-)
+from .ray_casting import TERRAIN_GEOM, HeightfieldRayCaster, MeshRayCaster
 from .landing_reference import (
+    GroundMap,
     LandingReference,
     LandingReferenceConfig,
-    estimate_ground_plane,
-    frame_points_world,
+    PlaneEstimate,
+    fit_ground_plane,
     quaternion_to_matrix,
 )
+from .gpu_ray_caster import WarpRayCaster, gpu_available
+from .lidar import LIVOX_MID360, LidarSpec, SimulatedLidar, effective_range_sigma
 from .pointcloud import PointCloudRecorder
+from .recovery import RecoveryAttempt, RecoveryStage, level_quaternion, righting_axis
 from .telemetry import TelemetryPayload, make_telemetry_payload
 
 EARTH_GRAVITY = 9.81
@@ -62,6 +59,9 @@ TARGET_PARKED_DEPTH = 100.0  # m below the terrain while no target is set
 TIPPED_TILT = math.radians(60.0)
 UPRIGHT_TILT = math.radians(45.0)
 TIPPED_LEG_FORCE_MARGIN = 1.2  # x spring force at full stroke
+# Wheel command during a recovery spin-up: far above the motor limit, so
+# limit_wheel_command applies full torque (and the speed limit).
+RECOVERY_WHEEL_COMMAND = 100.0  # N*m
 
 
 LEGS = ("fl", "fr", "bl", "br")
@@ -122,70 +122,73 @@ VISUAL_POINTS = 150
 
 @dataclass(frozen=True)
 class LandingVisual:
-    anchor: np.ndarray  # world point on the fitted plane below the robot
-    measured_normal: np.ndarray  # latest single-frame fit
-    points: np.ndarray  # sample of the camera's ground points (world)
+    anchor: np.ndarray  # world point on the fitted plane at the predicted landing spot
+    measured_normal: np.ndarray  # latest single fit
+    points: np.ndarray  # sample of the lidar points that fit used (world)
     radius: float
     used: bool = True  # False: ignored (too noisy), frozen or rejected
 
 
-class CameraLandingReference:
-    """Drives the simulated D435 and the landing-plane filter.
+class LidarLandingReference:
+    """Feeds the lidar points to the landing-plane fit and filter.
 
-    While the robot is airborne, a depth frame is captured at the camera's
-    frame rate and becomes usable ``latency`` seconds later; each usable frame
-    is fitted and fused. On the ground nothing is updated, so the last
-    estimate is held. :meth:`reset` (called at take-off) returns to "land
-    level" until the camera has seen the ground below.
+    While the robot is airborne, every lidar batch goes into the ground map
+    of the current jump (:meth:`add_points`). Every ``fit_period`` (when
+    asked to fit), the landing spot is predicted from the trajectory, the
+    jump's points around it are fitted and the fit is fused. On the ground
+    nothing is updated, so the last estimate is held. :meth:`reset` (called
+    at take-off) empties the map and returns to "land level".
     """
 
-    def __init__(
-        self,
-        model: mujoco.MjModel,
-        root_joint_id: int,
-        config: LandingReferenceConfig = LandingReferenceConfig(),
-        spec: DepthCameraSpec = DepthCameraSpec(),
-        seed: int = 0,
-    ) -> None:
-        self.camera = SimulatedDepthCamera(model, root_joint_id, spec, seed=seed)
+    def __init__(self, point_sigma: float,
+                 config: LandingReferenceConfig = LandingReferenceConfig()) -> None:
+        self.map = GroundMap(config.map_cell)
         self.filter = LandingReference(config)
         self.config = config
-        self._period = 1.0 / spec.frame_rate
-        self._latency = spec.latency
-        self._pending: list = []
-        self._next_capture = 0.0
-        self._root_qpos = int(model.jnt_qposadr[root_joint_id])
+        self._point_sigma = point_sigma
+        self._next_fit = 0.0
         self.visual: LandingVisual | None = None
+        self.touchdown_at: float | None = None  # predicted at the last fit [s]
 
     def reset(self, time: float) -> None:
         self.filter.reset(time)
-        self._pending.clear()
-        self._next_capture = time
+        self.map.clear()
+        self._next_fit = time
         self.visual = None
+        self.touchdown_at = None
 
-    def step(self, data: mujoco.MjData, airborne: bool) -> None:
-        now = float(data.time)
-        if airborne and now >= self._next_capture:
-            frame = self.camera.capture(data, roi_radius=self.config.roi_radius)
-            self._pending.append((now + self._latency, frame, np.array(frame.body_position)))
-            self._next_capture = now + self._period
-        while self._pending and self._pending[0][0] <= now:
-            _, frame, position = self._pending.pop(0)
-            estimate = estimate_ground_plane(frame, self.camera.mount, self.config)
-            used = self.filter.update(estimate)
-            if estimate.valid:
-                self._store_visual(frame, position, estimate, used)
+    def add_points(self, points: np.ndarray) -> None:
+        self.map.add(points)
 
-    def _store_visual(self, frame, position: np.ndarray, estimate, used: bool) -> None:
-        """Keep the latest fit in world coordinates for the viewer (sim only)."""
-        points = frame_points_world(frame, self.camera.mount)
-        points = points[np.hypot(points[:, 0], points[:, 1]) <= self.config.roi_radius]
+    def step(self, time: float, position: np.ndarray, velocity: np.ndarray,
+             gravity: float) -> None:
+        """Fit and fuse if a fit is due (call only while it should fit)."""
+        if time < self._next_fit:
+            return
+        self._next_fit = time + self.config.fit_period
+        landing = self.map.predict_landing(position, velocity, gravity,
+                                           self.config.touchdown_clearance)
+        if landing is None:
+            self.filter.update(PlaneEstimate(False, timestamp=time))
+            return
+        spot, touchdown_in = landing
+        self.touchdown_at = time + touchdown_in
+        points = self.map.points_near(spot, self.config.roi_radius, self.config.max_points)
+        estimate = fit_ground_plane(points, spot, float(position[2]), self._point_sigma,
+                                    time, self.config)
+        used = self.filter.update(estimate)
+        if estimate.valid:
+            self._store_visual(spot, points, estimate, float(position[2]), used)
+
+    def _store_visual(self, spot: np.ndarray, points: np.ndarray, estimate: PlaneEstimate,
+                      robot_z: float, used: bool) -> None:
+        """Keep the latest fit for the viewer (sim only)."""
         if len(points) > VISUAL_POINTS:
             points = points[:: max(1, len(points) // VISUAL_POINTS)][:VISUAL_POINTS]
         self.visual = LandingVisual(
-            anchor=position + np.array([0.0, 0.0, -estimate.height]),
+            anchor=np.array([spot[0], spot[1], robot_z - estimate.height]),
             measured_normal=np.array(estimate.normal),
-            points=points + position,
+            points=points,
             radius=self.config.roi_radius,
             used=used,
         )
@@ -207,6 +210,8 @@ class JumperSimulation:
         track_target: tuple[float, float] | None = None,
         target_scan: PointCloudRecorder | None = None,
         gravity: float = MOON_GRAVITY,
+        lidar: LidarSpec | None = None,
+        spin: bool = False,
     ) -> None:
         self.model = model
         self.data = data
@@ -232,16 +237,29 @@ class JumperSimulation:
         # Only the LQR cancels bearing friction: the PID gains were tuned with
         # that friction acting as extra rate damping, and lose damping without it.
         self.compensate_wheel_friction = controller_name == "lqr"
-        # Both controllers run the same hop process (camera landing reference,
+        # Both controllers run the same hop process (lidar landing reference,
         # contact gating, target tracking, jump aim, scan) so they can be
         # compared; only the control law differs.
-        # Roll/pitch reference from the downward depth camera.
-        self.landing_reference: CameraLandingReference | None = None
-        if (
-            landing_reference
-            and mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, CAMERA_SITE) >= 0
-        ):
-            self.landing_reference = CameraLandingReference(model, self.ids.root_joint)
+        # The terrain (and the target object on it) for the lidar's rays.
+        self._terrain: HeightfieldRayCaster | None = (
+            HeightfieldRayCaster(model)
+            if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM) >= 0 else None
+        )
+        # The lidar (default the side Mid-360S, used for development; full
+        # point rate with a GPU, 10 % without): scans while airborne, for the
+        # landing plane and the target scan.
+        if lidar is None:
+            lidar = replace(LIVOX_MID360, point_fraction=1.0 if gpu_available() else 0.1)
+        self._lidar_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, lidar.site)
+        self.lidar: SimulatedLidar | None = None
+        if self._terrain is not None and self._lidar_site >= 0:
+            caster = WarpRayCaster(self._terrain) if gpu_available() else self._terrain
+            self.lidar = SimulatedLidar(model, lidar, caster, seed=1)
+        self._lidar_next = 0.0
+        # Roll/pitch reference from the lidar points around the landing spot.
+        self.landing_reference: LidarLandingReference | None = None
+        if landing_reference and self.lidar is not None:
+            self.landing_reference = LidarLandingReference(effective_range_sigma(self.lidar.spec))
         self._robot_geoms = _robot_geom_mask(model, self.ids.root_joint)
         self._terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM)
         # Attitude control in flight, wheel momentum bleed-off in contact
@@ -250,15 +268,17 @@ class JumperSimulation:
         self.in_contact = False
         self._time_without_contact = math.inf
         self.contact_phases = 0
-        # LQR + camera + gating: ascent/descent from the IMU accelerometer, and
-        # the hop reference (track a point going up, level/plane coming down).
+        # Lidar landing reference + gating: ascent/descent from the IMU
+        # accelerometer, and the hop reference (track a point going up,
+        # level/plane coming down).
         self.flight_phase = FlightPhaseDetector()
         self._previous_velocity: np.ndarray | None = None
-        self._camera_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, CAMERA_SITE)
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
             self.flight_reference = FlightReference(
-                FlightReferenceConfig(), track_target, self._ground_height
+                FlightReferenceConfig(face_travel=self.lidar.spec.face_travel and not spin,
+                                      spin=spin),
+                track_target, self._ground_height,
             )
         self._jump_command = False  # given since the last phase update
         self._frozen_at_descent = 0  # landing-filter freezes before this descent
@@ -277,6 +297,10 @@ class JumperSimulation:
         self._aim_announced = False
         self._leg_stroke = np.array([float(model.jnt_range[j][1]) for j in self.ids.leg_joints])
         self.tipped = False
+        # Base height (world z) when the robot last touched the ground.
+        self.last_ground_z: float | None = None
+        # Space while tipped: an attempt to right the robot (recovery.py).
+        self.recovery: RecoveryAttempt | None = None
         # The scan target object, if the model has one: placed at the target.
         self._target_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TARGET_GEOM)
         # MuJoCo centres a mesh on its centre of mass: the geom sits at the
@@ -291,29 +315,16 @@ class JumperSimulation:
             model.mesh_quat[model.geom_dataid[self._target_geom]].copy()
             if self._target_geom >= 0 else None
         )
-        # Its longest dimension: the radius of the scan's keep sphere.
-        self._target_length = (
-            float(np.ptp(self._target_upright(), axis=0).max())
-            if self._target_geom >= 0 else None
-        )
         self._target_centre: np.ndarray | None = None  # placed object's centre
         self._place_target_object(track_target)
-        # Optional: point cloud of the target from on-target ascent frames.
-        # Own camera instance (full frames, own noise stream) so the landing
-        # fit sees exactly the same frames whether scanning is on or not.
+        # Optional: point cloud of every lidar point of tracked jumps,
+        # lift-off to touchdown.
         self.target_scan: PointCloudRecorder | None = None
-        self._scan_camera: SimulatedDepthCamera | None = None
-        self._scan_next = 0.0
-        self._scan_open = False  # a tracked ascent is collecting points
+        self._scan_open = False  # a tracked jump is collecting points
+        self._awaiting_touchdown = False  # a scanned jump's first contact to record
         self._scan_points_before = 0
         if target_scan is not None and self.flight_reference is not None:
             self.target_scan = target_scan
-            self._scan_camera = SimulatedDepthCamera(
-                model, self.ids.root_joint,
-                replace(self.landing_reference.camera.spec,
-                        width=target_scan.config.width, height=target_scan.config.height),
-                ray_caster=self.landing_reference.camera._ray_caster, seed=1,
-            )
         self.wheel_rest_controller = WheelRestController(tuning)
         self.wheel_control_mode = WheelControlMode.STABILIZING
         self._stationary_duration = 0.0
@@ -323,15 +334,10 @@ class JumperSimulation:
 
     def handle_key(self, key: str) -> str | None:
         if key == "space":
+            if self.tipped:
+                return self._start_recovery()
             if not self.jump_triggered:
-                self.jump_triggered = True
-                self.jump_start_time = float(self.data.time)
-                # Start each flight with an empty integrator rather than
-                # whatever it collected while standing on the ground.
-                self.controller.reset()
-                if self.landing_reference is not None:
-                    self.landing_reference.reset(float(self.data.time))
-                self._jump_command = True  # GROUND -> TAKEOFF
+                self._release_spring()
                 return "[JUMP INITIATED] Releasing spring!"
         elif key == "backspace":
             self.selected_gravity = (
@@ -374,6 +380,8 @@ class JumperSimulation:
         self.jump_triggered = False
         self.jump_start_time = 0.0
         self.tipped = False
+        self.last_ground_z = None
+        self.recovery = None
         self.selected_gravity = self.default_gravity
         self.in_contact = False
         self._time_without_contact = math.inf
@@ -383,6 +391,8 @@ class JumperSimulation:
         self._jump_command = False
         self._frozen_at_descent = 0
         self._close_scan()  # keep what the run collected; the file stays as saved
+        self._lidar_next = 0.0  # time starts again from 0
+        self._awaiting_touchdown = False
         self.flight_events.clear()
         self.leg_shortening[:] = 0.0
         self._aim_announced = False
@@ -392,9 +402,65 @@ class JumperSimulation:
             self.flight_reference.commanded = (1.0, 0.0, 0.0, 0.0)
             self.flight_reference.tracking = False
             self.flight_reference.active_target = None
+            self.flight_reference.heading_offset = 0.0
+            self.flight_reference.heading_rate = 0.0
+
+    def _release_spring(self) -> None:
+        self.jump_triggered = True
+        self.jump_start_time = float(self.data.time)
+        # Start each flight with an empty integrator rather than
+        # whatever it collected while standing on the ground.
+        self.controller.reset()
+        if self.landing_reference is not None:
+            self.landing_reference.reset(float(self.data.time))
+        self._jump_command = True  # GROUND -> TAKEOFF
+
+    def _start_recovery(self) -> str | None:
+        if self.recovery is not None:
+            return None  # one attempt at a time
+        if self.jump_triggered:
+            return "[RECOVERY] Wait: the spring is still winding up."
+        if self.wheel_control_mode is WheelControlMode.DISABLED:
+            return "[RECOVERY] Needs the reaction wheels: press C first."
+        self.recovery = RecoveryAttempt(float(self.data.time))
+        return "[RECOVERY] Spinning up the wheels, then releasing the spring."
+
+    def _update_recovery(self) -> None:
+        attempt = self.recovery
+        if attempt is None:
+            return
+        body = self.model.jnt_bodyid[self.ids.root_joint]
+        rotation = self.data.xmat[body].reshape(3, 3)
+        if attempt.stage is RecoveryStage.FLIGHT:
+            if self.phase is FlightPhase.GROUND and self.in_contact:
+                self.recovery = None
+                tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(rotation[2, 2])))))
+                self.flight_events.append(
+                    "[RECOVERY] Upright." if not self.tipped
+                    else f"[RECOVERY] Still tipped ({tilt:.0f} deg): press Space to try again."
+                )
+            return
+        if attempt.update(float(self.data.time)):
+            self._release_spring()
+
+    def _recovery_wheel_commands(self) -> None:
+        """Spin-up: full wheel torque about the righting axis (overrides the controller)."""
+        sign = self.recovery.wheel_torque_sign if self.recovery is not None else 0.0
+        if sign == 0.0 or self.wheel_control_mode is WheelControlMode.DISABLED:
+            return
+        body = self.model.jnt_bodyid[self.ids.root_joint]
+        axis = righting_axis(self.data.xmat[body].reshape(3, 3))
+        if axis is None:
+            return
+        for actuator_id, joint_id, component in zip(
+            self.ids.wheel_actuators, self.ids.wheel_joints, sign * axis, strict=True
+        ):
+            self.data.ctrl[actuator_id] = limit_wheel_command(
+                self.model, self.data, joint_id, RECOVERY_WHEEL_COMMAND * component, self.tuning
+            )
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
-        """Ground position (x, y) the camera tracks during ascent (None: default)."""
+        """Ground position (x, y) the lidar tracks during ascent (None: default)."""
         if self.flight_reference is not None:
             self.flight_reference.set_target(target)
         self._place_target_object(target)
@@ -403,7 +469,7 @@ class JumperSimulation:
         """Stand the target object on the terrain at ``target`` (hide it for None)."""
         if self._target_geom < 0:
             return
-        terrain = self._terrain_ray_caster()
+        terrain = self._terrain
         if terrain is not None:
             terrain.objects = []
         self.model.geom_quat[self._target_geom] = self._target_quat
@@ -440,15 +506,15 @@ class JumperSimulation:
         self._target_centre = terrain.objects[0].centre.copy()
 
     def _ground_height(self, x: float, y: float) -> float:
-        """Terrain height at (x, y); NaN off the terrain or without a camera."""
-        terrain = self._terrain_ray_caster()
+        """Terrain height at (x, y); NaN off the terrain."""
+        terrain = self._terrain
         if terrain is None:
             return math.nan
         return float(terrain.height(np.array([x]), np.array([y]))[0])
 
     @property
     def track_target_point(self) -> np.ndarray | None:
-        """The point a set track target makes the camera track (None: default)."""
+        """The point a set track target makes the lidar track (None: default)."""
         if self.flight_reference is None or self.flight_reference.target_setting is None:
             return None
         return self.flight_reference.target_setting.copy()
@@ -466,13 +532,6 @@ class JumperSimulation:
         upright = self.model.mesh_vert[adr : adr + num] @ rotation.reshape(3, 3).T
         return upright + self._target_offset
 
-    def _terrain_ray_caster(self) -> HeightfieldRayCaster | None:
-        """The ray caster the depth cameras share (None without a camera)."""
-        if self.landing_reference is None:
-            return None
-        caster = self.landing_reference.camera._ray_caster
-        return caster if isinstance(caster, HeightfieldRayCaster) else None
-
     @property
     def phase(self) -> FlightPhase:
         return self.flight_phase.phase
@@ -483,6 +542,14 @@ class JumperSimulation:
     @property
     def relaxation_active(self) -> bool:
         return self.wheel_control_mode is WheelControlMode.RESTING
+
+    @property
+    def height_above_last_ground(self) -> float | None:
+        """Base height above where it was at the last ground contact (None before any)."""
+        if self.last_ground_z is None:
+            return None
+        body = self.model.jnt_bodyid[self.ids.root_joint]
+        return float(self.data.xpos[body][2]) - self.last_ground_z
 
     def telemetry_payload(self) -> TelemetryPayload:
         sensor = read_simulated_imu(self.model, self.data, self.ids.root_joint)
@@ -513,6 +580,11 @@ class JumperSimulation:
         (target tracking on the way up, level then landing plane on the way
         down). Otherwise: landing plane tilt + yaw reference.
         """
+        if (self.recovery is not None and self.recovery.stage is RecoveryStage.FLIGHT
+                and not self.in_contact):
+            # Recovery hop: get level as fast as possible, keep the heading.
+            body = self.model.jnt_bodyid[self.ids.root_joint]
+            return level_quaternion(self.data.xmat[body].reshape(3, 3))
         if self.flight_reference is not None and not self.in_contact:
             return self.flight_reference.commanded
         if self.landing_reference is not None:
@@ -522,39 +594,52 @@ class JumperSimulation:
 
     def step(self) -> None:
         self._update_contact_phase(self.robot_touches_terrain())
+        if self.in_contact:
+            body = self.model.jnt_bodyid[self.ids.root_joint]
+            self.last_ground_z = float(self.data.xpos[body][2])
         if not self.contact_gating:
             # With gating the wheel mode follows the contact phase instead.
             self._update_wheel_rest_state()
         phase = self._update_flight_phase()
+        if not self.in_contact:
+            self._lidar_step()
         if self.landing_reference is not None:
             # Without the hop reference: fit the ground whenever airborne.
-            # With it: only on the way down (on the way up the camera is busy
-            # tracking the target and looks at the ground at an angle).
-            capture = (
+            # With it: only on the way down (the jump's points so far include
+            # the ascent's).
+            fit = (
                 phase is FlightPhase.DESCENT
                 if self.flight_reference is not None
                 else not self.in_contact
             )
             accepted = self.landing_reference.filter.accepted
-            self.landing_reference.step(self.data, airborne=capture)
+            if fit:
+                body = self.model.jnt_bodyid[self.ids.root_joint]
+                dof = self.model.jnt_dofadr[self.ids.root_joint]
+                self.landing_reference.step(
+                    float(self.data.time), self.data.xpos[body].copy(),
+                    self.data.qvel[dof : dof + 3].copy(), -float(self.model.opt.gravity[2]),
+                )
             if (self.flight_reference is not None and accepted == 0
                     and self.landing_reference.filter.accepted > 0):
-                self.flight_events.append("[FLIGHT] Ground seen: aligning with the landing plane.")
+                self.flight_events.append("[FLIGHT] Landing spot seen: aligning with its plane.")
         if self.flight_reference is not None and not self.in_contact:
+            touchdown_at = self.landing_reference.touchdown_at
+            dof = self.model.jnt_dofadr[self.ids.root_joint]
             self.flight_reference.update(
                 phase,
-                self.data.site_xpos[self._camera_site],
+                self.data.site_xpos[self._lidar_site],
                 self.yaw_reference,
-                self.landing_reference.reference_quaternion(self.yaw_reference),
+                self.landing_reference.reference_quaternion,
                 float(self.model.opt.timestep),
+                None if touchdown_at is None else touchdown_at - float(self.data.time),
+                self.data.qvel[dof : dof + 3],
             )
         self._update_tipped()
+        self._update_recovery()
         self._update_jump_aim()
-        if self._scan_open:
-            if phase is FlightPhase.ASCENT and not self.in_contact:
-                self._scan_step()
-            elif phase is not FlightPhase.TAKEOFF:  # still on its way up to ASCENT
-                self._close_scan()
+        if self._scan_open and self.in_contact:
+            self._close_scan()  # touchdown
         self._apply_controls()
         mujoco.mj_step(self.model, self.data)
 
@@ -567,6 +652,9 @@ class JumperSimulation:
                 self.contact_phases += 1
                 if self.contact_gating:
                     self._enter_contact_mode()
+                if self._awaiting_touchdown:
+                    self._awaiting_touchdown = False
+                    self._record_touchdown()
             return
         self._time_without_contact += float(self.model.opt.timestep)
         if self.in_contact and self._time_without_contact >= FLIGHT_DEBOUNCE:
@@ -575,27 +663,19 @@ class JumperSimulation:
                 self._enter_flight_mode()
             if self.flight_reference is not None:
                 qa = self.model.jnt_qposadr[self.ids.root_joint]
-                track = self.phase is FlightPhase.TAKEOFF  # a jump, not a bounce
+                # A jump, not a bounce or a recovery hop.
+                track = self.phase is FlightPhase.TAKEOFF and self.recovery is None
                 self.flight_reference.start_flight(
                     tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
                     self.data.qpos[qa : qa + 3].copy(),
                     self.yaw_reference,
                     track,
                 )
-                if track:
-                    if self.target_scan is not None:
-                        self.target_scan.start_jump()
-                        # Keep only points on and right around the target: a
-                        # sphere the target object's length around its centre
-                        # (without the object, around the tracked point).
-                        self.target_scan.keep_within(
-                            self._target_centre if self._target_centre is not None
-                            else self.flight_reference.active_target,
-                            self._target_length,
-                        )
-                        self._scan_open = True
-                        self._scan_next = float(self.data.time)
-                        self._scan_points_before = self.target_scan.point_count
+                if track and self.target_scan is not None:
+                    self.target_scan.start_jump()
+                    self._scan_open = True
+                    self._awaiting_touchdown = True
+                    self._scan_points_before = self.target_scan.point_count
 
     def _update_tipped(self) -> None:
         """Tipped over on the ground: pull the legs in as far as they go.
@@ -652,21 +732,36 @@ class JumperSimulation:
                 f"towards it{note}."
             )
 
-    def _scan_step(self) -> None:
-        """Capture a full frame at the camera rate; keep it if on target."""
-        now = float(self.data.time)
-        if now < self._scan_next:
-            return
-        self._scan_next = now + 1.0 / self._scan_camera.spec.frame_rate
-        # Pose as the camera will cast from it (kinematics, not the newer qpos).
+    def _record_touchdown(self) -> None:
+        """Store where the jump landed: the ground under the robot."""
         body = self.model.jnt_bodyid[self.ids.root_joint]
-        error = self.flight_reference.camera_pointing_error(
-            tuple(float(v) for v in self.data.xquat[body]), self.data.site_xpos[self._camera_site]
+        x, y, z = (float(v) for v in self.data.xpos[body])
+        ground = self._ground_height(x, y)
+        position = (x, y, ground if math.isfinite(ground) else z)
+        try:
+            self.target_scan.add_touchdown(position)
+        except OSError as error:
+            self.flight_events.append(f"[SCAN] Could not write the touchdown: {error}")
+            return
+        self.flight_events.append(
+            f"[SCAN] Jump {self.target_scan.jumps} touched down at "
+            f"({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})."
         )
-        if error > self.target_scan.config.margin:
-            return  # still turning towards the target: skip without ray casting
-        frame = self._scan_camera.capture(self.data)
-        self.target_scan.add_frame(frame, self._scan_camera.mount, error)
+
+    def _lidar_step(self) -> None:
+        """Cast the lidar points emitted since the last batch (while airborne)."""
+        if self.lidar is None or (self.landing_reference is None and not self._scan_open):
+            return
+        now = float(self.data.time)
+        if now < self._lidar_next:
+            return
+        period = self.lidar.spec.batch_period
+        returns = self.lidar.scan(self.data, period)
+        self._lidar_next = now + period
+        if self.landing_reference is not None:
+            self.landing_reference.add_points(returns.points)
+        if self._scan_open:
+            self.target_scan.add_points(returns.points, returns.ranges, returns.timestamp)
 
     def _close_scan(self) -> None:
         """End of a tracked ascent: write the cloud (all jumps so far)."""
@@ -681,7 +776,7 @@ class JumperSimulation:
             return
         added = scan.point_count - self._scan_points_before
         self.flight_events.append(
-            f"[SCAN] Jump {scan.jumps}: +{added} points on target; "
+            f"[SCAN] Jump {scan.jumps}: +{added} lidar points (lift-off to touchdown); "
             f"{scan.point_count} total saved to {scan.path}."
         )
 
@@ -729,13 +824,13 @@ class JumperSimulation:
             return
         if phase is FlightPhase.ASCENT and self.flight_reference.tracking:
             t = self.flight_reference.active_target
-            message = f"[FLIGHT] Ascent: camera tracking target ({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})."
+            message = f"[FLIGHT] Ascent: lidar tracking target ({t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f})."
         else:
             message = {
                 FlightPhase.GROUND: "[PHASE] On the ground.",
                 FlightPhase.TAKEOFF: "[PHASE] Take-off.",
                 FlightPhase.ASCENT: "[PHASE] Ascent.",
-                FlightPhase.DESCENT: "[FLIGHT] Descent: levelling until the camera sees the ground.",
+                FlightPhase.DESCENT: "[FLIGHT] Descent: levelling until the landing spot is seen.",
                 FlightPhase.LANDING: "[PHASE] Landing: touchdown close."
                 if not self.in_contact else "[PHASE] Landing: ground contact.",
             }[phase]
@@ -837,6 +932,7 @@ class JumperSimulation:
         else:
             for actuator_id in self.ids.wheel_actuators:
                 self.data.ctrl[actuator_id] = 0.0
+        self._recovery_wheel_commands()
 
         # Leg force = spring stiffness x shortening (open loop); tipped over:
         # pull every leg in to the end of its stroke.
