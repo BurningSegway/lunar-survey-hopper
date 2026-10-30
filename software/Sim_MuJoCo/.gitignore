@@ -10,3 +10,5 @@ build/terrain_diffuse.png
 build/Testing/
 # Model dumps saved by the MuJoCo viewer
 *.mjb
+# Depth screenshots saved by the MuJoCo viewer
+DepthCapture_*.png
