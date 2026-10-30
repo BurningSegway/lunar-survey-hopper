@@ -154,23 +154,25 @@ class LandingReferenceFilterTests(unittest.TestCase):
         self.assertEqual(reference.ignored, 1)
         np.testing.assert_allclose(reference.normal, (0.0, 0.0, 1.0))
 
-    def test_reference_freezes_close_to_touchdown(self) -> None:
-        config = LandingReferenceConfig()
-        reference = LandingReference(config)
+    def test_reference_keeps_updating_until_touchdown_and_flags_it_near(self) -> None:
         target = normal_of(0.15, 0.0)
-        # Descending at 4 m/s: fits from 3.0 m and 2.6 m are used ...
-        for t, h in ((0.0, 3.0), (0.1, 2.6)):
-            n = target / np.linalg.norm(target)
-            self.assertTrue(reference.update(PlaneEstimate(True, tuple(n), math.radians(0.3), height=h, timestamp=t)))
-        held = reference.normal
-        # ... but one 0.25 s from impact (1.0 m at 4 m/s) and one below
-        # freeze_height are not.
         other = normal_of(-0.1, 0.1)
-        for t, h in ((0.25, 1.0), (0.35, 0.6)):
-            self.assertFalse(reference.update(PlaneEstimate(True, tuple(other), math.radians(0.3), height=h, timestamp=t)))
-        self.assertEqual(reference.frozen, 2)
-        np.testing.assert_allclose(reference.normal, held)
-        self.assertAlmostEqual(reference.descent_rate, 4.0, delta=1.5)
+        for freeze in (False, True):
+            reference = LandingReference(LandingReferenceConfig(freeze_near_touchdown=freeze))
+            # Descending at 4 m/s: fits from 3.0 m and 2.6 m ...
+            for t, h in ((0.0, 3.0), (0.1, 2.6)):
+                n = target / np.linalg.norm(target)
+                self.assertTrue(reference.update(PlaneEstimate(True, tuple(n), math.radians(0.3), height=h, timestamp=t)))
+            held = reference.normal
+            # ... then one 0.25 s from impact (1.0 m at 4 m/s) and one below
+            # near_height: touchdown is near, and they are still fused (the
+            # old behaviour, freeze_near_touchdown, holds the reference).
+            for t, h in ((0.25, 1.0), (0.35, 0.6)):
+                used = reference.update(PlaneEstimate(True, tuple(other), math.radians(0.3), height=h, timestamp=t))
+                self.assertEqual(used, not freeze)
+            self.assertEqual(reference.near_touchdown, 2)
+            self.assertEqual(bool(np.allclose(reference.normal, held)), freeze)
+            self.assertAlmostEqual(reference.descent_rate, 4.0, delta=1.5)
 
     def test_fused_uncertainty_has_a_floor(self) -> None:
         reference = LandingReference()

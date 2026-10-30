@@ -123,11 +123,11 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--lidar", choices=sorted(LIDARS), default=None,
                         help="lidar (default: the simulation's, the Mid-360S)")
-    parser.add_argument("--spin", action="store_true", help="AS-DT1: slow spin instead of facing travel")
+    parser.add_argument("--spin", action="store_true", help="slow heading spin in flight")
     args = parser.parse_args()
     global LIDAR, SPIN
     SPIN = args.spin
-    LIDAR = None if args.lidar is None and not SPIN else LIDARS[args.lidar or "as-dt1"]
+    LIDAR = None if args.lidar is None else LIDARS[args.lidar]
     config = LandingReferenceConfig()
     probe = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     caster = HeightfieldRayCaster(probe)

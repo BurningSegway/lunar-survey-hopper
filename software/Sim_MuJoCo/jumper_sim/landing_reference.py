@@ -15,8 +15,11 @@ differs):
    with outlier rejection, and estimates how uncertain its normal is.
 4. :class:`LandingReference` fuses successive plane normals with a small
    Kalman filter on the tilt vector (n_x, n_y): fits that are too noisy are
-   ignored, clean fits dominate, and the reference freezes shortly before
-   touchdown. The tilt is clamped to ``max_tilt``.
+   ignored, clean fits dominate, and it keeps updating until touchdown (the
+   lidar keeps seeing the spot, so the robot can still correct just before
+   impact; ``freeze_near_touchdown`` restores the old freeze). It also tells
+   when touchdown is near (it starts the LANDING phase). The tilt is clamped
+   to ``max_tilt``.
 5. :meth:`LandingReference.reference_quaternion` builds the attitude the
    controller should hold: body z along the plane normal, heading unchanged.
 
@@ -57,10 +60,11 @@ class LandingReferenceConfig:
     # Successive fits see the same ground, so their roughness errors are
     # correlated; never let the fused estimate claim more certainty than this.
     min_reference_sigma: float = math.radians(1.0)
-    # Freeze the reference shortly before touchdown: a late change is one the
-    # controller cannot follow anyway.
-    freeze_height: float = 1.0  # m of the landing plane below the robot
-    freeze_time: float = 0.3  # s to touchdown at the measured descent rate
+    # Touchdown is near (the LANDING phase starts) below this height or this
+    # time to touchdown. The reference keeps updating then, unless frozen.
+    near_height: float = 1.0  # m of the landing plane below the robot
+    near_time: float = 0.3  # s to touchdown at the measured descent rate
+    freeze_near_touchdown: bool = False
 
 
 @dataclass(frozen=True)
@@ -297,7 +301,7 @@ class LandingReference:
         self.accepted = 0
         self.rejected = 0  # outliers
         self.ignored = 0  # too noisy (too far away)
-        self.frozen = 0  # skipped because touchdown is close
+        self.near_touchdown = 0  # fits with touchdown near
         self._last_height: tuple[float, float] | None = None  # (time, height)
         self.descent_rate = 0.0  # m/s, from successive plane heights
 
@@ -331,8 +335,9 @@ class LandingReference:
             return False
         self._update_descent_rate(estimate)
         if self.touchdown_close(estimate.height):
-            self.frozen += 1
-            return False
+            self.near_touchdown += 1
+            if self.config.freeze_near_touchdown:
+                return False
         noise = estimate.noise_sigma if math.isfinite(estimate.noise_sigma) else estimate.normal_sigma
         if noise > self.config.max_fit_sigma:
             self.ignored += 1
@@ -352,9 +357,9 @@ class LandingReference:
         return True
 
     def touchdown_close(self, height: float) -> bool:
-        if height < self.config.freeze_height:
+        if height < self.config.near_height:
             return True
-        return self.descent_rate > 0.0 and height / self.descent_rate < self.config.freeze_time
+        return self.descent_rate > 0.0 and height / self.descent_rate < self.config.near_time
 
     def _update_descent_rate(self, estimate: PlaneEstimate) -> None:
         if not (math.isfinite(estimate.height) and math.isfinite(estimate.timestamp)):

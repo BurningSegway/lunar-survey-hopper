@@ -30,7 +30,7 @@ from jumper_sim.pointcloud import PointCloudRecorder, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
 from jumper_sim.lidar import LIVOX_MID360, SONY_AS_DT1, effective_range_sigma
 from jumper_sim.recovery import RecoveryStage, righting_axis
-from jumper_sim.visualization import draw_height_label, draw_landing_plane
+from jumper_sim.visualization import draw_flight_target, draw_height_label, draw_landing_plane
 
 def mujoco_ray_distances(model, data, origin, directions, max_range):
     """Reference distances from MuJoCo's mj_multiRay (NaN for no hit)."""
@@ -134,6 +134,14 @@ class SimulationTests(unittest.TestCase):
         simulation.handle_key("space")
         np.testing.assert_allclose(filt.normal, (0.0, 0.0, 1.0))
         self.assertEqual(simulation.landing_reference.map.count, 0)
+
+    def test_heading_in_flight_follows_the_lidar_and_the_spin_flag(self) -> None:
+        cases = {(None, False): (False, False), (None, True): (False, True),
+                 (SONY_AS_DT1, False): (True, False), (SONY_AS_DT1, True): (False, True)}
+        for (lidar, spin), expected in cases.items():
+            simulation = JumperSimulation(self.model, self.data, "lqr", lidar=lidar, spin=spin)
+            config = simulation.flight_reference.config
+            self.assertEqual((config.face_travel, config.spin), expected, (lidar, spin))
 
     def test_as_dt1_casts_from_the_bottom_site_for_the_landing_reference(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr", lidar=SONY_AS_DT1)
@@ -423,7 +431,7 @@ class SimulationTests(unittest.TestCase):
         self.assertIn("press C", simulation.handle_key("space"))
         self.assertIsNone(simulation.recovery)
 
-    def test_hop_tracks_target_on_ascent_and_fits_landing_plane_only_on_descent(self) -> None:
+    def test_hop_tracks_target_then_fits_landing_plane_until_impact(self) -> None:
         for controller in ("lqr", "pid"):
             with self.subTest(controller=controller):
                 self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
@@ -440,7 +448,7 @@ class SimulationTests(unittest.TestCase):
         fit_phases = []
 
         def step(*args):
-            fit_phases.append(simulation.phase)
+            fit_phases.append((simulation.phase, simulation.in_contact))
             return original_step(*args)
 
         reference.step = step
@@ -448,14 +456,26 @@ class SimulationTests(unittest.TestCase):
             simulation.step()
         fit_phases.clear()
         simulation.handle_key("space")
-        phases, errors = [], []
+        phases, errors, descent_errors = [], [], []
+        scene = mujoco.MjvScene(self.model, maxgeom=10)
+        sight_line = []  # (tracking, red line drawn) in the descent
         while self.data.time < 6.0:
             simulation.step()
             if not phases or phases[-1] is not simulation.phase:
                 phases.append(simulation.phase)
+            error = simulation.flight_reference.axis_target_angle(
+                tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._lidar_site])
             if simulation.phase is FlightPhase.ASCENT:
-                errors.append(simulation.flight_reference.axis_target_angle(
-                    tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._lidar_site]))
+                errors.append(error)
+            elif simulation.phase is FlightPhase.DESCENT:
+                ascent_time = simulation.flight_reference.ascent_time  # (a bounce resets it)
+                tracking = simulation.flight_reference.tracking_target(simulation.phase)
+                if tracking:
+                    descent_errors.append(error)
+                scene.ngeom = 0
+                drawn = draw_flight_target(scene, simulation)
+                line = any(scene.geoms[i].type == mujoco.mjtGeom.mjGEOM_LINE for i in range(drawn))
+                sight_line.append((tracking, line))
         self.assertEqual(phases[:4], [FlightPhase.TAKEOFF, FlightPhase.ASCENT,
                                       FlightPhase.DESCENT, FlightPhase.LANDING])
         ground = simulation._ground_height(*target)
@@ -464,8 +484,19 @@ class SimulationTests(unittest.TestCase):
         # side lidar's band). The PID tracks less tightly: 7.5 deg on this
         # short Earth hop against ~0.3 for the LQR.
         self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
+        # Still on target in the first half of the ascent's time going down.
+        self.assertAlmostEqual(len(descent_errors) * float(self.model.opt.timestep),
+                               0.5 * ascent_time, delta=0.01)
+        self.assertLess(math.degrees(max(descent_errors)), 5.0 if controller == "lqr" else 12.0)
+        # The viewer's red line of sight stays exactly while the target is tracked.
+        self.assertIn((True, True), sight_line)
+        self.assertIn((False, False), sight_line)
+        self.assertTrue(all(tracking == line for tracking, line in sight_line))
+        # Fits on the way down, in LANDING too, up to the impact (not after).
         self.assertTrue(fit_phases)
-        self.assertEqual(set(fit_phases), {FlightPhase.DESCENT})
+        self.assertEqual({phase for phase, _ in fit_phases},
+                         {FlightPhase.DESCENT, FlightPhase.LANDING})
+        self.assertNotIn(True, {contact for _, contact in fit_phases})
         self.assertGreater(simulation.landing_reference.filter.accepted, 0)
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))

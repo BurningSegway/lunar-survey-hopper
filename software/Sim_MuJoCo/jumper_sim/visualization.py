@@ -4,13 +4,14 @@ Drawn into a ``mujoco.MjvScene`` (the passive viewer's ``user_scn``):
 
 * a translucent disc on the latest plane fit at the predicted landing spot,
   the size of the fitting region: orange when that fit updated the
-  reference, grey when it did not (too noisy, frozen just before touchdown,
+  reference, grey when it did not (too noisy,
   rejected as an outlier) or while the robot is in contact and the estimate
   is held;
 * a green arrow along the filtered reference normal the controller aligns body z to;
 * small blue dots: a sample of the lidar points the fit used;
 * the lidar's tracking target (red sphere) while a hop is under way, with a
-  red line from the lidar to it during the ascent;
+  red line from the lidar to it while it is tracked (the ascent and the
+  first half of the ascent's time into the descent);
 * cyan dots: a sample of the point cloud collected so far (with scanning
   on), refreshed at each touchdown;
 * a text label above the robot: its height above where it last touched the
@@ -94,19 +95,17 @@ def draw_landing_plane(scene: mujoco.MjvScene, simulation: JumperSimulation,
 
 
 def draw_flight_target(scene: mujoco.MjvScene, simulation: JumperSimulation) -> int:
-    """Append the tracking target (and line of sight during ascent)."""
+    """Append the tracking target (and the line of sight while it is tracked)."""
     reference = simulation.flight_reference
     if reference is None or reference.active_target is None or not reference.tracking:
         return 0
-    from .flight_phase import FlightPhase
-
     start = scene.ngeom
     marker = _add_geom(scene)
     if marker is not None:
         mujoco.mjv_initGeom(marker, mujoco.mjtGeom.mjGEOM_SPHERE,
                             np.array([TARGET_RADIUS, 0.0, 0.0]), reference.active_target,
                             np.eye(3).ravel(), TARGET_RGBA)
-    if simulation.phase is FlightPhase.ASCENT:
+    if reference.tracking_target(simulation.phase):
         line = _add_geom(scene)
         if line is not None:
             mujoco.mjv_initGeom(line, mujoco.mjtGeom.mjGEOM_LINE, np.zeros(3), np.zeros(3),

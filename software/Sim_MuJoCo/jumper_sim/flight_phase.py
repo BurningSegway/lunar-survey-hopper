@@ -11,7 +11,7 @@ for. Transitions:
   goes straight to DESCENT; a jump that never leaves the ground returns to
   GROUND after ``takeoff_timeout``.
 * ASCENT -> DESCENT: the vertical velocity estimate turns negative (the apex).
-* DESCENT -> LANDING: touchdown is near (the landing-plane filter freezes:
+* DESCENT -> LANDING: touchdown is near (the landing-plane filter's rule:
   plane < 1 m below or < 0.3 s away), or ground contact as a backup.
 * LANDING -> GROUND: standing still (accelerometer ~1 g, low body rate) for
   ``settle_time``. Bounces stay in LANDING.

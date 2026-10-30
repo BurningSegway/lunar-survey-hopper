@@ -81,16 +81,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--no-scan", action="store_true", help="do not collect the lidar point cloud",
     )
     parser.add_argument(
-        "--lidar", choices=sorted(LIDARS), default=None,
+        "--lidar", choices=sorted(LIDARS), default="mid360s",
         help="lidar: the Livox Mid-360S on the +x side face (default, used for "
         "development), or the Sony AS-DT1 (24x24 grid, 30 deg) under the bottom "
         "face, the robot facing its direction of travel in flight",
     )
     parser.add_argument(
         "--spin", action="store_true",
-        help="Sony AS-DT1 (implies --lidar as-dt1), the robot spinning slowly "
-        "(45 deg/s) about the vertical in flight to sweep it round a cone, "
-        "instead of facing its direction of travel",
+        help="spin slowly (45 deg/s) about the vertical in flight, sweeping the "
+        "lidar round; with the AS-DT1 instead of facing the direction of travel",
     )
     parser.add_argument(
         "--lidar-fraction", type=float, default=None, metavar="F",
@@ -105,21 +104,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def selected_lidar(lidar: str | None, spin: bool) -> str:
-    """The ``LIDARS`` name to use: the Mid-360S unless asked otherwise;
-    ``--spin`` is the AS-DT1's."""
-    if spin and lidar == "mid360s":
-        raise ValueError("--spin is for the AS-DT1 (the Mid-360S scans by itself)")
-    return lidar or ("as-dt1" if spin else "mid360s")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_argument_parser()
-    args = parser.parse_args(argv)
-    try:
-        lidar_name = selected_lidar(args.lidar, args.spin)
-    except ValueError as error:
-        parser.error(str(error))
+    args = build_argument_parser().parse_args(argv)
     model_path = args.model.expanduser().resolve()
     if not model_path.is_file():
         raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
@@ -141,7 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
     fraction = args.lidar_fraction
-    spec = LIDARS[lidar_name]
+    spec = LIDARS[args.lidar]
     if fraction is None:
         # The AS-DT1's 8640 points/s are cheap on any hardware.
         fraction = 1.0 if gpu_available() or spec is SONY_AS_DT1 else 0.1

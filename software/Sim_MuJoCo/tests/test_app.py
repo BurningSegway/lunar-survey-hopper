@@ -250,13 +250,13 @@ class LidarOptionTests(unittest.TestCase):
 
     def test_lidar_defaults_to_the_mid360s_with_the_as_dt1_as_an_option(self) -> None:
         parser = app.build_argument_parser()
-        self.assertIsNone(parser.parse_args([]).lidar)  # the Mid-360S
+        self.assertEqual(parser.parse_args([]).lidar, "mid360s")
         self.assertEqual(parser.parse_args(["--lidar", "as-dt1"]).lidar, "as-dt1")
-        self.assertEqual(app.selected_lidar(None, spin=False), "mid360s")
-        self.assertEqual(app.selected_lidar("as-dt1", spin=False), "as-dt1")
-        self.assertEqual(app.selected_lidar(None, spin=True), "as-dt1")  # --spin alone
-        with self.assertRaises(ValueError):
-            app.selected_lidar("mid360s", spin=True)
+        # --spin works with either lidar.
+        args = parser.parse_args(["--spin"])
+        self.assertEqual((args.lidar, args.spin), ("mid360s", True))
+        args = parser.parse_args(["--lidar", "as-dt1", "--spin"])
+        self.assertEqual((args.lidar, args.spin), ("as-dt1", True))
         with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
             parser.parse_args(["--lidar", "avia"])
 

@@ -67,7 +67,7 @@
            points out and slightly down from this face. -->
       <site name="lidar" pos="0.185 0 -0.1175" euler="0 -67.5 0" size="0.03" rgba="0.1 0.1 0.1 1"/>
 
-      <!-- LIDAR (Sony AS-DT1, 29x29x31 mm, --lidar as-dt1 or --spin) under the bottom face,
+      <!-- LIDAR (Sony AS-DT1, 29x29x31 mm, --lidar as-dt1) under the bottom face,
            its axis (site -z) tilted 10 deg from body -z towards +x: the 30 deg
            grid still holds the point the robot's bottom tracks (5 deg inside
            its edge), and the slow heading spin in flight sweeps it round a

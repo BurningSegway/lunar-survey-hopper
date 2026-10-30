@@ -207,6 +207,27 @@ class FlightReferenceTests(unittest.TestCase):
         np.testing.assert_allclose(q, LEVEL, atol=1e-12)
 
 
+    def test_tracking_continues_for_half_the_ascent_time_into_the_descent(self) -> None:
+        reference = FlightReference(FlightReferenceConfig(slew_rate=math.radians(1e6)),
+                                    target=(2.0, 0.0))
+        reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
+        camera = np.array([0.0, 0.0, 2.0])
+        plane = (math.cos(0.05), math.sin(0.05), 0.0, 0.0)
+        for phase, duration in ((FlightPhase.TAKEOFF, 0.2), (FlightPhase.ASCENT, 1.8)):
+            for _ in range(round(duration / DT)):
+                reference.update(phase, camera, 0.0, lambda yaw: plane, DT)
+        self.assertAlmostEqual(reference.ascent_time, 2.0)
+        # 2 s up: still on the target for 1 s of the descent ...
+        for _ in range(round(0.99 / DT)):
+            q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
+        self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
+        # ... then the landing reference.
+        for _ in range(round(0.02 / DT)):
+            q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
+        np.testing.assert_allclose(q, plane, atol=1e-12)
+        # LANDING (touchdown near) never tracks.
+        self.assertFalse(reference.tracking_target(FlightPhase.LANDING))
+
     def test_slow_spin_turns_the_heading_and_stops_before_touchdown(self) -> None:
         config = FlightReferenceConfig(slew_rate=math.radians(1e6), spin=True, face_travel=True)
         reference = FlightReference(config, target=(2.0, 0.0))
@@ -254,8 +275,8 @@ class FlightReferenceTests(unittest.TestCase):
         self.assertLessEqual(math.degrees(peak), 90.0 + 1e-6)
         self.assertLess(abs(math.degrees(reference.heading_rate)), 1.0)
         self.assertLess(reference.axis_target_angle(q, camera), 1e-6)  # still tracking
-        # Level on the way down: body +x (the lidar's tilt) along the travel.
-        q = reference.update(FlightPhase.DESCENT, camera, 0.3,
+        # Level just before touchdown: body +x (the lidar's tilt) along the travel.
+        q = reference.update(FlightPhase.LANDING, camera, 0.3,
                              lambda yaw: (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)), DT,
                              velocity=velocity)
         x_axis = quaternion_to_matrix(q)[:, 0]

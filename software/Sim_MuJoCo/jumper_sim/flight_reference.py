@@ -8,12 +8,16 @@
   as a ground position (x, y); the tracked point is ``aim_height`` above the
   ground there, so it is never in the air or buried. The required tilt is
   capped at ``max_track_tilt``; heading stays at the yaw reference.
-* DESCENT: the reference moves back towards level (the xy plane). As soon as
+* DESCENT: tracking goes on for ``descent_track_fraction`` (half) of the
+  time from lift-off to apex -- the descent takes about as long as the ascent
+  (to be replaced by a criterion from the predicted landing spot). Then the
+  reference moves back towards level (the xy plane). As soon as
   the ground at the predicted landing spot has been fitted, the landing-plane
   reference from :class:`~jumper_sim.landing_reference.LandingReference`
   takes over -- that filter starts at "level" and only receives fits during
   descent, so "level until the landing spot is seen, then its plane" falls
-  out of it directly.
+  out of it directly. It keeps updating until the moment of impact
+  (LANDING too), so the robot keeps aligning with the ground to the end.
 * Heading in flight (ASCENT and DESCENT; the tracking axis, body -z, is
   not affected by it), for a lidar tilted off body -z towards body +x:
   with ``face_travel`` the robot turns so body +x faces its horizontal
@@ -53,6 +57,8 @@ class FlightReferenceConfig:
     # Tracked point above the ground at the target: the middle of the 0.3 m
     # target object.
     aim_height: float = 0.15  # m
+    # Keep tracking into the descent for this fraction of the ascent's time.
+    descent_track_fraction: float = 0.5
     # Without a ground height, the ground is taken as the take-off ground.
     standing_height: float = 0.27  # m, body origin above the ground when standing
     # Heading in flight (neither: hold the lift-off heading).
@@ -139,6 +145,8 @@ class FlightReference:
         self.tracking = False
         self.heading_offset = 0.0  # rad, heading turned since lift-off
         self.heading_rate = 0.0  # rad/s, current turn rate
+        self.ascent_time = 0.0  # s, lift-off to apex
+        self.descent_time = 0.0  # s, since apex
 
     def set_target(self, target: tuple[float, float] | None) -> None:
         """Track ``aim_height`` above the ground at ``target`` (x, y)."""
@@ -164,6 +172,8 @@ class FlightReference:
         self.tracking = track
         self.heading_offset = 0.0
         self.heading_rate = 0.0
+        self.ascent_time = 0.0
+        self.descent_time = 0.0
         if track:
             self.active_target = (
                 self.target_setting.copy() if self.target_setting is not None
@@ -177,17 +187,30 @@ class FlightReference:
         """``landing_reference(yaw)``: the landing attitude with that heading;
         ``touchdown_in``: predicted time to touchdown [s] (None: unknown);
         ``velocity``: the robot's (world) velocity, for ``face_travel``."""
+        if phase in (FlightPhase.TAKEOFF, FlightPhase.ASCENT):
+            self.ascent_time += dt
+        elif phase is FlightPhase.DESCENT:
+            self.descent_time += dt
         if phase is FlightPhase.TAKEOFF:
             return self.commanded  # hold the lift-off attitude until clear of the ground
         self._update_heading(phase, dt, yaw_reference, touchdown_in, velocity)
         yaw = yaw_reference + self.heading_offset
-        if phase is FlightPhase.ASCENT and self.tracking and self.active_target is not None:
+        if self.tracking_target(phase):
             desired = look_at_quaternion(sensor_position, self.active_target, yaw,
                                          self.config.max_track_tilt)
         else:  # DESCENT, LANDING
             desired = landing_reference(yaw)  # level until the landing spot is seen, then its plane
         self.commanded = slew_quaternion(self.commanded, desired, self.config.slew_rate * dt)
         return self.commanded
+
+    def tracking_target(self, phase: FlightPhase) -> bool:
+        """Whether body -z is pointed at the target in this phase."""
+        if not self.tracking or self.active_target is None:
+            return False
+        if phase is FlightPhase.ASCENT:
+            return True
+        return (phase is FlightPhase.DESCENT
+                and self.descent_time < self.config.descent_track_fraction * self.ascent_time)
 
     def _update_heading(self, phase: FlightPhase, dt: float, yaw_reference: float,
                         touchdown_in: float | None, velocity: np.ndarray | None) -> None:

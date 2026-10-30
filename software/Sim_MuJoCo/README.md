@@ -98,12 +98,13 @@ Options:
   default: `pointclouds/target_scan.ply`). `--no-scan` turns scanning off.
   `--no-scan-window` keeps the file but does not open the live point cloud
   window.
-- The lidar is the Livox Mid-360S on the side (used for development). The
-  other sensor under consideration, the Sony AS-DT1 under the bottom, is
-  launched with one of two flags (see "Lidar option: Sony AS-DT1" below):
-  - `--lidar as-dt1`: the robot faces its direction of travel in flight;
-  - `--spin`: the robot spins slowly (45 deg/s) in flight instead (implies
-    the AS-DT1; not allowed with `--lidar mid360s`).
+- The lidar is the Livox Mid-360S on the side (used for development).
+  `--lidar as-dt1` launches the other sensor under consideration, the Sony
+  AS-DT1 under the bottom, with the robot facing its direction of travel in
+  flight (see "Lidar option: Sony AS-DT1" below).
+- `--spin` makes the robot spin slowly (45 deg/s) about the vertical in
+  flight, with either lidar (for the AS-DT1 instead of facing travel); it
+  stops 1 s before the predicted touchdown.
 - `--lidar-fraction F` sets the fraction of the lidar's real point rate
   that is simulated (default: 1; for the Mid-360S 0.1 without an NVIDIA
   GPU); see "Lidar" below.
@@ -176,8 +177,8 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 | GROUND | still (~1 g, body rate < 0.2 rad/s) for 0.5 s after landing | leaning towards the target (next section); wheels spin down |
 | TAKEOFF | jump command (`Space`) | legs held as they are; after lift-off the lift-off attitude is held |
 | ASCENT | airborne and 0.5 m above the standing height | the robot's bottom tracks the target and it turns to face its travel (AS-DT1); lidar scans |
-| DESCENT | apex (vertical velocity turns negative) | reference back to level, landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
-| LANDING | landing-plane filter freezes (plane < 1 m below or < 0.3 s to touchdown), or ground contact | nothing special yet: the frozen plane is held until contact, legs straight |
+| DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on for half the ascent's time; then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
+| LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or ground contact | the landing plane keeps updating until impact; legs straight |
 
 - A hop that peaks below 0.5 m skips ASCENT; a jump that does not leave the
   ground returns to GROUND after 0.5 s.
@@ -198,10 +199,14 @@ Attitude reference per phase (`jumper_sim/flight_reference.py`): in ASCENT,
 on a jump, the robot's bottom (body -z, inside the lidar's field of view)
 is pointed at the track target and follows it as the robot
 moves (red sphere and line of
-sight in the viewer; tilt capped at 60 deg); in DESCENT the reference moves
-back towards level, and as soon as the ground at the predicted landing spot
-has been fitted, to its plane ("Landing reference from the lidar");
-LANDING holds it. The reference slews at most 180 deg/s, so
+sight in the viewer; tilt capped at 60 deg). It keeps tracking for the
+first half of the ascent's time (lift-off to apex) into the descent, since
+the descent takes about as long (a criterion from the predicted landing spot
+is planned instead); the red line of sight stays in the viewer for as long
+as the target is tracked. Then the reference moves back towards level, and as
+soon as the ground at the predicted landing spot has been fitted, to its
+plane ("Landing reference from the lidar"), which keeps updating through
+LANDING until the moment of impact. The reference slews at most 180 deg/s, so
 the controller never sees a reference step.
 
 ### Leaning towards the target
@@ -366,7 +371,7 @@ its own, the robot's heading does the job:
   lidar's tilt, faces its horizontal velocity: the lidar looks ahead, where
   the robot will land. Turning does not move body -z, so target tracking is
   unaffected. Straight up or down (< 0.2 m/s horizontally) it keeps its heading.
-- **`--spin`:** it spins slowly (45 deg/s, 8 s a turn) instead, sweeping the
+- **`--lidar as-dt1 --spin`:** it spins slowly (45 deg/s, 8 s a turn) instead, sweeping the
   lidar round a cone ~25 deg around body -z. The spin stops 1 s before the
   predicted touchdown, keeping the heading reached. More ground is covered,
   but the landing spot is seen only part of the time.
@@ -441,8 +446,10 @@ counts too:
 3. up to 1000 of the jump's points (an even subsample) within 0.5 m of that
    spot are fitted to the area-averaged ground plane, with outlier
    rejection and an uncertainty estimate;
-4. the fits are fused in a small Kalman filter that freezes when touchdown
-   is < 1 m or < 0.3 s away. The controller holds body z along that plane
+4. the fits are fused in a small Kalman filter that keeps updating until the
+   moment of impact (it used to freeze when touchdown was < 1 m or < 0.3 s
+   away; `freeze_near_touchdown` restores that); a near touchdown starts
+   LANDING. The controller holds body z along that plane
    normal (clamped to 20 deg) with the usual yaw reference. Nothing updates
    in contact; a jump resets the reference to level. PlotJuggler's
    `roll_ref`/`pitch_ref` show it.
@@ -461,10 +468,12 @@ misalignment of body z to the true ground plane at touchdown):
 | land level | 9.84 deg | 16.38 deg | 16.79 deg |
 | RealSense D435 stand-in, disc below the robot (as of the last commit) | 2.28 deg | 10.35 deg | 15.78 deg |
 | Mid-360S on the bottom facing down (blind straight below) | 0.35 deg | 0.96 deg | 2.17 deg |
-| **Mid-360S on the side, 22.5 deg down (current)** | **0.35 deg** | **1.28 deg** | **4.72 deg** |
+| Mid-360S on the side, 22.5 deg down, freezing near touchdown | 0.35 deg | 1.28 deg | 4.72 deg |
+| **Mid-360S on the side, updating until impact (current)** | **0.23 deg** | **1.05 deg** | **4.72 deg** |
+| Mid-360S, freezing near touchdown, `--spin` | 0.29 deg | 1.09 deg | 12.82 deg |
 | AS-DT1 under the bottom, facing straight down | 1.19 deg | 9.47 deg | 13.59 deg |
 | AS-DT1 facing straight down, spinning | 1.29 deg | 9.78 deg | 16.82 deg |
-| AS-DT1 tilted 10 deg, spinning (`--spin`) | 0.76 deg | 9.73 deg | 16.66 deg |
+| AS-DT1 tilted 10 deg, spinning (`--lidar as-dt1 --spin`) | 0.76 deg | 9.73 deg | 16.66 deg |
 | AS-DT1 tilted 10 deg, facing travel (`--lidar as-dt1`) | 0.57 deg | 5.07 deg | 12.27 deg |
 
 The camera only saw the ground straight below, which on a hop is not where
@@ -477,8 +486,11 @@ The bottom mount could not see where it landed when falling straight down
 from rest (pushed off a rim, or the contact benchmark's drops): it landed
 level, misaligned by the slope (1-17 deg), and tipped over in 4 of 12 drops.
 The side mount sees below itself: those drops land 0.11-0.41 deg off the
-ground plane, none tipped. The hop from the spawn lands 0.17 deg off
-(camera: 3.15 deg).
+ground plane, none tipped; updating until impact (instead of freezing 1 m /
+0.3 s before) brings that to 0.01-0.23 deg, still none tipped. The hop from
+the spawn, which also tracks the target for half its ascent time into the
+descent now, lands 0.37 deg off and stays upright (before: 0.17 deg, then
+tipped; camera: 3.15 deg). Wheel peak 17.1 rev/s (before 16.2).
 
 The AS-DT1's 30 deg view covers little ground, so what matters is where it
 looks during the descent. Facing straight down it saw the landing spot of a
@@ -500,7 +512,7 @@ bunny = within 0.3 m of the target, above the ground; landing disc = within
 | lidar | points | on the bunny | landing disc | ground covered (0.5 m cells) |
 |---|---|---|---|---|
 | **Mid-360S (side, current)** | **603-674k** | 166 / 102 / 47 | 6.1-6.5k | 2345-2932 m^2 |
-| AS-DT1, `--spin` | 53-73k | 40 / 23 / 4 | 1.3k | 302-362 m^2 |
+| AS-DT1, `--lidar as-dt1 --spin` | 53-73k | 40 / 23 / 4 | 1.3k | 302-362 m^2 |
 | AS-DT1, `--lidar as-dt1` (facing travel) | 56-73k | 49 / 16 / 7 | 3.0-3.2k | 179-283 m^2 |
 
 The AS-DT1 casts ~9-11x fewer points, nearly all of which hit (8640/s); it
@@ -513,7 +525,7 @@ puts about a third as many on the target, half as many in the landing disc
   fit, filter and reference attitude; written to run unchanged on the robot.
 - `jumper_sim/visualization.py`: the viewer overlay.
 - Tuning: `LandingReferenceConfig` (disc radius, max points, fit period,
-  touchdown clearance, max tilt, filter noise, freeze rules).
+  touchdown clearance, max tilt, filter noise, near-touchdown rules).
 
 ## Terrain
 

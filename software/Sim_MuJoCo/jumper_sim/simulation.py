@@ -126,7 +126,7 @@ class LandingVisual:
     measured_normal: np.ndarray  # latest single fit
     points: np.ndarray  # sample of the lidar points that fit used (world)
     radius: float
-    used: bool = True  # False: ignored (too noisy), frozen or rejected
+    used: bool = True  # False: ignored (too noisy) or rejected
 
 
 class LidarLandingReference:
@@ -281,7 +281,7 @@ class JumperSimulation:
                 track_target, self._ground_height,
             )
         self._jump_command = False  # given since the last phase update
-        self._frozen_at_descent = 0  # landing-filter freezes before this descent
+        self._near_at_descent = 0  # near-touchdown fits before this descent
         self.flight_events: list[str] = []
         # LQR + hop reference: on the ground, lean the body axis towards the
         # track target (closed loop on the IMU attitude, by shortening legs) so
@@ -389,7 +389,7 @@ class JumperSimulation:
         self.flight_phase.reset()
         self._previous_velocity = None
         self._jump_command = False
-        self._frozen_at_descent = 0
+        self._near_at_descent = 0
         self._close_scan()  # keep what the run collected; the file stays as saved
         self._lidar_next = 0.0  # time starts again from 0
         self._awaiting_touchdown = False
@@ -606,11 +606,10 @@ class JumperSimulation:
         if self.landing_reference is not None:
             # Without the hop reference: fit the ground whenever airborne.
             # With it: only on the way down (the jump's points so far include
-            # the ascent's).
-            fit = (
-                phase is FlightPhase.DESCENT
-                if self.flight_reference is not None
-                else not self.in_contact
+            # the ascent's), until the moment of impact.
+            fit = not self.in_contact and (
+                phase in (FlightPhase.DESCENT, FlightPhase.LANDING)
+                or self.flight_reference is None
             )
             accepted = self.landing_reference.filter.accepted
             if fit:
@@ -802,7 +801,7 @@ class JumperSimulation:
         specific_force = quaternion_to_matrix(quaternion).T @ (acceleration - self.model.opt.gravity)
         touchdown_near = (
             self.landing_reference is not None
-            and self.landing_reference.filter.frozen > self._frozen_at_descent
+            and self.landing_reference.filter.near_touchdown > self._near_at_descent
         )
         phase = self.flight_phase.update(
             specific_force, quaternion, gravity_magnitude(self.model.opt.gravity),
@@ -818,8 +817,8 @@ class JumperSimulation:
 
     def _enter_phase(self, phase: FlightPhase) -> None:
         if phase is FlightPhase.DESCENT and self.landing_reference is not None:
-            # Only a freeze from this descent on means touchdown is near.
-            self._frozen_at_descent = self.landing_reference.filter.frozen
+            # Only a near-touchdown fit from this descent on counts.
+            self._near_at_descent = self.landing_reference.filter.near_touchdown
         if self.flight_reference is None:
             return
         if phase is FlightPhase.ASCENT and self.flight_reference.tracking:
@@ -830,7 +829,11 @@ class JumperSimulation:
                 FlightPhase.GROUND: "[PHASE] On the ground.",
                 FlightPhase.TAKEOFF: "[PHASE] Take-off.",
                 FlightPhase.ASCENT: "[PHASE] Ascent.",
-                FlightPhase.DESCENT: "[FLIGHT] Descent: levelling until the landing spot is seen.",
+                FlightPhase.DESCENT: (
+                    "[FLIGHT] Descent: tracking the target for half the ascent's time, "
+                    "then levelling until the landing spot is seen."
+                    if self.flight_reference.tracking
+                    else "[FLIGHT] Descent: levelling until the landing spot is seen."),
                 FlightPhase.LANDING: "[PHASE] Landing: touchdown close."
                 if not self.in_contact else "[PHASE] Landing: ground contact.",
             }[phase]
