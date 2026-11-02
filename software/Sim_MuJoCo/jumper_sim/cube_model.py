@@ -5,11 +5,14 @@ in an inertial frame, scalar last (``q4``), and the body angular velocity in
 the body frame. ``Omega`` are the wheel speeds relative to the body, one wheel
 per body axis.
 
-The report writes ``u = Omega``, but the input matrix it derives (4.19) is the
-derivative with respect to the wheel *acceleration* ``Omega_dot``: ``Omega``
-itself only enters ``A`` (4.21), as the operating point ``Omega_hat``. So the
-linear model's input is ``Omega_dot``, and the wheel speed command sent to the
-motors is its integral (see :class:`jumper_sim.controller.LqrController`).
+The input is the wheel motor torque ``u = tau`` (on each wheel; the body gets
+``-tau``). Each wheel's spin obeys ``J_w,i (Omega_dot_i + w_dot_i) = tau_i``,
+so ``J_w Omega_dot = tau - J_w w_dot``, and the gyrostat equation (4.8),
+``J_c w_dot + J_w Omega_dot + S(w)(J_c w + J_w Omega) = 0``, becomes
+``(J_c - J_w) w_dot = -tau - S(w)(J_c w + J_w Omega)``. ``Omega`` only enters
+``A``, as the operating point ``Omega_hat`` (0 in the report's 4.21); it is
+not a state of its own: the total momentum is conserved, so ``w`` and
+``Omega`` cannot be controlled independently.
 
 In MuJoCo's convention (scalar first, Hamilton, body to world), the report's
 quaternion is ``(x, y, z, w)``: (4.3)-(4.4) is ``q_dot = 1/2 q * (0, w_body)``
@@ -48,6 +51,11 @@ class SensorCube:
     def j_w(self) -> np.ndarray:
         """(4.6): the three wheels are identical."""
         return self.wheel_inertia * np.eye(3)
+
+    @property
+    def j_b(self) -> np.ndarray:
+        """J_c - J_w: what a wheel's torque turns (its own spin excluded)."""
+        return self.j_c - self.j_w
 
 
 # The final cube design, from CAD (inertias given in g*mm^2 -> 1e-9 kg*m^2).
@@ -111,23 +119,32 @@ def cross_matrix(v: np.ndarray) -> np.ndarray:
 def dynamics(
     x: np.ndarray,
     wheel_speeds: np.ndarray,
-    wheel_accelerations: np.ndarray,
+    wheel_torques: np.ndarray,
     cube: SensorCube = SENSOR_CUBE,
 ) -> np.ndarray:
-    """x_dot = f(x, u) (4.11), free flight (no external torque, 4.7)."""
+    """x_dot = f(x, u), u = tau, free flight (no external torque, 4.7)."""
     q, w = x[:4], x[4:]
     momentum = cube.j_c @ w + cube.j_w @ wheel_speeds  # (4.5)
     q_dot = 0.5 * quaternion_rate_matrix(w) @ q  # (4.3)
-    w_dot = np.linalg.solve(  # (4.10)
-        cube.j_c, -cube.j_w @ wheel_accelerations - cross_matrix(w) @ momentum
-    )
+    w_dot = np.linalg.solve(cube.j_b, -wheel_torques - cross_matrix(w) @ momentum)
     return np.concatenate([q_dot, w_dot])
+
+
+def wheel_accelerations(
+    x: np.ndarray,
+    wheel_speeds: np.ndarray,
+    wheel_torques: np.ndarray,
+    cube: SensorCube = SENSOR_CUBE,
+) -> np.ndarray:
+    """Omega_dot = J_w^-1 tau - w_dot: the wheels relative to the body."""
+    w_dot = dynamics(x, wheel_speeds, wheel_torques, cube)[4:]
+    return wheel_torques / cube.wheel_inertia - w_dot
 
 
 def jacobians(
     x: np.ndarray, wheel_speeds: np.ndarray, cube: SensorCube = SENSOR_CUBE
 ) -> tuple[np.ndarray, np.ndarray]:
-    """A = df/dx (4.18) and B = df/dOmega_dot (4.19), anywhere."""
+    """A = df/dx and B = df/dtau, anywhere."""
     q, w = x[:4], x[4:]
     momentum = cube.j_c @ w + cube.j_w @ wheel_speeds
     # d(1/2 S_q(w) q)/dw: column i is 1/2 S_q(e_i) q.
@@ -135,13 +152,13 @@ def jacobians(
         [quaternion_rate_matrix(np.eye(3)[i]) @ q for i in range(3)]
     )
     # d(w x H)/dw = -S(H) + S(w) J_c, with H = J_c w + J_w Omega.
-    dw_dw = np.linalg.solve(cube.j_c, cross_matrix(momentum) - cross_matrix(w) @ cube.j_c)
+    dw_dw = np.linalg.solve(cube.j_b, cross_matrix(momentum) - cross_matrix(w) @ cube.j_c)
     a = np.zeros((7, 7))
     a[:4, :4] = 0.5 * quaternion_rate_matrix(w)
     a[:4, 4:] = dq_dw
     a[4:, 4:] = dw_dw
     b = np.zeros((7, 3))
-    b[4:, :] = -np.linalg.solve(cube.j_c, cube.j_w)
+    b[4:, :] = -np.linalg.inv(cube.j_b)
     return a, b
 
 
@@ -149,6 +166,9 @@ def linearize(
     wheel_speeds: np.ndarray, cube: SensorCube = SENSOR_CUBE
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reduced A_r, B_r (5.1) about q0 = [0 0 0 1], w0 = 0, Omega_0 = Omega_hat.
+
+    At Omega_hat = 0 (the report's choice) A_r's rate block is zero and
+    B_r's rate rows are -diag(1 / (J_c,i - J_w,i)).
 
     At q0 the row (and column) of q4 is zero: q4 = sqrt(1 - |q1..3|^2) is a
     dependent state, so it is stripped, leaving x_r = [q1 q2 q3 wx wy wz].

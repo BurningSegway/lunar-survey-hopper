@@ -96,7 +96,8 @@ class SimulationTests(unittest.TestCase):
 
     def test_flying_robot_follows_the_reports_cube_model(self) -> None:
         # Tumbling with spun wheels and varying wheel torques: the report's
-        # f(x, u) (4.11), fed MuJoCo's wheel accelerations, tracks MuJoCo.
+        # f(x, u) with u = tau, fed the wheels' net torque (motor minus
+        # bearing friction), tracks MuJoCo.
         ids = self.simulation.ids
         self.model.opt.gravity[:] = 0.0
         qa = self.model.jnt_qposadr[ids.root_joint]
@@ -117,12 +118,13 @@ class SimulationTests(unittest.TestCase):
             self.data.ctrl[:] = 0.0
             self.data.ctrl[ids.wind_up_actuator] = JUMP_WINDUP_FORCE
             self.data.ctrl[list(ids.wheel_actuators)] = 0.4 * np.sin(k * dt * np.array([20.0, 31.0, 17.0]))
+            motor = self.data.ctrl[list(ids.wheel_actuators)].copy()
             before = self.data.qvel[wheel_dofs].copy()
             mujoco.mj_step(self.model, self.data)
             after = self.data.qvel[wheel_dofs].copy()
-            accelerations = (after - before) / dt
-            k1 = cube_dynamics(x, before, accelerations)
-            k2 = cube_dynamics(x + dt * k1, after, accelerations)
+            friction = self.model.dof_damping[wheel_dofs]
+            k1 = cube_dynamics(x, before, motor - friction * before)
+            k2 = cube_dynamics(x + dt * k1, after, motor - friction * after)
             x = x + 0.5 * dt * (k1 + k2)
             x[:4] /= np.linalg.norm(x[:4])
         mujoco_state = state()

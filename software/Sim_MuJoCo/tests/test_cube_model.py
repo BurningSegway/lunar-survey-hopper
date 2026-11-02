@@ -13,6 +13,7 @@ from jumper_sim.cube_model import (
     jacobians,
     linearize,
     quaternion_rate_matrix,
+    wheel_accelerations,
 )
 
 RNG = np.random.default_rng(7)
@@ -43,7 +44,7 @@ class CubeModelTests(unittest.TestCase):
         np.testing.assert_allclose(dynamics(EQUILIBRIUM, np.array([80.0, -30.0, 10.0]), np.zeros(3)), 0.0)
 
     def test_free_flight_conserves_angular_momentum(self) -> None:
-        # dH/dt + w x H = 0 (4.7): |H| is constant, wheel accelerations included.
+        # dH/dt + w x H = 0 (4.7): |H| is constant, wheel torques included.
         x, speeds, dt = random_state(), np.array([40.0, -20.0, 10.0]), 1e-4
         x[4:] *= 0.5
 
@@ -52,48 +53,62 @@ class CubeModelTests(unittest.TestCase):
 
         start = momentum_norm(x, speeds)
         for k in range(5000):
-            accelerations = 30.0 * np.sin(np.array([3.0, 5.0, 7.0]) * k * dt)
-            x = x + dt * dynamics(x, speeds, accelerations)
-            speeds = speeds + dt * accelerations
+            torques = 0.5 * np.sin(np.array([3.0, 5.0, 7.0]) * k * dt)
+            speeds_dot = wheel_accelerations(x, speeds, torques)
+            x = x + dt * dynamics(x, speeds, torques)
+            speeds = speeds + dt * speeds_dot
         self.assertAlmostEqual(momentum_norm(x, speeds) / start, 1.0, places=3)
 
     def test_jacobians_match_finite_differences(self) -> None:
-        # (4.18) and (4.19), away from the equilibrium too.
+        # A (4.18 with J_c - J_w in front) and B = df/dtau, away from the
+        # equilibrium too.
         for _ in range(3):
             x, speeds = random_state(), RNG.uniform(-100.0, 100.0, 3)
-            accelerations = RNG.uniform(-50.0, 50.0, 3)
+            torques = RNG.uniform(-2.0, 2.0, 3)
             a, b = jacobians(x, speeds)
             step = 1e-6
             numeric_a = np.column_stack([
-                (dynamics(x + step * e, speeds, accelerations)
-                 - dynamics(x - step * e, speeds, accelerations)) / (2 * step)
+                (dynamics(x + step * e, speeds, torques)
+                 - dynamics(x - step * e, speeds, torques)) / (2 * step)
                 for e in np.eye(7)
             ])
             numeric_b = np.column_stack([
-                (dynamics(x, speeds, accelerations + step * e)
-                 - dynamics(x, speeds, accelerations - step * e)) / (2 * step)
+                (dynamics(x, speeds, torques + step * e)
+                 - dynamics(x, speeds, torques - step * e)) / (2 * step)
                 for e in np.eye(3)
             ])
             np.testing.assert_allclose(a, numeric_a, atol=1e-6)
             np.testing.assert_allclose(b, numeric_b, atol=1e-6)
 
     def test_linearisation_has_the_reports_structure(self) -> None:
-        # (4.21) with row/column q4 stripped (5.1).
-        speeds = np.array([60.0, -60.0, 40.0])
-        a, b = linearize(speeds)
+        # (4.21) with row/column q4 stripped (5.1), torque input.
         jw = SENSOR_CUBE.wheel_inertia
-        jx, jy, jz = SENSOR_CUBE.body_inertia
-        np.testing.assert_allclose(a[:3, :3], 0.0)
-        np.testing.assert_allclose(a[:3, 3:], 0.5 * np.eye(3))
-        np.testing.assert_allclose(a[3:, :3], 0.0)
-        # J_c^-1 S(J_w Omega_hat): the wheels' momentum couples the axes.
-        np.testing.assert_allclose(
-            a[3:, 3:], np.diag([1 / jx, 1 / jy, 1 / jz]) @ cross_matrix(jw * speeds)
-        )
-        self.assertAlmostEqual(a[3, 4], -jw * speeds[2] / jx)
-        self.assertAlmostEqual(a[3, 5], jw * speeds[1] / jx)
+        bx, by, bz = (j - jw for j in SENSOR_CUBE.body_inertia)
+        a, b = linearize(np.zeros(3))  # the report's Omega_hat = 0
+        expected_a = np.zeros((6, 6))
+        expected_a[:3, 3:] = 0.5 * np.eye(3)
+        np.testing.assert_allclose(a, expected_a)
         np.testing.assert_allclose(b[:3], 0.0)
-        np.testing.assert_allclose(b[3:], -np.diag([jw / jx, jw / jy, jw / jz]))
+        np.testing.assert_allclose(b[3:], -np.diag([1 / bx, 1 / by, 1 / bz]))
+        # With spun wheels, (J_c - J_w)^-1 S(J_w Omega_hat) couples the axes.
+        speeds = np.array([60.0, -60.0, 40.0])
+        a, _ = linearize(speeds)
+        np.testing.assert_allclose(
+            a[3:, 3:], np.diag([1 / bx, 1 / by, 1 / bz]) @ cross_matrix(jw * speeds)
+        )
+        self.assertAlmostEqual(a[3, 4], -jw * speeds[2] / bx)
+        self.assertAlmostEqual(a[3, 5], jw * speeds[1] / bx)
+
+    def test_wheel_torque_spins_the_wheel_and_turns_the_body_back(self) -> None:
+        # J_w (Omega_dot + w_dot) = tau and (J_c - J_w) w_dot = -tau at rest:
+        # the momentum J_c w + J_w Omega stays zero.
+        torques = np.array([0.3, -0.5, 0.2])
+        w_dot = dynamics(EQUILIBRIUM, np.zeros(3), torques)[4:]
+        omega_dot = wheel_accelerations(EQUILIBRIUM, np.zeros(3), torques)
+        np.testing.assert_allclose(SENSOR_CUBE.j_w @ (omega_dot + w_dot), torques)
+        np.testing.assert_allclose(
+            SENSOR_CUBE.j_c @ w_dot + SENSOR_CUBE.j_w @ omega_dot, 0.0, atol=1e-12
+        )
 
     def test_reduced_system_is_controllable(self) -> None:
         # Kalman rank condition (5.1)-(5.2), with and without wheel momentum.

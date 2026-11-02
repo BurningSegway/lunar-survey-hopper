@@ -161,15 +161,19 @@ the sensor cube; the simulated robot is fitted to the same model.
 
 **Model** (`jumper_sim/cube_model.py`). The cube is a gyrostat: state
 `x = [q1 q2 q3 q4 wx wy wz]` (attitude quaternion, scalar last, and body
-rates), wheel speeds `Omega` relative to the body. `dynamics()` is
-`x_dot = f(x, u)` (4.11): `q_dot = 1/2 S_q q` and
-`w_dot = J_c^-1 (-J_w Omega_dot - S(w) (J_c w + J_w Omega))`, free flight.
-`jacobians()` gives A and B (4.18-4.19) anywhere; `linearize(Omega_hat)` gives
-the reduced `A_r`, `B_r` about `q0 = [0 0 0 1]`, `w0 = 0` with the wheels at
-`Omega_hat` (q4 stripped, 5.1). The wheels' momentum couples the axes:
-`A_r`'s rate block is `J_c^-1 S(J_w Omega_hat)`. The input of the linear model
-is the wheel acceleration `Omega_dot` (B is the derivative with respect to
-it; `Omega` itself only enters A as the operating point).
+rates), wheel speeds `Omega` relative to the body. The input is the wheel
+motor torque `u = tau` (the body gets `-tau`). Each wheel spins up as
+`J_w,i (Omega_dot_i + w_dot_i) = tau_i`; putting
+`J_w Omega_dot = tau - J_w w_dot` into the gyrostat equation (4.8) gives
+`dynamics()`, `x_dot = f(x, u)`: `q_dot = 1/2 S_q q` and
+`w_dot = (J_c - J_w)^-1 (-tau - S(w) (J_c w + J_w Omega))`, free flight
+(`wheel_accelerations()` gives `Omega_dot`). `jacobians()` gives A and B
+anywhere; `linearize(Omega_hat)` gives the reduced `A_r`, `B_r` about
+`q0 = [0 0 0 1]`, `w0 = 0` with the wheels at `Omega_hat` (q4 stripped, 5.1).
+At the report's `Omega_hat = 0`, `A_r`'s rate block is zero and
+`B_r = [0; -diag(1 / (J_c,i - J_w,i))]`; with spun wheels the rate block is
+`(J_c - J_w)^-1 S(J_w Omega_hat)`. `Omega` is not a state: the total momentum
+is conserved, so `w` and `Omega` cannot be controlled independently.
 
 The values are the final design's, `SENSOR_CUBE`: CAD
 `J_c = diag(0.07066, 0.07067, 0.07333) kg*m^2` (whole robot, wheels locked,
@@ -177,22 +181,22 @@ about its CoM), `J_w,i = 0.004422 kg*m^2`, cube 3.3 kg (placeholder), plus
 the jump springs (below).
 
 **Controller** (`LqrController` in `jumper_sim/controller.py`).
-`u = Omega_dot = -K x_r` on `x_r = [q1 q2 q3, w - w_ref]`, the error
+`u = tau = -K x_r` on `x_r = [q1 q2 q3, w - w_ref]`, the error
 quaternion's vector part to the reference attitude and the rate error to the
 reference's rate (so a turning reference, such as target tracking, is
 followed without lag). `K = R^-1 B_r' P` from the algebraic Riccati equation
 (5.6-5.7), solved in `solve_continuous_are` (matrix sign function, no
 dependencies). Q and R follow Bryson's rule, set in physical units in
-`LqrLimits`: full wheel acceleration (75 rev/s^2) at a 9 deg error, a body
+`LqrLimits`: full motor torque (the 1.95 N*m limit) at a 9 deg error, a body
 rate of 1.6 rad/s as bad as that error. As in the report, the model is
 linearised with the wheels at rest (`Omega_hat = 0`): one constant, per-axis
 gain, solved once. Optionally (`schedule_wheel_speeds=True`) the gain is
 re-solved whenever the measured wheel speeds move 2 rad/s, so it matches the
-momentum the wheels hold (0.17 ms per solve). The wheels
-take speed commands, as the ODrives do in velocity mode: `Omega_dot` is
-integrated into a wheel speed command, which a 25 Hz speed loop follows with
-the acceleration as torque feedforward (anti-windup: the command stays within
-the speed error that already asks for full torque).
+momentum the wheels hold (0.17 ms per solve). The torque goes to the
+motors as it is (ODrive torque mode), clipped to the motor limit, plus the
+bearing-friction feedforward. (An earlier version took the wheel
+acceleration as the input and commanded wheel speeds through a speed loop;
+the free-flight benchmark is within 2 % of it.)
 
 **Simulated plant.** `build/fit_robot_model.py` writes `SENSOR_CUBE` and the
 springs into `build/Jumping_Robot.xml`: wheel inertias, the base's mass and
@@ -660,8 +664,7 @@ Edit `ReactionWheelTuning`, `PidGains`, and `LqrLimits` in
 `jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
 limits, stationary detection thresholds and duration, wheel-rest behavior,
 wheel friction, and the LQR's physical tuning limits (Bryson's rule).
-`LqrController` also takes `schedule_wheel_speeds`, `relinearize_step` and
-`speed_loop_bandwidth`. The robot's design values (J_c, J_w,i, masses, jump
+`LqrController` also takes `schedule_wheel_speeds` and `relinearize_step`. The robot's design values (J_c, J_w,i, masses, jump
 springs) live in `jumper_sim/cube_model.py`; the LQR and the motor limits use
 them directly, and `build/fit_robot_model.py` writes them into the MJCF. Keep
 `wheel_viscous_friction` consistent with the wheel joints' damping.

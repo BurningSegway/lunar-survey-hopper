@@ -43,29 +43,28 @@ class LqrLimits:
     """Q and R of the report's LQR by Bryson's rule (report ch. 5).
 
     Each weight is 1/(largest acceptable value)^2, so the tuning reads as:
-    "use full wheel acceleration when the attitude error reaches
+    "use full motor torque when the attitude error reaches
     ``max_angle_error``" and "a body rate of ``max_rate`` is as bad as that
     error". The attitude states are the error quaternion's vector part, so the
-    angle is weighed as sin(angle/2). ``max_wheel_acceleration`` defaults to
-    the motor limit in :class:`ReactionWheelTuning`.
+    angle is weighed as sin(angle/2). ``max_torque`` defaults to the motor
+    limit in :class:`ReactionWheelTuning`.
     """
 
     max_angle_error: float = math.radians(9.0)  # rad
     max_rate: float = 1.6  # rad/s
-    max_wheel_acceleration: float | None = None  # rad/s^2
+    max_torque: float | None = None  # N*m
 
-    def wheel_acceleration(self, tuning: ReactionWheelTuning) -> float:
-        """Largest wheel acceleration u [rad/s^2]."""
-        if self.max_wheel_acceleration is not None:
-            return self.max_wheel_acceleration
-        return tuning.max_wheel_acceleration
+    def torque(self, tuning: ReactionWheelTuning) -> float:
+        """Largest wheel motor torque u [N*m]."""
+        if self.max_torque is not None:
+            return self.max_torque
+        return wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
 
     def weights(self, tuning: ReactionWheelTuning) -> tuple[np.ndarray, np.ndarray]:
-        """(Q, R) for x_r = [q1 q2 q3 wx wy wz] and u = Omega_dot."""
-        max_acceleration = self.wheel_acceleration(tuning)
+        """(Q, R) for x_r = [q1 q2 q3 wx wy wz] and u = tau."""
         max_quaternion = math.sin(0.5 * self.max_angle_error)
         q = np.diag([1.0 / max_quaternion**2] * 3 + [1.0 / self.max_rate**2] * 3)
-        r = np.eye(3) / max_acceleration**2
+        r = np.eye(3) / self.torque(tuning) ** 2
         return q, r
 
 
@@ -224,26 +223,18 @@ class LqrController:
     State x_r = [q1 q2 q3 wx wy wz]: the vector part of the error quaternion
     to the reference attitude, and the body rates (the simulator passes the
     rate error to a turning reference, see :func:`reference_rate`; the report
-    regulates to a fixed one). Input u = Omega_dot, the
-    wheel accelerations; u = -K x_r with K = R^-1 B_r' P from the algebraic
-    Riccati equation (5.6)-(5.7) on (A_r, B_r) of
-    :func:`jumper_sim.cube_model.linearize`.
+    regulates to a fixed one). Input u = tau, the wheel motor torques;
+    u = -K x_r with K = R^-1 B_r' P from the algebraic Riccati equation
+    (5.6)-(5.7) on (A_r, B_r) of :func:`jumper_sim.cube_model.linearize`. The
+    torque goes to the motors as it is (ODrive torque mode); the body gets
+    -tau.
 
     As in the report (4.21), the model is linearised with the wheels at
     rest, Omega_hat = 0: one constant K, decoupled per axis, no Riccati solve
     while flying. A_r would depend on the wheel speeds (the gyroscopic
-    coupling J_w*Omega_hat/J_c between the axes, 4.18); optionally,
-    ``schedule_wheel_speeds`` re-linearises at the measured wheel speeds
-    whenever they have moved ``relinearize_step`` [rad/s] from the last
-    point (5-7 % less integrated error with spun wheels in the free-flight
-    benchmark, ~0.18 ms per re-solve).
-
-    The wheels take speed commands, as the ODrives do in velocity mode: the
-    commanded acceleration is integrated into a wheel speed command, which a
-    per-wheel speed loop (``speed_loop_bandwidth`` [Hz]) follows with the
-    acceleration as torque feedforward. :meth:`compute_torque` returns the
-    resulting body torque (minus the motor torque), so it plugs into the
-    simulator's wheel limits like the PID.
+    coupling between the axes, 4.18); optionally, ``schedule_wheel_speeds``
+    re-linearises at the measured wheel speeds whenever they have moved
+    ``relinearize_step`` [rad/s] from the last point (~0.18 ms per re-solve).
     """
 
     compensates_wheel_friction = True
@@ -256,29 +247,18 @@ class LqrController:
         cube: SensorCube = SENSOR_CUBE,
         schedule_wheel_speeds: bool = False,
         relinearize_step: float = 2.0,
-        speed_loop_bandwidth: float = 25.0,
     ) -> None:
         if limits is None:
             limits = LqrLimits()
         if limits.max_angle_error <= 0.0 or limits.max_rate <= 0.0:
             raise ValueError("LQR limits must be positive")
-        self._tuning = tuning
         self._cube = cube
         self._q, self._r = limits.weights(tuning)
-        self._max_acceleration = limits.wheel_acceleration(tuning)
+        self._max_torque = limits.torque(tuning)
         self.schedule_wheel_speeds = schedule_wheel_speeds
         self._relinearize_step = relinearize_step
-        self._effective_inertia = np.array([
-            effective_inertia(cube.wheel_inertia, j) for j in cube.body_inertia
-        ])
-        self._speed_gain = self._effective_inertia * 2.0 * math.pi * speed_loop_bandwidth
-        # Anti-windup: the command stays within the speed error that already
-        # asks for full motor torque.
-        max_motor_torque = wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
-        self._max_speed_error = max_motor_torque / self._speed_gain
         self._linearized_at = np.zeros(3)
         self._gain = self.gain_at(self._linearized_at)
-        self.reset()
 
     @property
     def gain(self) -> np.ndarray:
@@ -290,13 +270,6 @@ class LqrController:
         """Omega_hat [rad/s] the current gain was computed at."""
         return self._linearized_at.copy()
 
-    @property
-    def wheel_speed_command(self) -> WheelSpeeds | None:
-        """Last wheel speed command [rad/s] (None before the first step)."""
-        if self._speed_command is None:
-            return None
-        return WheelSpeeds(*(float(v) for v in self._speed_command))
-
     def gain_at(self, wheel_speeds: np.ndarray) -> np.ndarray:
         a, b = linearize(wheel_speeds, self._cube)
         p = solve_continuous_are(a, b, self._q, self._r)
@@ -305,41 +278,20 @@ class LqrController:
     def compute_torque(
         self, sensor: SensorData, wheel_speeds: WheelSpeeds, time_step: float
     ) -> TorqueCommand:
-        speeds = np.array([wheel_speeds.x, wheel_speeds.y, wheel_speeds.z])
-        if (
-            self.schedule_wheel_speeds
-            and np.max(np.abs(speeds - self._linearized_at)) > self._relinearize_step
-        ):
-            self._linearized_at = speeds
-            self._gain = self.gain_at(speeds)
+        if self.schedule_wheel_speeds:
+            speeds = np.array([wheel_speeds.x, wheel_speeds.y, wheel_speeds.z])
+            if np.max(np.abs(speeds - self._linearized_at)) > self._relinearize_step:
+                self._linearized_at = speeds
+                self._gain = self.gain_at(speeds)
         state = np.concatenate([
             error_quaternion_vector((sensor.roll, sensor.pitch, sensor.yaw)),
             (sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate),
         ])
-        acceleration = np.clip(
-            -self._gain @ state, -self._max_acceleration, self._max_acceleration
-        )
-        if self._speed_command is None:
-            self._speed_command = speeds.copy()
-        self._speed_command = np.clip(
-            self._speed_command + acceleration * time_step,
-            speeds - self._max_speed_error,
-            speeds + self._max_speed_error,
-        )
-        self._speed_command = np.clip(
-            self._speed_command,
-            -self._tuning.max_wheel_velocity,
-            self._tuning.max_wheel_velocity,
-        )
-        motor = (
-            self._effective_inertia * acceleration
-            + self._speed_gain * (self._speed_command - speeds)
-        )
+        motor = np.clip(-self._gain @ state, -self._max_torque, self._max_torque)
         return TorqueCommand(*(-float(v) for v in motor))
 
     def reset(self) -> None:
-        # The next step starts the speed command from the measured speeds.
-        self._speed_command: np.ndarray | None = None
+        pass  # no internal state
 
 
 def error_quaternion_vector(rotation: tuple[float, float, float]) -> np.ndarray:
@@ -464,19 +416,14 @@ def wheel_friction_compensation(
     return tuning.wheel_viscous_friction * wheel_speed
 
 
-def effective_inertia(wheel: float, body: float) -> float:
+def wheel_effective_inertia(tuning: ReactionWheelTuning) -> float:
     """Torque per wheel acceleration relative to the body [kg*m^2].
 
-    ``body`` is the whole robot's inertia about the wheel's axis, wheels
-    locked (J_c): the body turns back by wheel/body of the wheel's
-    acceleration (J_c w_dot = -J_w Omega_dot), so the motor needs
-    wheel * (body - wheel) / body.
+    ``robot_inertia`` is J_c (wheels locked): the body turns back by J_w/J_c
+    of the wheel's acceleration, so the motor needs J_w (J_c - J_w) / J_c.
     """
+    wheel, body = tuning.wheel_inertia, tuning.robot_inertia
     return wheel * (body - wheel) / body
-
-
-def wheel_effective_inertia(tuning: ReactionWheelTuning) -> float:
-    return effective_inertia(tuning.wheel_inertia, tuning.robot_inertia)
 
 
 def read_simulated_imu(

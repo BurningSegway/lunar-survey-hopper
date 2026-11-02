@@ -47,8 +47,8 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
 
 | File | Role |
 |---|---|
-| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`. Input of the linear model is Omega_dot |
-| `controller.py` | PID and the report's LQR (ch. 5): u = Omega_dot = -K [q_err_vec, w - w_ref], CARE by matrix sign function, Bryson's rule via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds), wheel speed command + 25 Hz speed loop; `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
+| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot) |
+| `controller.py` | PID and the report's LQR (ch. 5): u = tau = -K [q_err_vec, w - w_ref] (torque straight to the motors, clipped), CARE by matrix sign function, Bryson's rule via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
 | `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating (attitude control only in flight, wheel momentum bleed in contact, 60 ms flight debounce); jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing filter's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
 | `flight_reference.py` | Hop reference: on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading in ASCENT/DESCENT: `face_travel` (body +x along the horizontal velocity, <= 90 deg/s) or `spin` (`--spin`, any lidar; 45 deg/s, stopped 1 s before predicted touchdown); body -z unaffected. Slew limit 180 deg/s |
@@ -131,6 +131,6 @@ above the ground (starting in it, the firm foot ejects the robot).
 - Sensor realism: IMU noise/bias/latency, attitude estimator, control rate.
 - Hardware prep: measure bearing friction; real cube mass (3.3 kg is a
   placeholder) and where the springs sit (their inertia is not in J_c); port
-  the LQR (wheel speed commands map to ODrive velocity mode) + gating,
+  the LQR (torque commands map to ODrive torque mode) + gating,
   landing reference and hop reference to the robot.
 - Recovery success rates in README were measured on the old 6 kg model.
