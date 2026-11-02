@@ -37,6 +37,8 @@ class HeightfieldRayCaster:
     Agreement with ``mj_multiRay`` is checked in the tests.
     """
 
+    BLOCK = 8  # cells per side of the max-height blocks the march skips
+
     def __init__(self, model: mujoco.MjModel, geom_name: str = TERRAIN_GEOM,
                  ) -> None:
         geom_id = _required(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
@@ -59,6 +61,21 @@ class HeightfieldRayCaster:
         self._dy = 2.0 * size_y / (rows - 1)
         self._rows, self._cols = rows, cols
         self._max_height = float(self._heights.max())
+        # Highest vertex of each BLOCK x BLOCK cells (its edge vertices too):
+        # a ray that passes a whole block above it cannot hit the terrain
+        # there, so the march skips the block in one step.
+        block_rows = -(-(rows - 1) // self.BLOCK)
+        block_cols = -(-(cols - 1) // self.BLOCK)
+        self._block_max = np.array([
+            [
+                self._heights[
+                    bi * self.BLOCK : (bi + 1) * self.BLOCK + 1,
+                    bj * self.BLOCK : (bj + 1) * self.BLOCK + 1,
+                ].max()
+                for bj in range(block_cols)
+            ]
+            for bi in range(block_rows)
+        ])
         # Static meshes on the terrain the camera also sees (e.g. the target).
         self.objects: list[MeshRayCaster] = []
 
@@ -99,6 +116,10 @@ class HeightfieldRayCaster:
         only changes slope where the ray crosses a grid line (x or y) or a
         cell diagonal. Stepping from breakpoint to breakpoint therefore finds
         the first sign change exactly, and the hit is a linear interpolation.
+        Where the ray stays above a whole block's highest vertex until it
+        leaves the block, it jumps to the block's edge instead (the surface
+        is below that vertex everywhere in the block): ~10x fewer steps for
+        long rays, same hits.
         """
         origin = np.asarray(origin, dtype=float)
         n = len(directions)
@@ -129,15 +150,34 @@ class HeightfieldRayCaster:
         g = gap(active, t)
         alive = g > 0  # below ground or off the map: no hit
         active, t, g = active[alive], t[alive], g[alive]
+        block_rate_x = rate_x / self.BLOCK
+        block_rate_y = rate_y / self.BLOCK
+        last_block = np.array(self._block_max.shape) - 1
         while active.size:
-            fx = fx0 + t * rate_x[active]
-            fy = fy0 + t * rate_y[active]
+            rx, ry = rate_x[active], rate_y[active]
+            fx = fx0 + t * rx
+            fy = fy0 + t * ry
             dt = np.minimum.reduce([
-                next_crossing(fx, rate_x[active]),
-                next_crossing(fy, rate_y[active]),
+                next_crossing(fx, rx),
+                next_crossing(fy, ry),
                 next_crossing(fx - fy, rate_w[active]),
             ])
             t_next = np.minimum(t + np.maximum(dt, 1e-9), max_range)
+            # Skip the rest of the block where the ray stays above its top.
+            bx, by = fx / self.BLOCK, fy / self.BLOCK
+            brx, bry = block_rate_x[active], block_rate_y[active]
+            to_edge = np.minimum(next_crossing(bx, brx), next_crossing(by, bry))
+            t_edge = np.minimum(t + np.maximum(to_edge, 1e-9), max_range)  # > t
+            ray_dz = dz[active]
+            z_low = origin[2] + ray_dz * np.where(ray_dz < 0.0, t_edge, t)
+            # The block the segment crosses: at its middle (at its start, a
+            # ray on a block edge moving down the grid would read the block
+            # behind it).
+            half = 0.5 * (t_edge - t)
+            bi = np.clip(np.floor(by + half * bry).astype(int), 0, last_block[0])
+            bj = np.clip(np.floor(bx + half * brx).astype(int), 0, last_block[1])
+            skip = z_low > self._block_max[bi, bj]
+            t_next = np.where(skip, np.maximum(t_edge, t_next), t_next)
             g_next = gap(active, t_next)
             crossed = g_next <= 0  # NaN (left the map) compares False
             if np.any(crossed):

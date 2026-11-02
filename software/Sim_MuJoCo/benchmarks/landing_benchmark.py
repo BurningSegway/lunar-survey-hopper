@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -124,10 +125,14 @@ def main() -> None:
     parser.add_argument("--lidar", choices=sorted(LIDARS), default=None,
                         help="lidar (default: the simulation's, the Mid-360S)")
     parser.add_argument("--spin", action="store_true", help="slow heading spin in flight")
+    parser.add_argument("--lidar-fraction", type=float, default=None, metavar="F",
+                        help="fraction of the lidar's point rate (default: the simulation's)")
     args = parser.parse_args()
     global LIDAR, SPIN
     SPIN = args.spin
     LIDAR = None if args.lidar is None else LIDARS[args.lidar]
+    if args.lidar_fraction is not None:
+        LIDAR = replace(LIDAR or LIDARS["mid360s"], point_fraction=args.lidar_fraction)
     config = LandingReferenceConfig()
     probe = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     caster = HeightfieldRayCaster(probe)

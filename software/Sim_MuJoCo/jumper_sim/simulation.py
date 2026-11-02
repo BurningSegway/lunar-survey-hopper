@@ -10,7 +10,6 @@ import numpy as np
 from .controller import (
     AttitudeController,
     LqrController,
-    LqrLimits,
     ReactionWheelController,
     ReactionWheelTuning,
     WheelRestController,
@@ -20,9 +19,11 @@ from .controller import (
     quaternion_error,
     read_simulated_imu,
     read_wheel_speeds,
-    robot_inertia,
+    reference_rate,
     wheel_friction_compensation,
+    SensorData,
 )
+from .cube_model import JUMP_SPRING, JUMP_SPRING_COUNT
 from .flight_phase import FlightPhase, FlightPhaseDetector, gravity_magnitude
 from .flight_reference import FlightReference, FlightReferenceConfig
 from .jump_aim import JumpAim
@@ -45,13 +46,20 @@ EARTH_GRAVITY = 9.81
 MOON_GRAVITY = 1.62
 JUMP_RELEASE_DURATION = 0.4
 JUMP_CYCLE_DURATION = 3.0
-# Must exceed the jump spring's force when wound; keep within the
-# wind_up_motor ctrlrange in the MJCF.
-JUMP_WINDUP_FORCE = -13000.0
+# Holds the foot against the wound stop: 25 % above the jump springs' force
+# at full compression; keep within the wind_up_motor ctrlrange in the MJCF.
+JUMP_WINDUP_FORCE = -1.25 * JUMP_SPRING_COUNT * JUMP_SPRING.max_force
 # Contact gating: the robot counts as airborne again only after this long
 # without terrain contact, so rocking on the legs or a skid reads as one
 # contact phase. Real bounces in Moon gravity last >= ~0.1 s.
 FLIGHT_DEBOUNCE = 0.06
+# The LQR follows the reference's rotation up to this rate [rad/s] (target
+# tracking turns slower); beyond it, e.g. while the reference slews 180 deg/s
+# to catch up at lift-off, the rest counts as error: chasing such a slew at
+# full rate overshot by 20 deg when it stopped (short Earth hop to a close
+# target: 0.2 deg off at the apex with 1 rad/s, 7 deg uncapped, 2.8 deg
+# without following the reference's rate).
+REFERENCE_RATE_FEEDFORWARD_LIMIT = 1.0
 TARGET_GEOM = "target_object"
 TARGET_PARKED_DEPTH = 100.0  # m below the terrain while no target is set
 # Tipped over (on the ground): body tilt beyond TIPPED_TILT; upright again
@@ -224,19 +232,18 @@ class JumperSimulation:
         if controller_name == "pid":
             self.controller: AttitudeController = ReactionWheelController(tuning)
         elif controller_name == "lqr":
-            self.controller = LqrController(
-                tuning,
-                LqrLimits().to_weights(tuning),
-                gyroscopic_inertia=robot_inertia(
-                    model, self.ids.root_joint, self.ids.wheel_joints
-                ),
-            )
+            # The report's LQR on the sensor cube model (SENSOR_CUBE, which
+            # build/Jumping_Robot.xml is fitted to).
+            self.controller = LqrController(tuning)
         else:
             raise ValueError(f"Unknown controller {controller_name!r}; use 'pid' or 'lqr'")
         self.controller_name = controller_name
-        # Only the LQR cancels bearing friction: the PID gains were tuned with
-        # that friction acting as extra rate damping, and lose damping without it.
-        self.compensate_wheel_friction = controller_name == "lqr"
+        # What the control law needs fed (see the controller classes): only
+        # the LQR cancels bearing friction and regulates the rate error to a
+        # moving reference.
+        self.compensate_wheel_friction = self.controller.compensates_wheel_friction
+        self.track_reference_rate = self.controller.follows_reference_rate
+        self._previous_reference: tuple[float, float, float, float] | None = None
         # Both controllers run the same hop process (lidar landing reference,
         # contact gating, target tracking, jump aim, scan) so they can be
         # compared; only the control law differs.
@@ -371,6 +378,7 @@ class JumperSimulation:
         self.model.opt.gravity[2] = -self.default_gravity
         mujoco.mj_forward(self.model, self.data)
         self.controller.reset()
+        self._previous_reference = None
         if self.landing_reference is not None:
             self.landing_reference.reset(float(self.data.time))
         self.wheel_rest_controller.cancel()
@@ -892,16 +900,23 @@ class JumperSimulation:
 
     def _apply_controls(self) -> None:
         if self.wheel_control_mode is not WheelControlMode.DISABLED:
-            sensor = read_simulated_imu(self.model, self.data, self.ids.root_joint)
             # Both controllers work on the body-frame quaternion error to the
             # reference attitude, which lines up with the gyro rates and wheel
             # axes at any attitude.
             qpos_address = self.model.jnt_qposadr[self.ids.root_joint]
-            quaternion = self.data.qpos[qpos_address + 3 : qpos_address + 7]
-            error = quaternion_error(
-                tuple(float(v) for v in quaternion), self.reference_quaternion()
-            )
-            sensor = replace(sensor, roll=error[0], pitch=error[1], yaw=error[2])
+            dof_address = self.model.jnt_dofadr[self.ids.root_joint]
+            attitude = tuple(float(v) for v in self.data.qpos[qpos_address + 3 : qpos_address + 7])
+            reference = self.reference_quaternion()
+            rates = self.data.qvel[dof_address + 3 : dof_address + 6]
+            if self.track_reference_rate and self._previous_reference is not None:
+                # The LQR's rate state is the error to the reference's rate,
+                # so a turning reference (target tracking) is followed without lag.
+                rates = rates - reference_rate(
+                    self._previous_reference, reference, attitude,
+                    float(self.model.opt.timestep), REFERENCE_RATE_FEEDFORWARD_LIMIT,
+                )
+            self._previous_reference = reference
+            sensor = SensorData(*quaternion_error(attitude, reference), *(float(v) for v in rates))
             wheel_speeds = self.read_wheel_speeds()
             torques = self.controller.compute_torque(
                 sensor, wheel_speeds, float(self.model.opt.timestep)
@@ -933,6 +948,7 @@ class JumperSimulation:
                     self.model, self.data, joint_id, command, self.tuning
                 )
         else:
+            self._previous_reference = None
             for actuator_id in self.ids.wheel_actuators:
                 self.data.ctrl[actuator_id] = 0.0
         self._recovery_wheel_commands()

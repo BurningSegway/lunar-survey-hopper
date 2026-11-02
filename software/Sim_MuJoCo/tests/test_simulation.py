@@ -13,6 +13,7 @@ import numpy as np
 from jumper_sim.simulation import (
     EARTH_GRAVITY,
     FLIGHT_DEBOUNCE,
+    JUMP_WINDUP_FORCE,
     MOON_GRAVITY,
     JumperSimulation,
     WheelControlMode,
@@ -23,6 +24,13 @@ from jumper_sim.controller import (
     limit_wheel_command,
     robot_inertia,
     wheel_effective_inertia,
+)
+from jumper_sim.cube_model import (
+    JUMP_SPRING,
+    JUMP_SPRING_COUNT,
+    ROBOT_MASS,
+    SENSOR_CUBE,
+    dynamics as cube_dynamics,
 )
 from jumper_sim.ray_casting import TERRAIN_GEOM_GROUP, HeightfieldRayCaster
 from jumper_sim.flight_phase import FlightPhase
@@ -50,6 +58,9 @@ def mujoco_ray_distances(model, data, origin, directions, max_range):
 
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
+# A cube face (half size 0.15 m) 1 cm above the spawn ground: dropped from
+# higher up, the controller rights the robot before it lands.
+ON_ITS_SIDE_HEIGHT = 0.16
 TERRAIN_ASSETS = (
     MODEL_PATH.parent / "terrain.obj",
     MODEL_PATH.parent / "terrain_height.bin",
@@ -67,16 +78,79 @@ class SimulationTests(unittest.TestCase):
         self.data = mujoco.MjData(self.model)
         self.simulation = JumperSimulation(self.model, self.data, "pid")
 
-    def test_lqr_uses_whole_robot_inertia_from_model(self) -> None:
-        simulation = JumperSimulation(self.model, self.data, "lqr")
-        inertia = simulation.controller.axis_inertia
-        rigid = robot_inertia(
-            self.model, simulation.ids.root_joint, simulation.ids.wheel_joints
+    def test_model_is_fitted_to_the_cube_and_springs(self) -> None:
+        # build/fit_robot_model.py: in flight the robot is the report's model.
+        ids = self.simulation.ids
+        inertia = robot_inertia(self.model, ids.root_joint, ids.wheel_joints)
+        np.testing.assert_allclose(inertia.rigid_body, SENSOR_CUBE.j_c, atol=1e-7)
+        np.testing.assert_allclose(inertia.wheel_spin, (SENSOR_CUBE.wheel_inertia,) * 3)
+        self.assertAlmostEqual(inertia.mass, ROBOT_MASS)
+        joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "jump_joint")
+        self.assertAlmostEqual(
+            float(self.model.jnt_stiffness[joint]), JUMP_SPRING_COUNT * JUMP_SPRING.stiffness
         )
-        np.testing.assert_allclose(rigid.wheel_spin, (0.0036,) * 3)
-        # Box 0.075 + two off-axis wheels (0.0036 + 0.2*0.125^2 each) + legs
-        # and the spherical foot; the axis's own wheel spin inertia is excluded.
-        np.testing.assert_allclose(inertia, (0.1050, 0.1050, 0.0985), atol=5e-4)
+        # Wound to full compression at q = 0, released to the free length.
+        np.testing.assert_allclose(self.model.jnt_range[joint], (0.0, JUMP_SPRING.stroke))
+        self.assertAlmostEqual(float(self.model.qpos_spring[self.model.jnt_qposadr[joint]]), JUMP_SPRING.stroke)
+        self.assertGreater(-JUMP_WINDUP_FORCE, JUMP_SPRING_COUNT * JUMP_SPRING.max_force)
+
+    def test_flying_robot_follows_the_reports_cube_model(self) -> None:
+        # Tumbling with spun wheels and varying wheel torques: the report's
+        # f(x, u) (4.11), fed MuJoCo's wheel accelerations, tracks MuJoCo.
+        ids = self.simulation.ids
+        self.model.opt.gravity[:] = 0.0
+        qa = self.model.jnt_qposadr[ids.root_joint]
+        va = self.model.jnt_dofadr[ids.root_joint]
+        wheel_dofs = [self.model.jnt_dofadr[j] for j in ids.wheel_joints]
+        self.data.qpos[qa + 2] = 20.0  # in the air, foot wound (q = 0)
+        self.data.qvel[:] = 0.0
+        self.data.qvel[va + 3:va + 6] = (0.7, -0.4, 1.1)
+        self.data.qvel[wheel_dofs] = (50.0, -30.0, 80.0)
+        mujoco.mj_forward(self.model, self.data)
+
+        def state():
+            w, x, y, z = self.data.qpos[qa + 3:qa + 7]
+            return np.concatenate([[x, y, z, w], self.data.qvel[va + 3:va + 6]])
+
+        x, dt = state(), float(self.model.opt.timestep)
+        for k in range(300):
+            self.data.ctrl[:] = 0.0
+            self.data.ctrl[ids.wind_up_actuator] = JUMP_WINDUP_FORCE
+            self.data.ctrl[list(ids.wheel_actuators)] = 0.4 * np.sin(k * dt * np.array([20.0, 31.0, 17.0]))
+            before = self.data.qvel[wheel_dofs].copy()
+            mujoco.mj_step(self.model, self.data)
+            after = self.data.qvel[wheel_dofs].copy()
+            accelerations = (after - before) / dt
+            k1 = cube_dynamics(x, before, accelerations)
+            k2 = cube_dynamics(x + dt * k1, after, accelerations)
+            x = x + 0.5 * dt * (k1 + k2)
+            x[:4] /= np.linalg.norm(x[:4])
+        mujoco_state = state()
+        np.testing.assert_allclose(x[4:], mujoco_state[4:], atol=0.01)
+        self.assertLess(math.degrees(2.0 * math.acos(min(1.0, abs(float(x[:4] @ mujoco_state[:4]))))), 0.3)
+
+    def test_jump_foot_extends_the_springs_stroke_and_winds_back(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr", landing_reference=False)
+        while self.data.time < 2.0:
+            simulation.step()
+        joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "jump_joint")
+        foot = self.model.jnt_qposadr[joint]
+        self.assertAlmostEqual(float(self.data.qpos[foot]), 0.0, delta=0.005)  # wound
+        va = self.model.jnt_dofadr[simulation.ids.root_joint]
+        simulation.handle_key("space")
+        speed, extension = 0.0, 0.0
+        while self.data.time < 4.0:
+            simulation.step()
+            speed = max(speed, float(self.data.qvel[va + 2]))
+            extension = max(extension, float(self.data.qpos[foot]))
+        self.assertAlmostEqual(extension, JUMP_SPRING.stroke, delta=0.005)
+        self.assertAlmostEqual(float(self.data.qpos[foot]), 0.0, delta=0.005)  # wound back
+        # The foot starts at the cube's bottom, 12.75 cm above the ground: the
+        # springs spend much of their energy on it before it pushes off.
+        # (6.4 m/s here; all of it in the robot would give 10.3 m/s.)
+        ideal = math.sqrt(2.0 * JUMP_SPRING_COUNT * JUMP_SPRING.energy / ROBOT_MASS)
+        self.assertGreater(speed, 0.5 * ideal)
+        self.assertLess(speed, 0.75 * ideal)
 
     def test_friction_tuning_matches_model_wheel_damping(self) -> None:
         for joint_id in self.simulation.ids.wheel_joints:
@@ -89,12 +163,16 @@ class SimulationTests(unittest.TestCase):
         mujoco.mj_forward(self.model, self.data)
         fast = HeightfieldRayCaster(self.model)
         rng = np.random.default_rng(4)
-        for origin in ((0.0, 0.0, 3.0), (5.0, -3.0, 8.0), (-12.0, 7.0, 1.0)):
+        # The last two: long rays from high up, mostly over blocks the march
+        # skips (HeightfieldRayCaster.BLOCK).
+        for origin, reach in (((0.0, 0.0, 3.0), 15.0), ((5.0, -3.0, 8.0), 15.0),
+                              ((-12.0, 7.0, 1.0), 15.0), ((3.0, 2.0, 20.0), 40.0),
+                              ((-20.0, -15.0, 12.0), 40.0)):
             directions = rng.standard_normal((400, 3))
             directions[:, 2] = -np.abs(directions[:, 2])
             directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-            a = fast.cast(np.array(origin), directions, 15.0)
-            b = mujoco_ray_distances(self.model, self.data, origin, directions, 15.0)
+            a = fast.cast(np.array(origin), directions, reach)
+            b = mujoco_ray_distances(self.model, self.data, origin, directions, reach)
             np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
             np.testing.assert_allclose(a[np.isfinite(a)], b[np.isfinite(b)], atol=1e-6)
 
@@ -373,7 +451,7 @@ class SimulationTests(unittest.TestCase):
         quaternion = np.zeros(4)
         mujoco.mju_euler2Quat(quaternion, np.array([0.0, math.radians(90), 0.0]), "xyz")
         self.data.qpos[3:7] = quaternion
-        self.data.qpos[2] = 0.4
+        self.data.qpos[2] = ON_ITS_SIDE_HEIGHT
         while self.data.time < 4.0 and not simulation.tipped:
             simulation.step()
         self.assertTrue(simulation.tipped)
@@ -387,7 +465,7 @@ class SimulationTests(unittest.TestCase):
         quaternion = np.zeros(4)
         mujoco.mju_euler2Quat(quaternion, np.radians(euler_deg), "xyz")
         self.data.qpos[3:7] = quaternion
-        self.data.qpos[2] = 0.4
+        self.data.qpos[2] = ON_ITS_SIDE_HEIGHT
         while self.data.time < 6.0:
             simulation.step()
         self.assertTrue(simulation.tipped)
@@ -481,8 +559,9 @@ class SimulationTests(unittest.TestCase):
         ground = simulation._ground_height(*target)
         np.testing.assert_allclose(simulation.flight_reference.active_target, (*target, ground + 0.15))
         # On target at the apex (the robot's bottom, in the middle of the
-        # side lidar's band). The PID tracks less tightly: 7.5 deg on this
-        # short Earth hop against ~0.3 for the LQR.
+        # side lidar's band). On this short (~1.6 m) Earth hop of the 4.2 kg
+        # cube: LQR 0.2 deg, PID 1.2 deg (6.4 deg in the descent; 7.5 deg at
+        # the apex on the old 6 kg model).
         self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
         # Still on target in the first half of the ascent's time going down.
         self.assertAlmostEqual(len(descent_errors) * float(self.model.opt.timestep),

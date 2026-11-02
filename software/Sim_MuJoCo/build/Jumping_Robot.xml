@@ -49,14 +49,18 @@
     <geom name="target_object" type="mesh" mesh="target_mesh" pos="0 0 0"
           rgba="1 0.45 0 1"/>  <!-- bright orange -->
 
-    <body name="base_link" pos="0 0 0.25">
+    <body name="base_link" pos="0 0 0.2875">
       <freejoint name="root"/>
       
       <!-- IMU at the body origin (accelerometer used for ascent/descent detection) -->
       <site name="imu" pos="0 0 0" size="0.01"/>
 
-      <!-- Explicitly defined 5.0 kg, 30 cm cube -->
-      <inertial pos="0 0 0" mass="5.0" diaginertia="0.075 0.075 0.075"/>
+      <!-- 30 cm cube. Mass and inertia (and the wheels' inertias) are fitted by
+           build/fit_robot_model.py to jumper_sim/cube_model.py (CAD J_c,
+           J_w,i; 3.3 kg cube placeholder + four 224 g jump springs): the whole
+           robot in flight is exactly 4.196 kg and diag(J_c) about its CoM.
+           Rerun the script instead of editing these by hand. -->
+      <inertial pos="0 0 0" mass="3.196" fullinertia="0.0396424837 0.0396524837 0.0482262792 -0.000148951382 0.000227895615 0.000227895615"/>
       <geom name="body_box" type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.8 0.8"/>
 
       <!-- LIDAR (Livox Mid-360S, 65x65x60 mm) on the +x side face, flush with
@@ -76,21 +80,21 @@
 
       <!-- REACTION WHEELS (Housed inside the box on their respective axes) -->
       <body name="rw_x" pos="0.125 0 0">
-        <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
+        <inertial pos="0 0 0" mass="0.2" diaginertia="0.004422 0.002211 0.002211"/>
         <joint name="rw_x_joint" type="hinge" axis="1 0 0" damping="0.01"/>
         <geom name="rw_x_geom" type="cylinder" size="0.08 0.02" euler="0 90 0"
               contype="0" conaffinity="0" rgba="0.8 0.2 0.2 1"/>
       </body>
       
       <body name="rw_y" pos="0 0.125 0">
-        <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
+        <inertial pos="0 0 0" mass="0.2" diaginertia="0.002211 0.004422 0.002211"/>
         <joint name="rw_y_joint" type="hinge" axis="0 1 0" damping="0.01"/>
         <geom name="rw_y_geom" type="cylinder" size="0.08 0.02" euler="90 0 0"
               contype="0" conaffinity="0" rgba="0.2 0.8 0.2 1"/>
       </body>
       
       <body name="rw_z" pos="0 0 0.125">
-        <inertial pos="0 0 0" mass="0.2" diaginertia="0.0036 0.0036 0.0036"/>
+        <inertial pos="0 0 0" mass="0.2" diaginertia="0.002211 0.002211 0.004422"/>
         <joint name="rw_z_joint" type="hinge" axis="0 0 1" damping="0.01"/>
         <geom name="rw_z_geom" type="cylinder" size="0.08 0.02"
               contype="0" conaffinity="0" rgba="0.8 0.8 0.2 1"/>
@@ -115,10 +119,15 @@
       </body>
 
       <!-- CENTRAL JUMPING FOOT
-           Spring stiffness 15000 N/m: ~3 m mean apex in Earth gravity (~16 m on
-           the Moon) on the moon-surface terrain (MuJoCo 3.2.3). The wind-up motor
-           (13 kN, JUMP_WINDUP_FORCE in simulation.py) must exceed the spring
-           force when wound (~4.8 kN).
+           Four compression springs in parallel (fjedre.dk 13760, JUMP_SPRING in
+           jumper_sim/cube_model.py; joint, foot position and spawn height
+           written by build/fit_robot_model.py): q = 0 is wound to full
+           compression (257 mm, 1718 N, 221 J) with the foot at the bottom of
+           the cube; the range ends at the springs' free length (spring length
+           and placement are not modelled). Light damping, stiff stroke
+           limits, a third of the springs' mass moving with the foot
+           (armature). The wind-up motor (JUMP_WINDUP_FORCE in simulation.py)
+           holds the foot at q = 0 with 1.25x the wound force.
            Firm foot contact: priority="2" overrides the soft sand for the foot
            only (legs and body still land in sand). In the sand the foot sank in
            and was ejected, so the jump height depended on the spot (0.01-8.8 m
@@ -128,8 +137,8 @@
            cylinder on flat ground touches at one rim point, so the push was
            off-centre and spun the robot up to 18 rad/s at take-off; the sphere
            pushes through its centre (0.2-0.9 rad/s). -->
-      <body name="central_foot" pos="0 0 -0.15">
-        <joint name="jump_joint" type="slide" axis="0 0 -1" stiffness="15000" damping="100" springref="0.3" limited="true" range="-0.02 0.4" armature="0.1"/>
+      <body name="central_foot" pos="0 0 -0.14">
+        <joint name="jump_joint" type="slide" axis="0 0 -1" stiffness="6680" damping="2" springref="0.2572" limited="true" range="0 0.2572" solreflimit="0.002 1" armature="0.298667"/>
         <geom name="foot" type="sphere" size="0.04" pos="0 0 0.03" mass="0.2" rgba="0.9 0.5 0.1 1"
               priority="2" solref="0.002 1" friction="0.7 0.01 0.001"/>
       </body>

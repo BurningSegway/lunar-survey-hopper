@@ -108,10 +108,19 @@ Options:
 - `--lidar-fraction F` sets the fraction of the lidar's real point rate
   that is simulated (default: 1; for the Mid-360S 0.1 without an NVIDIA
   GPU); see "Lidar" below.
+- `--smooth` simulates 3 % of the Mid-360S's point rate (6000 points/s) so
+  the viewer runs without stutter on a CPU; `--lidar-fraction` overrides it.
+  Measured over a Moon hop, stepping in the viewer's 8.3 ms slices: 1.7 % of
+  the slices run over (95th percentile 7.3 ms) and the simulation needs half
+  of real time, against 10 % of the slices at the default 10 % (5 % at 5 %,
+  1 % at 1 %; without any lidar 0 %). The landing plane fit is a little
+  noisier with fewer points (landing benchmark: touchdown misalignment median
+  0.47 deg, p90 1.21, against 0.29 and 0.84 at 10 %), so use it for watching
+  and the default for measurements.
 
 ## Controls
 
-- `Space`: initiate a jump (release for 0.4 seconds, then wind the spring back);
+- `Space`: initiate a jump (release the springs for 0.4 seconds, then wind them back);
   while tipped over, attempt a recovery instead (see "Tipped over")
 - `Backspace`: toggle Earth/Moon gravity without resetting the simulation (the
   simulation starts in Moon gravity)
@@ -145,6 +154,66 @@ roll, pitch, and yaw, their references, and X/Y/Z wheel speeds in rad/s.
 Start PlotJuggler's UDP Server listening on port `9870` before launching the
 simulator.
 
+## Sensor cube model and LQR (report chapters 4-5)
+
+`--controller lqr` is the LQR of the project report, on the report's model of
+the sensor cube; the simulated robot is fitted to the same model.
+
+**Model** (`jumper_sim/cube_model.py`). The cube is a gyrostat: state
+`x = [q1 q2 q3 q4 wx wy wz]` (attitude quaternion, scalar last, and body
+rates), wheel speeds `Omega` relative to the body. `dynamics()` is
+`x_dot = f(x, u)` (4.11): `q_dot = 1/2 S_q q` and
+`w_dot = J_c^-1 (-J_w Omega_dot - S(w) (J_c w + J_w Omega))`, free flight.
+`jacobians()` gives A and B (4.18-4.19) anywhere; `linearize(Omega_hat)` gives
+the reduced `A_r`, `B_r` about `q0 = [0 0 0 1]`, `w0 = 0` with the wheels at
+`Omega_hat` (q4 stripped, 5.1). The wheels' momentum couples the axes:
+`A_r`'s rate block is `J_c^-1 S(J_w Omega_hat)`. The input of the linear model
+is the wheel acceleration `Omega_dot` (B is the derivative with respect to
+it; `Omega` itself only enters A as the operating point).
+
+The values are the final design's, `SENSOR_CUBE`: CAD
+`J_c = diag(0.07066, 0.07067, 0.07333) kg*m^2` (whole robot, wheels locked,
+about its CoM), `J_w,i = 0.004422 kg*m^2`, cube 3.3 kg (placeholder), plus
+the jump springs (below).
+
+**Controller** (`LqrController` in `jumper_sim/controller.py`).
+`u = Omega_dot = -K x_r` on `x_r = [q1 q2 q3, w - w_ref]`, the error
+quaternion's vector part to the reference attitude and the rate error to the
+reference's rate (so a turning reference, such as target tracking, is
+followed without lag). `K = R^-1 B_r' P` from the algebraic Riccati equation
+(5.6-5.7), solved in `solve_continuous_are` (matrix sign function, no
+dependencies). Q and R follow Bryson's rule, set in physical units in
+`LqrLimits`: full wheel acceleration (75 rev/s^2) at a 9 deg error, a body
+rate of 1.6 rad/s as bad as that error. As in the report, the model is
+linearised with the wheels at rest (`Omega_hat = 0`): one constant, per-axis
+gain, solved once. Optionally (`schedule_wheel_speeds=True`) the gain is
+re-solved whenever the measured wheel speeds move 2 rad/s, so it matches the
+momentum the wheels hold (0.17 ms per solve). The wheels
+take speed commands, as the ODrives do in velocity mode: `Omega_dot` is
+integrated into a wheel speed command, which a 25 Hz speed loop follows with
+the acceleration as torque feedforward (anti-windup: the command stays within
+the speed error that already asks for full torque).
+
+**Simulated plant.** `build/fit_robot_model.py` writes `SENSOR_CUBE` and the
+springs into `build/Jumping_Robot.xml`: wheel inertias, the base's mass and
+full inertia tensor so the whole robot in flight is exactly `diag(J_c)` (no
+products of inertia), the jump joint and the spawn height. Rerun it after
+changing the values in `cube_model.py`; tests check that the MJCF matches.
+Integrating the report's `f(x, u)` alongside MuJoCo (tumbling, spun wheels,
+varying torques) tracks the body rate within 0.002 rad/s and the attitude
+within 0.1 deg over 0.3 s.
+
+**Measured** (free flight, `lqr_benchmark`, same 4.2 kg plant): against the
+previous per-axis LQI the report's LQR has 0-36 % lower integrated error and
+saturates the wheels less, but settles into 2 deg 40-70 ms later (it has no
+integrator and weighs the attitude as `sin(angle/2)`); measured with the
+gain scheduling on. With the report's fixed gain (the default), the two
+scenarios with spun wheels are 5-7 % worse, the others the same. On the
+target-tracking Earth hop test it is 0.2 deg off at the apex (PID 1.2 deg);
+in Moon hops ~0.01 deg. The reference's rate is followed up to 1 rad/s
+(`REFERENCE_RATE_FEEDFORWARD_LIMIT`): faster, such as the 180 deg/s slew
+that catches up at lift-off, counts as error (chasing it overshot 20 deg).
+
 ## One hop process for both controllers
 
 PID and LQR run the same hop process, so they can be compared on equal
@@ -152,9 +221,11 @@ terms: contact gating, the hop phases and attitude reference, leaning
 towards the target, the target object and scan, and the lidar landing
 reference below all apply to both. Both regulate the body-frame quaternion
 error to the reference attitude; only the control law differs, plus wheel
-friction compensation, which only the LQR uses (the PID gains were tuned with
-bearing friction acting as damping). The PID tracks the target less tightly:
-2.7-4.6 deg off at the apex of Moon hops against ~0.1 deg for the LQR.
+friction compensation and the rate error to the moving reference, which only
+the LQR uses (the PID gains were tuned with bearing friction acting as
+damping, and on the raw body rate). The PID tracks the target less tightly:
+1.2 deg off at the apex of the Earth hop test (6.4 deg in the descent)
+against 0.2 deg (0.6) for the LQR.
 
 ## Contact gating
 
@@ -287,8 +358,9 @@ its side):
 
 The console prints `[RECOVERY] Upright.` or `[RECOVERY] Still tipped (...)`.
 Each attempt starts from wherever the last one left the robot, so pressing
-Space again is worth it. Measured on 16 terrain spots x 4 sides in Moon
-gravity, via the Space key: upright after one attempt 41/54 and 40/55,
+Space again is worth it. Measured (on the old 6 kg model with the old
+spring, not yet redone for the 4.2 kg cube) on 16 terrain spots x 4 sides in
+Moon gravity, via the Space key: upright after one attempt 41/54 and 40/55,
 after up to three 51/54 and 54/55. In Earth gravity the hop is too short
 for this: 0/57. Rocking the body up before releasing the spring, or
 extending the legs, made it worse (see the module docstring). The attempt
@@ -332,8 +404,9 @@ The rays are cast on the GPU with NVIDIA Warp (`jumper_sim/gpu_ray_caster.py`:
 the same terrain triangles and target mesh as the numpy caster in
 `jumper_sim/ray_casting.py`, identical hits, ~80x faster), so the full point
 rate is simulated. Without an NVIDIA GPU the numpy caster is used and only
-10 % of the points are cast (the full rate would run 2-10x slower than real
-time). `--lidar-fraction F` overrides either default. Measured on Moon hops
+10 % of the points are cast (the full rate runs at about real time but
+stutters: 76 % of the viewer's 8.3 ms slices run over; `--smooth` casts 3 %).
+`--lidar-fraction F` overrides either default. Measured on Moon hops
 (3 targets, 8.4 s of flight each, side mount, landing reference included):
 
 | caster, fraction | points per hop | within 0.3 m of the bunny | flight speed |
@@ -541,12 +614,30 @@ about 3 cm at most.
 
 The jumping foot has its own contact: a 4 cm sphere, even firmer
 (`priority="2"`, `solref 0.002 1`, the sand's friction), so the spring pushes
-off the surface instead of sinking into the sand and being ejected. With the
-spring at 15000 N/m (13 kN wind-up) a jump reaches about 3 m on Earth and
-16 m on the Moon on average; it varies by about +-25 % with the ground under
-the robot (measured 1.4-4.2 m on Earth over 9 spots). The foot is round
-because a flat cylinder on flat ground touches at a single rim point, which
-spun the robot at take-off.
+off the surface instead of sinking into the sand and being ejected. The foot
+is round because a flat cylinder on flat ground touches at a single rim
+point, which spun the robot at take-off.
+
+## Jump springs
+
+The foot is pushed by four compression springs in parallel (fjedre.dk 13760:
+piano wire, 54 mm outer diameter, free length 335 mm, max. loaded length
+77.8 mm, 1.67 N/mm, 224 g; `JUMP_SPRING` in `jumper_sim/cube_model.py`):
+6680 N/m together, wound to full compression before each jump (257.2 mm,
+1718 N, 221 J). Where the springs sit and how long they are is not modelled
+(for now): the wound foot sits at the bottom of the cube, `Space` releases it
+to the springs' full stroke, and 0.4 s later the wind-up (1.25x the wound
+force) pulls it back. The joint has light damping (2 N*s/m), stiff ends of
+stroke, and a third of the springs' mass moving with the foot (armature). The
+robot weighs 4.196 kg (3.3 kg cube + 0.896 kg springs).
+
+Measured on 5 spots: about 1.65 m apex on Earth (1.5-2.1 m) and 9.2 m on the
+Moon (7.7-11.7 m), take-off at 5.2-6.4 m/s. Starting from the bottom of the
+cube, the foot falls 12.75 cm before it reaches the ground, and the springs
+spend much of their energy on it (all 221 J in the robot would give
+10.3 m/s; a foot wound flush with the leg tips reached 9.8 m/s, ~4.7 m Earth
+/ ~28 m Moon, but landed on its rigid stop and tipped 3 of 12 benchmark drops).
+Take-off spin is mostly below 2 rad/s (5.9 rad/s at one Earth spot).
 
 ## Benchmarks
 
@@ -568,10 +659,12 @@ landing benchmarks on the pinned version.
 Edit `ReactionWheelTuning`, `PidGains`, and `LqrLimits` in
 `jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
 limits, stationary detection thresholds and duration, wheel-rest behavior,
-wheel friction, and the LQR's physical tuning limits. The LQR takes the
-robot's inertia from the MJCF; keep `robot_inertia`/`wheel_inertia` and
-`wheel_viscous_friction` consistent with `build/Jumping_Robot.xml` for the
-PID and the motor limits.
+wheel friction, and the LQR's physical tuning limits (Bryson's rule).
+`LqrController` also takes `schedule_wheel_speeds`, `relinearize_step` and
+`speed_loop_bandwidth`. The robot's design values (J_c, J_w,i, masses, jump
+springs) live in `jumper_sim/cube_model.py`; the LQR and the motor limits use
+them directly, and `build/fit_robot_model.py` writes them into the MJCF. Keep
+`wheel_viscous_friction` consistent with the wheel joints' damping.
 
 
 ## Tests

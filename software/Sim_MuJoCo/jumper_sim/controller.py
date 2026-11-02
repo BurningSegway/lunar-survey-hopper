@@ -7,6 +7,8 @@ from typing import Protocol
 import mujoco
 import numpy as np
 
+from .cube_model import SENSOR_CUBE, SensorCube, linearize
+
 
 @dataclass(frozen=True)
 class PidGains:
@@ -24,10 +26,9 @@ class ReactionWheelTuning:
     stationary_linear_speed: float = 0.05
     stationary_angular_speed: float = 0.05
     stationary_duration: float = 1.0
-    robot_mass: float = 5.0
-    robot_inertia: float = 0.075
-    wheel_mass: float = 0.2
-    wheel_inertia: float = 0.0036
+    # J_c (wheels locked) on its smallest axis, for the motor torque limits.
+    robot_inertia: float = min(SENSOR_CUBE.body_inertia)
+    wheel_inertia: float = SENSOR_CUBE.wheel_inertia
     # Viscous bearing friction of each wheel [N*m*s/rad]. Matches the wheel
     # joints' damping in build/Jumping_Robot.xml; on hardware, identify it from
     # a spin-down test. Set to 0.0 to disable friction compensation.
@@ -39,54 +40,33 @@ class ReactionWheelTuning:
 
 @dataclass(frozen=True)
 class LqrLimits:
-    """Physical tuning knobs for the LQR (Bryson's rule).
+    """Q and R of the report's LQR by Bryson's rule (report ch. 5).
 
     Each weight is 1/(largest acceptable value)^2, so the tuning reads as:
-    "use full torque when the error reaches ``max_angle_error``", "a body rate
-    of ``max_rate`` is as bad as that angle error", and "remove a steady error
-    over roughly ``integral_time`` seconds". ``max_torque`` defaults to the
-    wheel motor limit from :class:`ReactionWheelTuning`.
+    "use full wheel acceleration when the attitude error reaches
+    ``max_angle_error``" and "a body rate of ``max_rate`` is as bad as that
+    error". The attitude states are the error quaternion's vector part, so the
+    angle is weighed as sin(angle/2). ``max_wheel_acceleration`` defaults to
+    the motor limit in :class:`ReactionWheelTuning`.
     """
 
     max_angle_error: float = math.radians(9.0)  # rad
     max_rate: float = 1.6  # rad/s
-    integral_time: float = 0.3  # s; 0 disables the integrator
-    max_torque: float | None = None  # N*m
+    max_wheel_acceleration: float | None = None  # rad/s^2
 
-    def to_weights(self, tuning: ReactionWheelTuning) -> "LqrWeights":
-        max_torque = (
-            self.max_torque
-            if self.max_torque is not None
-            else wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
-        )
-        integral = (
-            1.0 / (self.max_angle_error * self.integral_time) ** 2
-            if self.integral_time > 0.0
-            else 0.0
-        )
-        return LqrWeights(
-            angle=1.0 / self.max_angle_error**2,
-            angular_rate=1.0 / self.max_rate**2,
-            torque=1.0 / max_torque**2,
-            integral=integral,
-        )
+    def wheel_acceleration(self, tuning: ReactionWheelTuning) -> float:
+        """Largest wheel acceleration u [rad/s^2]."""
+        if self.max_wheel_acceleration is not None:
+            return self.max_wheel_acceleration
+        return tuning.max_wheel_acceleration
 
-
-@dataclass(frozen=True)
-class LqrWeights:
-    """Raw LQR weights; build them with :meth:`LqrLimits.to_weights`."""
-
-    angle: float
-    angular_rate: float
-    torque: float
-    # Weight on the integrated angle error (LQI); 0 disables the integrator.
-    # It removes the steady error left by bearing friction the feedforward in
-    # wheel_friction_compensation() does not cancel (unknown or drifting b).
-    integral: float
-    integral_torque_limit: float = 0.8  # N*m, anti-windup clamp
-    # Only integrate while |angle error| is below this [rad], so large
-    # transients do not wind the integrator up (integral separation).
-    integral_zone: float = math.radians(5.0)
+    def weights(self, tuning: ReactionWheelTuning) -> tuple[np.ndarray, np.ndarray]:
+        """(Q, R) for x_r = [q1 q2 q3 wx wy wz] and u = Omega_dot."""
+        max_acceleration = self.wheel_acceleration(tuning)
+        max_quaternion = math.sin(0.5 * self.max_angle_error)
+        q = np.diag([1.0 / max_quaternion**2] * 3 + [1.0 / self.max_rate**2] * 3)
+        r = np.eye(3) / max_acceleration**2
+        return q, r
 
 
 @dataclass(frozen=True)
@@ -121,6 +101,12 @@ class WheelTorques:
 
 
 class AttitudeController(Protocol):
+    # What the simulation should feed the control law: bearing-friction
+    # compensation on the motor command, and the rate error to a moving
+    # reference instead of the body rate.
+    compensates_wheel_friction: bool
+    follows_reference_rate: bool
+
     def compute_torque(
         self, sensor: SensorData, wheel_speeds: WheelSpeeds, time_step: float
     ) -> TorqueCommand: ...
@@ -185,6 +171,10 @@ class WheelRestController:
 
 class ReactionWheelController:
     _max_integral = 10.0
+    # The gains were tuned with bearing friction acting as damping, on the raw
+    # body rate: no friction compensation, no rate error to the reference.
+    compensates_wheel_friction = False
+    follows_reference_rate = False
 
     def __init__(self, tuning: ReactionWheelTuning) -> None:
         self._tuning = tuning
@@ -228,163 +218,187 @@ class ReactionWheelController:
         return max(-cls._max_integral, min(cls._max_integral, value))
 
 
-AxisInertia = tuple[float, float, float]
-AxisGains = tuple[float, float]
-
-
 class LqrController:
-    """Per-axis LQR on a double integrator J*theta_ddot = tau.
+    """The report's LQR (ch. 4-5) on the sensor cube's linearised gyrostat model.
 
-    ``axis_inertia`` is the inertia the wheels actually push against on each
-    body axis (roll, pitch, yaw). Passing ``gyroscopic_inertia`` (from
-    :func:`robot_inertia`) also supplies it, and adds the w x H gyroscopic
-    feedforward from :func:`gyroscopic_torque`. When neither is given,
-    ``tuning.robot_inertia`` is used for all three axes. ``weights`` default
-    to :class:`LqrLimits` ``().to_weights(tuning)``.
+    State x_r = [q1 q2 q3 wx wy wz]: the vector part of the error quaternion
+    to the reference attitude, and the body rates (the simulator passes the
+    rate error to a turning reference, see :func:`reference_rate`; the report
+    regulates to a fixed one). Input u = Omega_dot, the
+    wheel accelerations; u = -K x_r with K = R^-1 B_r' P from the algebraic
+    Riccati equation (5.6)-(5.7) on (A_r, B_r) of
+    :func:`jumper_sim.cube_model.linearize`.
 
-    With ``weights.integral > 0`` the state is augmented with the integrated
-    angle error (LQI), which removes steady attitude errors from constant
-    disturbance torques such as unmodelled bearing friction. The integrator is
-    clamped so its torque never exceeds ``weights.integral_torque_limit``.
+    As in the report (4.21), the model is linearised with the wheels at
+    rest, Omega_hat = 0: one constant K, decoupled per axis, no Riccati solve
+    while flying. A_r would depend on the wheel speeds (the gyroscopic
+    coupling J_w*Omega_hat/J_c between the axes, 4.18); optionally,
+    ``schedule_wheel_speeds`` re-linearises at the measured wheel speeds
+    whenever they have moved ``relinearize_step`` [rad/s] from the last
+    point (5-7 % less integrated error with spun wheels in the free-flight
+    benchmark, ~0.18 ms per re-solve).
+
+    The wheels take speed commands, as the ODrives do in velocity mode: the
+    commanded acceleration is integrated into a wheel speed command, which a
+    per-wheel speed loop (``speed_loop_bandwidth`` [Hz]) follows with the
+    acceleration as torque feedforward. :meth:`compute_torque` returns the
+    resulting body torque (minus the motor torque), so it plugs into the
+    simulator's wheel limits like the PID.
     """
+
+    compensates_wheel_friction = True
+    follows_reference_rate = True
 
     def __init__(
         self,
         tuning: ReactionWheelTuning,
-        weights: LqrWeights | None = None,
-        axis_inertia: AxisInertia | None = None,
-        gyroscopic_inertia: "RobotInertia | None" = None,
+        limits: LqrLimits | None = None,
+        cube: SensorCube = SENSOR_CUBE,
+        schedule_wheel_speeds: bool = False,
+        relinearize_step: float = 2.0,
+        speed_loop_bandwidth: float = 25.0,
     ) -> None:
-        if weights is None:
-            weights = LqrLimits().to_weights(tuning)
-        self._gyroscopic_inertia = gyroscopic_inertia
-        if axis_inertia is None and gyroscopic_inertia is not None:
-            axis_inertia = gyroscopic_inertia.plant_axis_inertia
-        if axis_inertia is None:
-            axis_inertia = (tuning.robot_inertia,) * 3
-        if (
-            any(inertia <= 0.0 for inertia in axis_inertia)
-            or weights.angle <= 0.0
-            or weights.angular_rate <= 0.0
-            or weights.torque <= 0.0
-            or weights.integral < 0.0
-            or weights.integral_torque_limit < 0.0
-        ):
-            raise ValueError("LQR inertia and weights must be positive")
-        self._weights = weights
-        self._axis_inertia = tuple(float(i) for i in axis_inertia)
-        axis_solutions = [
-            self._compute_axis_gains(inertia, weights)
-            for inertia in self._axis_inertia
-        ]
-        self._gains = tuple((k[1], k[2]) for k in axis_solutions)
-        self._integral_gains = tuple(k[0] for k in axis_solutions)
-        self._integral_limits = tuple(
-            weights.integral_torque_limit / k_i if k_i > 0.0 else 0.0
-            for k_i in self._integral_gains
-        )
+        if limits is None:
+            limits = LqrLimits()
+        if limits.max_angle_error <= 0.0 or limits.max_rate <= 0.0:
+            raise ValueError("LQR limits must be positive")
+        self._tuning = tuning
+        self._cube = cube
+        self._q, self._r = limits.weights(tuning)
+        self._max_acceleration = limits.wheel_acceleration(tuning)
+        self.schedule_wheel_speeds = schedule_wheel_speeds
+        self._relinearize_step = relinearize_step
+        self._effective_inertia = np.array([
+            effective_inertia(cube.wheel_inertia, j) for j in cube.body_inertia
+        ])
+        self._speed_gain = self._effective_inertia * 2.0 * math.pi * speed_loop_bandwidth
+        # Anti-windup: the command stays within the speed error that already
+        # asks for full motor torque.
+        max_motor_torque = wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
+        self._max_speed_error = max_motor_torque / self._speed_gain
+        self._linearized_at = np.zeros(3)
+        self._gain = self.gain_at(self._linearized_at)
         self.reset()
 
     @property
-    def axis_inertia(self) -> AxisInertia:
-        return self._axis_inertia
+    def gain(self) -> np.ndarray:
+        """Current K (3 x 6): u = -K x_r."""
+        return self._gain
 
     @property
-    def gains(self) -> tuple[AxisGains, AxisGains, AxisGains]:
-        """(angle gain, rate gain) for roll, pitch and yaw."""
-        return self._gains
+    def linearized_at(self) -> np.ndarray:
+        """Omega_hat [rad/s] the current gain was computed at."""
+        return self._linearized_at.copy()
 
     @property
-    def integral_gains(self) -> tuple[float, float, float]:
-        """Integrated-angle gain per axis (all zero when integral is off)."""
-        return self._integral_gains
+    def wheel_speed_command(self) -> WheelSpeeds | None:
+        """Last wheel speed command [rad/s] (None before the first step)."""
+        if self._speed_command is None:
+            return None
+        return WheelSpeeds(*(float(v) for v in self._speed_command))
+
+    def gain_at(self, wheel_speeds: np.ndarray) -> np.ndarray:
+        a, b = linearize(wheel_speeds, self._cube)
+        p = solve_continuous_are(a, b, self._q, self._r)
+        return np.linalg.solve(self._r, b.T @ p)
 
     def compute_torque(
         self, sensor: SensorData, wheel_speeds: WheelSpeeds, time_step: float
     ) -> TorqueCommand:
-        feedforward = (
-            gyroscopic_torque(self._gyroscopic_inertia, sensor, wheel_speeds)
-            if self._gyroscopic_inertia is not None
-            else (0.0, 0.0, 0.0)
+        speeds = np.array([wheel_speeds.x, wheel_speeds.y, wheel_speeds.z])
+        if (
+            self.schedule_wheel_speeds
+            and np.max(np.abs(speeds - self._linearized_at)) > self._relinearize_step
+        ):
+            self._linearized_at = speeds
+            self._gain = self.gain_at(speeds)
+        state = np.concatenate([
+            error_quaternion_vector((sensor.roll, sensor.pitch, sensor.yaw)),
+            (sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate),
+        ])
+        acceleration = np.clip(
+            -self._gain @ state, -self._max_acceleration, self._max_acceleration
         )
-        angles = (sensor.roll, sensor.pitch, sensor.yaw)
-        rates = (sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate)
-        torques = []
-        for axis in range(3):
-            k_i = self._integral_gains[axis]
-            if k_i > 0.0 and abs(angles[axis]) < self._weights.integral_zone:
-                limit = self._integral_limits[axis]
-                self._integral[axis] = max(
-                    -limit, min(limit, self._integral[axis] + angles[axis] * time_step)
-                )
-            k_angle, k_rate = self._gains[axis]
-            torques.append(
-                feedforward[axis]
-                - (k_i * self._integral[axis] + k_angle * angles[axis] + k_rate * rates[axis])
-            )
-        return TorqueCommand(*torques)
+        if self._speed_command is None:
+            self._speed_command = speeds.copy()
+        self._speed_command = np.clip(
+            self._speed_command + acceleration * time_step,
+            speeds - self._max_speed_error,
+            speeds + self._max_speed_error,
+        )
+        self._speed_command = np.clip(
+            self._speed_command,
+            -self._tuning.max_wheel_velocity,
+            self._tuning.max_wheel_velocity,
+        )
+        motor = (
+            self._effective_inertia * acceleration
+            + self._speed_gain * (self._speed_command - speeds)
+        )
+        return TorqueCommand(*(-float(v) for v in motor))
 
     def reset(self) -> None:
-        self._integral = [0.0, 0.0, 0.0]
+        # The next step starts the speed command from the measured speeds.
+        self._speed_command: np.ndarray | None = None
 
-    @staticmethod
-    def _compute_axis_gains(
-        inertia: float, weights: LqrWeights
-    ) -> tuple[float, float, float]:
-        """Return (integral gain, angle gain, rate gain) for one axis."""
-        if weights.integral == 0.0:
-            # State [angle, rate]: double integrator.
-            a = np.array([[0.0, 1.0], [0.0, 0.0]])
-            b = np.array([[0.0], [1.0 / inertia]])
-            q = np.diag([weights.angle, weights.angular_rate])
-        else:
-            # State [integrated angle, angle, rate].
-            a = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
-            b = np.array([[0.0], [0.0], [1.0 / inertia]])
-            q = np.diag([weights.integral, weights.angle, weights.angular_rate])
-        p = solve_continuous_are(a, b, q, np.array([[weights.torque]]))
-        k = (b.T @ p / weights.torque).ravel()
-        if weights.integral == 0.0:
-            return 0.0, float(k[0]), float(k[1])
-        return float(k[0]), float(k[1]), float(k[2])
+
+def error_quaternion_vector(rotation: tuple[float, float, float]) -> np.ndarray:
+    """[q1 q2 q3] of the error quaternion for a body-frame rotation vector.
+
+    The inverse of :func:`quaternion_error` (which returns the shorter
+    rotation, so q4 >= 0): axis * sin(angle / 2).
+    """
+    vector = np.asarray(rotation, dtype=float)
+    angle = float(np.linalg.norm(vector))
+    if angle < 1e-12:
+        return 0.5 * vector
+    return vector * (math.sin(0.5 * angle) / angle)
 
 
 def solve_continuous_are(
     a: np.ndarray, b: np.ndarray, q: np.ndarray, r: np.ndarray
 ) -> np.ndarray:
-    """Solve A'P + PA - PBR^-1B'P + Q = 0 via the Hamiltonian's stable subspace.
+    """Solve A'P + PA - PBR^-1B'P + Q = 0 (5.7) with the matrix sign function.
 
-    Small, dependency-free equivalent of scipy.linalg.solve_continuous_are for
-    the low-order systems used here.
+    Small, dependency-free equivalent of scipy.linalg.solve_continuous_are.
+    The sign function of the Hamiltonian (Newton iteration with determinant
+    scaling) gives its stable invariant subspace without eigenvectors, which
+    are ill-conditioned here: the cube's axes are nearly identical, so the
+    eigenvalues nearly repeat.
     """
     n = a.shape[0]
-    r_inv = np.linalg.inv(r)
-    hamiltonian = np.block([[a, -b @ r_inv @ b.T], [-q, -a.T]])
-    eigenvalues, eigenvectors = np.linalg.eig(hamiltonian)
-    stable = eigenvectors[:, eigenvalues.real < 0.0]
-    if stable.shape[1] != n:
+    hamiltonian = np.block([[a, -b @ np.linalg.solve(r, b.T)], [-q, -a.T]])
+    sign = hamiltonian
+    for _ in range(100):
+        inverse = np.linalg.inv(sign)
+        scale = math.exp(-np.linalg.slogdet(sign)[1] / (2 * n))
+        updated = 0.5 * (scale * sign + inverse / scale)
+        converged = np.linalg.norm(updated - sign, 1) <= 1e-13 * np.linalg.norm(updated, 1)
+        sign = updated
+        if converged:
+            break
+    else:
         raise ValueError("Riccati equation has no stabilising solution")
-    p = np.real(stable[n:, :] @ np.linalg.inv(stable[:n, :]))
+    identity = np.eye(n)
+    # P spans the stable subspace: (sign + I) [I; P] = 0.
+    lhs = np.vstack([sign[:n, n:], sign[n:, n:] + identity])
+    rhs = -np.vstack([sign[:n, :n] + identity, sign[n:, :n]])
+    p = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
     return 0.5 * (p + p.T)
 
 
 @dataclass(frozen=True)
 class RobotInertia:
-    """Whole-robot inertia about its CoM, in the root body frame.
+    """Whole-robot mass properties about its CoM, in the root body frame.
 
     ``rigid_body`` treats every body -- including the wheels -- as locked
-    together; ``wheel_spin`` is each wheel's inertia about its own spin axis.
+    together (the report's J_c); ``wheel_spin`` is each wheel's inertia about
+    its own spin axis (J_w,i).
     """
 
     rigid_body: tuple[tuple[float, float, float], ...]
     wheel_spin: tuple[float, float, float]
-
-    @property
-    def plant_axis_inertia(self) -> AxisInertia:
-        """Inertia each wheel's motor reacts against (own wheel spin excluded)."""
-        return tuple(
-            self.rigid_body[axis][axis] - self.wheel_spin[axis] for axis in range(3)
-        )
+    mass: float
 
 
 def robot_inertia(
@@ -392,7 +406,11 @@ def robot_inertia(
     root_joint_id: int,
     wheel_joint_ids: tuple[int, int, int],
 ) -> RobotInertia:
-    """Evaluate :class:`RobotInertia` from the model at its reference pose."""
+    """Evaluate :class:`RobotInertia` from the model at its reference pose.
+
+    That is the flight pose: build/fit_robot_model.py puts the wound jump
+    foot at q = 0, and the legs rest at 0.
+    """
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
@@ -421,26 +439,8 @@ def robot_inertia(
     return RobotInertia(
         rigid_body=tuple(tuple(float(v) for v in row) for row in inertia_body),
         wheel_spin=tuple(wheel_spin),
+        mass=float(sum(model.body_mass[b] for b in bodies)),
     )
-
-
-def gyroscopic_torque(
-    inertia: RobotInertia, sensor: SensorData, wheel_speeds: WheelSpeeds
-) -> tuple[float, float, float]:
-    """Body torque w x H that cancels gyroscopic coupling in flight.
-
-    H = J_rigid*w + J_spin*w_wheel is the robot's total angular momentum in
-    the body frame (w_wheel relative to the body). In flight dH/dt = 0 in
-    inertial space, so the body sees -w x H; adding +w x H to the commanded
-    body torque leaves each axis behaving like the decoupled double integrator
-    the LQR was designed for.
-    """
-    rate = np.array([sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate])
-    momentum = np.array(inertia.rigid_body) @ rate + np.array(inertia.wheel_spin) * np.array(
-        [wheel_speeds.x, wheel_speeds.y, wheel_speeds.z]
-    )
-    torque = np.cross(rate, momentum)
-    return float(torque[0]), float(torque[1]), float(torque[2])
 
 
 def _is_descendant(model: mujoco.MjModel, body: int, ancestor: int) -> bool:
@@ -464,10 +464,19 @@ def wheel_friction_compensation(
     return tuning.wheel_viscous_friction * wheel_speed
 
 
+def effective_inertia(wheel: float, body: float) -> float:
+    """Torque per wheel acceleration relative to the body [kg*m^2].
+
+    ``body`` is the whole robot's inertia about the wheel's axis, wheels
+    locked (J_c): the body turns back by wheel/body of the wheel's
+    acceleration (J_c w_dot = -J_w Omega_dot), so the motor needs
+    wheel * (body - wheel) / body.
+    """
+    return wheel * (body - wheel) / body
+
+
 def wheel_effective_inertia(tuning: ReactionWheelTuning) -> float:
-    return tuning.wheel_inertia * tuning.robot_inertia / (
-        tuning.wheel_inertia + tuning.robot_inertia
-    )
+    return effective_inertia(tuning.wheel_inertia, tuning.robot_inertia)
 
 
 def read_simulated_imu(
@@ -540,6 +549,39 @@ def quaternion_error(
         return (2.0 * ex, 2.0 * ey, 2.0 * ez)
     scale = 2.0 * math.atan2(vector_norm, ew) / vector_norm
     return (scale * ex, scale * ey, scale * ez)
+
+
+def reference_rate(
+    previous: tuple[float, float, float, float],
+    reference: tuple[float, float, float, float],
+    quaternion: tuple[float, float, float, float],
+    time_step: float,
+    max_rate: float,
+) -> tuple[float, float, float]:
+    """Angular velocity of a moving reference attitude, in the body frame [rad/s].
+
+    From two successive reference quaternions (MuJoCo convention), rotated
+    from the reference frame into the body's (``quaternion``) and capped at
+    ``max_rate`` so a step in the reference does not read as a huge rate.
+    """
+    if reference == previous:
+        return (0.0, 0.0, 0.0)
+    rate = [v / time_step for v in quaternion_error(reference, previous)]
+    speed = math.sqrt(rate[0] ** 2 + rate[1] ** 2 + rate[2] ** 2)
+    if speed > max_rate:
+        rate = [v * max_rate / speed for v in rate]
+    # Into the body frame: rotate by conj(q) * reference.
+    w, x, y, z = quaternion
+    rw, rx, ry, rz = reference
+    relative = np.array([
+        w * rw + x * rx + y * ry + z * rz,
+        w * rx - x * rw - y * rz + z * ry,
+        w * ry + x * rz - y * rw - z * rx,
+        w * rz - x * ry + y * rx - z * rw,
+    ])
+    body = np.zeros(3)
+    mujoco.mju_rotVecQuat(body, np.array(rate), relative)
+    return (float(body[0]), float(body[1]), float(body[2]))
 
 
 def limit_wheel_command(

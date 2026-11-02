@@ -17,7 +17,7 @@ import mujoco.viewer
 import numpy as np
 
 from .gpu_ray_caster import gpu_available
-from .lidar import LIDARS, SONY_AS_DT1
+from .lidar import LIDARS, LIVOX_MID360, SONY_AS_DT1, LidarSpec
 from .pointcloud import PointCloudRecorder
 from .simulation import MOON_GRAVITY, JumperSimulation
 from .telemetry import UdpTelemetry
@@ -31,6 +31,11 @@ SYNC_PERIOD = 1.0 / 120.0  # s of wall time between viewer syncs
 # Most sim time one sync may catch up on; if a slow stretch puts the sim
 # further behind the wall clock, it runs slower than real time instead.
 MAX_CATCH_UP = 0.05  # s
+# --smooth: the Mid-360S at 3 % of its point rate (6000 points/s). Measured on
+# a CPU (Moon hop, steps in 8.3 ms viewer slices): 1.7 % of the slices take
+# longer than 8.3 ms (95th percentile 7.3 ms) and the sim needs half of real
+# time, against 10 % of the slices at the default 10 % (5 % at 5 %, 2 % at 2 %).
+SMOOTH_LIDAR_FRACTION = 0.03
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 SCAN_PATH = Path(__file__).resolve().parents[1] / "pointclouds" / "target_scan.ply"
 # Default track target: a random ground position this far from the spawn, at
@@ -95,13 +100,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--lidar-fraction", type=float, default=None, metavar="F",
         help="fraction of the lidar's real point rate that is simulated "
         "(default: 1; for the Mid-360S 0.1 without an NVIDIA GPU, since the CPU "
-        "caster runs its full rate 2-10x slower than real time)",
+        "caster runs its full rate at about real time, but stuttering; see --smooth)",
+    )
+    parser.add_argument(
+        "--smooth", action="store_true",
+        help=f"simulate only {SMOOTH_LIDAR_FRACTION:.0%} of the Mid-360S's point rate, "
+        "so the viewer runs without stutter on a CPU (--lidar-fraction overrides it)",
     )
     parser.add_argument(
         "--no-scan-window", action="store_true",
         help="do not open the live point cloud window (the file is still written)",
     )
     return parser
+
+
+def lidar_fraction(args: argparse.Namespace, spec: LidarSpec) -> float:
+    """Fraction of the lidar's point rate to simulate."""
+    if args.lidar_fraction is not None:
+        return args.lidar_fraction
+    if args.smooth and spec is LIVOX_MID360:
+        return SMOOTH_LIDAR_FRACTION
+    # The AS-DT1's 8640 points/s are cheap on any hardware.
+    return 1.0 if gpu_available() or spec is SONY_AS_DT1 else 0.1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -126,11 +146,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
-    fraction = args.lidar_fraction
     spec = LIDARS[args.lidar]
-    if fraction is None:
-        # The AS-DT1's 8640 points/s are cheap on any hardware.
-        fraction = 1.0 if gpu_available() or spec is SONY_AS_DT1 else 0.1
+    fraction = lidar_fraction(args, spec)
     lidar = replace(spec, point_fraction=fraction)
     print(f"[LIDAR] {lidar.name}: {fraction:.0%} of the point rate, rays cast on the "
           f"{'GPU (Warp)' if gpu_available() else 'CPU'}")
