@@ -156,8 +156,10 @@ simulator.
 
 ## Sensor cube model and LQR (report chapters 4-5)
 
-`--controller lqr` is the LQR of the project report, on the report's model of
-the sensor cube; the simulated robot is fitted to the same model.
+`--controller lqr` is the LQR of the project report with the integral
+reference tracking of its MATLAB script (`angular_reference_integral.mlx`),
+on the report's model of the sensor cube; the simulated robot is fitted to
+the same model.
 
 **Model** (`jumper_sim/cube_model.py`). The cube is a gyrostat: state
 `x = [q1 q2 q3 q4 wx wy wz]` (attitude quaternion, scalar last, and body
@@ -180,23 +182,41 @@ The values are the final design's, `SENSOR_CUBE`: CAD
 about its CoM), `J_w,i = 0.004422 kg*m^2`, cube 3.3 kg (placeholder), plus
 the jump springs (below).
 
-**Controller** (`LqrController` in `jumper_sim/controller.py`).
-`u = tau = -K x_r` on `x_r = [q1 q2 q3, w - w_ref]`, the error
-quaternion's vector part to the reference attitude and the rate error to the
-reference's rate (so a turning reference, such as target tracking, is
-followed without lag). `K = R^-1 B_r' P` from the algebraic Riccati equation
-(5.6-5.7), solved in `solve_continuous_are` (matrix sign function, no
-dependencies). Q and R follow Bryson's rule, set in physical units in
-`LqrLimits`: full motor torque (the 1.95 N*m limit) at a 9 deg error, a body
-rate of 1.6 rad/s as bad as that error. As in the report, the model is
-linearised with the wheels at rest (`Omega_hat = 0`): one constant, per-axis
-gain, solved once. Optionally (`schedule_wheel_speeds=True`) the gain is
-re-solved whenever the measured wheel speeds move 2 rad/s, so it matches the
-momentum the wheels hold (0.17 ms per solve). The torque goes to the
-motors as it is (ODrive torque mode), clipped to the motor limit, plus the
-bearing-friction feedforward. (An earlier version took the wheel
-acceleration as the input and commanded wheel speeds through a speed loop;
-the free-flight benchmark is within 2 % of it.)
+**Controller** (`LqrController` in `jumper_sim/controller.py`), the script's
+9-state LQI. The plant `x_r = [q1 q2 q3 wx wy wz]` is augmented with the
+integrated tracking error `x_I` (`x_I_dot = q_v - r`, the script's eq. 25):
+`A_aug = [[A_r, 0], [C, 0]]`, `B_aug = [B_r; 0]`, `C = [I 0]`, and
+`u = tau = -K_bar [x_r; x_I]` with `K_bar = R^-1 B_aug' P` from the algebraic
+Riccati equation (5.6-5.7), solved in `solve_continuous_are` (matrix sign
+function, no dependencies).
+
+- **Reference tracking.** The script adds `N r` with `N = N_u + K N_x` from
+  `[[A_r, B_r], [C, 0]] [N_x; N_u] = [0; I]` (`tracking_feedforward()`). For
+  this plant `N_x = [I; 0]` and `N_u = 0`, so `-K x_r + N r = -K [q_v - r; w]`:
+  the error to the reference. The controller is given that error directly,
+  as the error quaternion's vector part to the reference attitude (equal to
+  `q_v - r` near level, and still right at the hop reference's 60 deg tilt),
+  plus the rate error to the reference's rate, so a turning reference is
+  followed without lag.
+- **Weights** (Bryson's rule, `LqrLimits`, the script's): 15 deg attitude
+  error (weighed as `angle/2` on the quaternion), 60 deg/s rate, 5 deg*s
+  integral, 10 rev/s^2 wheel acceleration. The script's input is the wheel
+  acceleration; ours is the motor torque `tau_i = J_eff,i Omega_dot_i`
+  (`J_eff,i = J_w,i (J_c,i - J_w,i) / J_c,i`), so R is weighed on 0.26 N*m,
+  which gives the script's closed loop exactly (poles -3.1 +- 2.0j, -1.6;
+  `K_bar / J_eff` is the script's 770.5 / 126.1 / 720). That bound is only a
+  weight: the torque is clipped at the 1.95 N*m motor limit.
+- **Anti-windup** (not in the script): an axis only integrates while its
+  error is below 5 deg (`integral_zone`), and its integral's torque is
+  clamped at 0.8 N*m (`integral_torque_limit`); the simulator empties it at
+  every lift-off and touchdown. `None` for both gives the script's pure
+  integrator.
+- As in the report, the model is linearised with the wheels at rest
+  (`Omega_hat = 0`): one constant, per-axis gain, solved once. Optionally
+  (`schedule_wheel_speeds=True`) the gain is re-solved whenever the measured
+  wheel speeds move 2 rad/s, so it matches the momentum the wheels hold. The
+  torque goes to the motors as it is (ODrive torque mode), clipped to the
+  motor limit, plus the bearing-friction feedforward.
 
 **Simulated plant.** `build/fit_robot_model.py` writes `SENSOR_CUBE` and the
 springs into `build/Jumping_Robot.xml`: wheel inertias, the base's mass and
@@ -207,16 +227,21 @@ Integrating the report's `f(x, u)` alongside MuJoCo (tumbling, spun wheels,
 varying torques) tracks the body rate within 0.002 rad/s and the attitude
 within 0.1 deg over 0.3 s.
 
-**Measured** (free flight, `lqr_benchmark`, same 4.2 kg plant): against the
-previous per-axis LQI the report's LQR has 0-36 % lower integrated error and
-saturates the wheels less, but settles into 2 deg 40-70 ms later (it has no
-integrator and weighs the attitude as `sin(angle/2)`); measured with the
-gain scheduling on. With the report's fixed gain (the default), the two
-scenarios with spun wheels are 5-7 % worse, the others the same. On the
-target-tracking Earth hop test it is 0.2 deg off at the apex (PID 1.2 deg);
-in Moon hops ~0.01 deg. The reference's rate is followed up to 1 rad/s
-(`REFERENCE_RATE_FEEDFORWARD_LIMIT`): faster, such as the 180 deg/s slew
-that catches up at lift-off, counts as error (chasing it overshot 20 deg).
+**Measured** (same 4.2 kg plant). Free flight, run over 8 s from 200 m
+(the benchmark's 2 s window is too short for these weights): every scenario
+settles into 2 deg in 0.65-2.9 s with no steady error, against 0.16-0.58 s
+for the previous LQR without integrator (9 deg / 1.6 rad/s / full motor
+torque); it saturates less (<= 2 % against <= 13 %) and spins the wheels
+less. The two scenarios with spun wheels are the slowest (2.5-2.9 s: the
+fixed gain does not model the wheels' coupling). Without the anti-windup the
+large tilts wind the integrator up: 1.7-4.2 s, 9-34 % more integrated error.
+Landing benchmark: median 0.32 deg, p90 1.33 deg off the ground at
+touchdown (previous LQR 0.29 / 0.84); from 3 m 0.76 deg median (0.41),
+from 10 m 0.20 deg (0.32). On the target-tracking Earth hop test it is
+3.0 deg off at the apex and at most 3.0 deg in the descent (previous LQR
+0.2 deg at the apex; pure integrator 5.9 deg in the descent). The reference's
+rate is followed up to 1 rad/s (`REFERENCE_RATE_FEEDFORWARD_LIMIT`): faster,
+such as the 180 deg/s slew that catches up at lift-off, counts as error.
 
 ## One hop process for both controllers
 
@@ -229,7 +254,7 @@ friction compensation and the rate error to the moving reference, which only
 the LQR uses (the PID gains were tuned with bearing friction acting as
 damping, and on the raw body rate). The PID tracks the target less tightly:
 1.2 deg off at the apex of the Earth hop test (6.4 deg in the descent)
-against 0.2 deg (0.6) for the LQR.
+against 3.0 deg (3.0) for the LQR, which is softer but integrates.
 
 ## Contact gating
 
@@ -663,7 +688,8 @@ landing benchmarks on the pinned version.
 Edit `ReactionWheelTuning`, `PidGains`, and `LqrLimits` in
 `jumper_sim/controller.py` to change the PID gains, wheel speed/acceleration
 limits, stationary detection thresholds and duration, wheel-rest behavior,
-wheel friction, and the LQR's physical tuning limits (Bryson's rule).
+wheel friction, and the LQR's physical tuning limits (Bryson's rule) and
+anti-windup.
 `LqrController` also takes `schedule_wheel_speeds` and `relinearize_step`. The robot's design values (J_c, J_w,i, masses, jump
 springs) live in `jumper_sim/cube_model.py`; the LQR and the motor limits use
 them directly, and `build/fit_robot_model.py` writes them into the MJCF. Keep

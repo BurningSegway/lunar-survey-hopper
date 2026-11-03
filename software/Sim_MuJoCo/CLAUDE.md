@@ -10,7 +10,7 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~141 tests, ~100 s, all must pass (the lidar pattern test already failed before the report LQR)
+.venv/bin/python -m unittest discover -s tests           # ~146 tests, ~45 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
@@ -35,10 +35,17 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
   friction compensation to it.
 - Keep the landing-filter outlier gate and all three benchmarks (the user
   chose to keep them). The LQR is the project report's (ch. 4-5, user's
-  choice, replacing the per-axis LQI with its gyroscopic feedforward): keep
-  it the report's model and law: linearised at Omega_hat = 0 (the report's
-  choice, to save overhead), one fixed gain; `schedule_wheel_speeds=True`
-  re-solves it at the measured wheel speeds (5-7 % better with spun wheels).
+  choice, replacing the per-axis LQI with its gyroscopic feedforward) with
+  the integral reference tracking of the user's MATLAB script
+  `angular_reference_integral.mlx` (9-state LQI, eq. 25; not in the repo):
+  keep it the report's model and the script's law and Bryson bounds (15 deg,
+  60 deg/s, 5 deg*s, 10 rev/s^2 wheel acceleration as 0.26 N*m of torque;
+  a test checks the gains against the script's). The script's N r
+  feedforward is the error quaternion (N_x = [I; 0], N_u = 0). Anti-windup
+  (5 deg integral zone, 0.8 N*m clamp, reset at lift-off/touchdown) is the
+  user's choice after the pure integrator wound up. Linearised at
+  Omega_hat = 0 (the report's choice, to save overhead), one fixed gain;
+  `schedule_wheel_speeds=True` re-solves it at the measured wheel speeds.
 - Design values (CAD J_c, J_w,i, 3.3 kg cube placeholder, four fjedre.dk
   13760 jump springs) live in `cube_model.py`; the MJCF is fitted to them by
   `build/fit_robot_model.py` (rerun it, don't hand-edit those MJCF values).
@@ -48,7 +55,7 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
 | File | Role |
 |---|---|
 | `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot) |
-| `controller.py` | PID and the report's LQR (ch. 5): u = tau = -K [q_err_vec, w - w_ref] (torque straight to the motors, clipped), CARE by matrix sign function, Bryson's rule via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
+| `controller.py` | PID and the report's LQR (ch. 5) as the script's LQI: u = tau = -K_bar [q_err_vec, w - w_ref, x_I] (torque straight to the motors, clipped at the motor limit), `augment`, `tracking_feedforward`, CARE by matrix sign function, Bryson's rule + anti-windup via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
 | `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating (attitude control only in flight, wheel momentum bleed in contact, 60 ms flight debounce); jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing filter's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
 | `flight_reference.py` | Hop reference: on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading in ASCENT/DESCENT: `face_travel` (body +x along the horizontal velocity, <= 90 deg/s) or `spin` (`--spin`, any lidar; 45 deg/s, stopped 1 s before predicted touchdown); body -z unaffected. Slew limit 180 deg/s |

@@ -562,7 +562,8 @@ class SimulationTests(unittest.TestCase):
         np.testing.assert_allclose(simulation.flight_reference.active_target, (*target, ground + 0.15))
         # On target at the apex (the robot's bottom, in the middle of the
         # side lidar's band). On this short (~1.6 m) Earth hop of the 4.2 kg
-        # cube: LQR 0.2 deg, PID 1.2 deg (6.4 deg in the descent; 7.5 deg at
+        # cube: LQI 3.0 deg (3.0 in the descent; the LQR without integrator
+        # 0.2), PID 1.2 deg (6.4 deg in the descent; 7.5 deg at
         # the apex on the old 6 kg model).
         self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
         # Still on target in the first half of the ascent's time going down.

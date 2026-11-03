@@ -40,32 +40,49 @@ class ReactionWheelTuning:
 
 @dataclass(frozen=True)
 class LqrLimits:
-    """Q and R of the report's LQR by Bryson's rule (report ch. 5).
+    """Q and R of the report's LQI by Bryson's rule (angular_reference_integral.mlx).
 
-    Each weight is 1/(largest acceptable value)^2, so the tuning reads as:
-    "use full motor torque when the attitude error reaches
-    ``max_angle_error``" and "a body rate of ``max_rate`` is as bad as that
-    error". The attitude states are the error quaternion's vector part, so the
-    angle is weighed as sin(angle/2). ``max_torque`` defaults to the motor
-    limit in :class:`ReactionWheelTuning`.
+    Each weight is 1/(largest acceptable value)^2 of its state or input: the
+    attitude error ``max_angle_error`` (weighed as the error quaternion's
+    vector part, angle/2), the body rate ``max_rate``, the integrated
+    quaternion error ``max_integral_error`` [rad*s] (None: no integral state,
+    the plain 6-state LQR) and the wheel acceleration
+    ``max_wheel_acceleration``. The script's input is the wheel acceleration;
+    ours is the motor torque tau_i = J_eff,i Omega_dot_i (J_eff,i =
+    J_w,i (J_c,i - J_w,i) / J_c,i), so R is weighed on that torque, which
+    gives the script's closed loop exactly. ``max_torque`` overrides that
+    torque bound on all three axes.
+
+    Anti-windup (not in the script): an axis only integrates while its
+    attitude error is below ``integral_zone`` [rad] (integral separation), and
+    its integral is clamped so K_I x_I never exceeds ``integral_torque_limit``
+    [N*m]. None disables either.
     """
 
-    max_angle_error: float = math.radians(9.0)  # rad
-    max_rate: float = 1.6  # rad/s
+    max_angle_error: float = math.radians(15.0)  # rad
+    max_rate: float = math.radians(60.0)  # rad/s
+    max_integral_error: float | None = math.radians(5.0)  # rad*s
+    max_wheel_acceleration: float = 10.0 * 2.0 * math.pi  # rad/s^2
     max_torque: float | None = None  # N*m
+    integral_zone: float | None = math.radians(5.0)  # rad
+    integral_torque_limit: float | None = 0.8  # N*m
 
-    def torque(self, tuning: ReactionWheelTuning) -> float:
-        """Largest wheel motor torque u [N*m]."""
+    def torques(self, cube: SensorCube = SENSOR_CUBE) -> np.ndarray:
+        """Bryson's bound on each wheel motor torque u_i [N*m]."""
         if self.max_torque is not None:
-            return self.max_torque
-        return wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
+            return np.full(3, self.max_torque)
+        j_c = np.asarray(cube.body_inertia)
+        j_eff = cube.wheel_inertia * (j_c - cube.wheel_inertia) / j_c
+        return j_eff * self.max_wheel_acceleration
 
-    def weights(self, tuning: ReactionWheelTuning) -> tuple[np.ndarray, np.ndarray]:
-        """(Q, R) for x_r = [q1 q2 q3 wx wy wz] and u = tau."""
-        max_quaternion = math.sin(0.5 * self.max_angle_error)
-        q = np.diag([1.0 / max_quaternion**2] * 3 + [1.0 / self.max_rate**2] * 3)
-        r = np.eye(3) / self.torque(tuning) ** 2
-        return q, r
+    def weights(self, cube: SensorCube = SENSOR_CUBE) -> tuple[np.ndarray, np.ndarray]:
+        """(Q, R) for z = [q1 q2 q3 wx wy wz (xI1 xI2 xI3)] and u = tau."""
+        max_quaternion = 0.5 * self.max_angle_error
+        diagonal = [1.0 / max_quaternion**2] * 3 + [1.0 / self.max_rate**2] * 3
+        if self.max_integral_error is not None:
+            diagonal += [1.0 / self.max_integral_error**2] * 3
+        r = np.diag(1.0 / self.torques(cube) ** 2)
+        return np.diag(diagonal), r
 
 
 @dataclass(frozen=True)
@@ -218,23 +235,34 @@ class ReactionWheelController:
 
 
 class LqrController:
-    """The report's LQR (ch. 4-5) on the sensor cube's linearised gyrostat model.
+    """The report's LQI (angular_reference_integral.mlx) on the sensor cube's
+    linearised gyrostat model.
 
-    State x_r = [q1 q2 q3 wx wy wz]: the vector part of the error quaternion
-    to the reference attitude, and the body rates (the simulator passes the
-    rate error to a turning reference, see :func:`reference_rate`; the report
-    regulates to a fixed one). Input u = tau, the wheel motor torques;
-    u = -K x_r with K = R^-1 B_r' P from the algebraic Riccati equation
-    (5.6)-(5.7) on (A_r, B_r) of :func:`jumper_sim.cube_model.linearize`. The
-    torque goes to the motors as it is (ODrive torque mode); the body gets
-    -tau.
+    Plant state x_r = [q1 q2 q3 wx wy wz] (A_r, B_r of
+    :func:`jumper_sim.cube_model.linearize`), augmented with the integrated
+    tracking error x_I (x_I_dot = q_v - r, the script's eq. 25):
+    z = [x_r, x_I], A_aug = [[A_r, 0], [C, 0]], B_aug = [B_r; 0], C = [I 0].
+    u = -K_bar z with K_bar = R^-1 B_aug' P from the algebraic Riccati
+    equation (5.6)-(5.7). Input u = tau, the wheel motor torques, straight to
+    the motors (ODrive torque mode), clipped to the motor limit; the body
+    gets -tau.
+
+    Reference tracking: the script adds N r, N = N_u + K N_x from
+    [[A_r, B_r], [C, 0]] [N_x; N_u] = [0; I]. For this plant N_x = [I; 0] and
+    N_u = 0, so -K x_r + N r = -K [q_v - r; w]: the error to the reference.
+    The controller is given that error directly, as the vector part of the
+    error quaternion q_ref^-1 q (equal to q_v - r near level, and still
+    right at the hop reference's large tilts), and the rate error to a
+    turning reference (see :func:`reference_rate`). The integrator has
+    anti-windup the script does not (see :class:`LqrLimits`); :meth:`reset`
+    empties it (the simulator does at every lift-off and touchdown).
 
     As in the report (4.21), the model is linearised with the wheels at
     rest, Omega_hat = 0: one constant K, decoupled per axis, no Riccati solve
     while flying. A_r would depend on the wheel speeds (the gyroscopic
     coupling between the axes, 4.18); optionally, ``schedule_wheel_speeds``
     re-linearises at the measured wheel speeds whenever they have moved
-    ``relinearize_step`` [rad/s] from the last point (~0.18 ms per re-solve).
+    ``relinearize_step`` [rad/s] from the last point.
     """
 
     compensates_wheel_friction = True
@@ -250,20 +278,45 @@ class LqrController:
     ) -> None:
         if limits is None:
             limits = LqrLimits()
-        if limits.max_angle_error <= 0.0 or limits.max_rate <= 0.0:
+        if (
+            limits.max_angle_error <= 0.0
+            or limits.max_rate <= 0.0
+            or (limits.max_integral_error is not None and limits.max_integral_error <= 0.0)
+            or (limits.integral_zone is not None and limits.integral_zone <= 0.0)
+            or (limits.integral_torque_limit is not None and limits.integral_torque_limit < 0.0)
+        ):
             raise ValueError("LQR limits must be positive")
         self._cube = cube
-        self._q, self._r = limits.weights(tuning)
-        self._max_torque = limits.torque(tuning)
+        self._integrates = limits.max_integral_error is not None
+        self._integral_zone = limits.integral_zone
+        self._integral_torque_limit = limits.integral_torque_limit
+        self._q, self._r = limits.weights(cube)
+        self._max_torque = wheel_effective_inertia(tuning) * tuning.max_wheel_acceleration
         self.schedule_wheel_speeds = schedule_wheel_speeds
         self._relinearize_step = relinearize_step
         self._linearized_at = np.zeros(3)
         self._gain = self.gain_at(self._linearized_at)
+        self.reset()
 
     @property
     def gain(self) -> np.ndarray:
-        """Current K (3 x 6): u = -K x_r."""
+        """Current K_bar (3 x 9, or 3 x 6 without the integrator): u = -K_bar z."""
         return self._gain
+
+    @property
+    def state_gain(self) -> np.ndarray:
+        """K (3 x 6), on x_r = [q1 q2 q3 wx wy wz]."""
+        return self._gain[:, :6]
+
+    @property
+    def integral_gain(self) -> np.ndarray:
+        """K_I (3 x 3), on x_I (zero without the integrator)."""
+        return self._gain[:, 6:] if self._integrates else np.zeros((3, 3))
+
+    @property
+    def integral(self) -> np.ndarray:
+        """x_I, the integrated error quaternion vector [s]."""
+        return self._integral.copy()
 
     @property
     def linearized_at(self) -> np.ndarray:
@@ -271,7 +324,8 @@ class LqrController:
         return self._linearized_at.copy()
 
     def gain_at(self, wheel_speeds: np.ndarray) -> np.ndarray:
-        a, b = linearize(wheel_speeds, self._cube)
+        a, b = augment(*linearize(wheel_speeds, self._cube)) if self._integrates \
+            else linearize(wheel_speeds, self._cube)
         p = solve_continuous_are(a, b, self._q, self._r)
         return np.linalg.solve(self._r, b.T @ p)
 
@@ -283,15 +337,52 @@ class LqrController:
             if np.max(np.abs(speeds - self._linearized_at)) > self._relinearize_step:
                 self._linearized_at = speeds
                 self._gain = self.gain_at(speeds)
-        state = np.concatenate([
-            error_quaternion_vector((sensor.roll, sensor.pitch, sensor.yaw)),
-            (sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate),
-        ])
+        error = error_quaternion_vector((sensor.roll, sensor.pitch, sensor.yaw))
+        state = np.concatenate([error, (sensor.roll_rate, sensor.pitch_rate, sensor.yaw_rate)])
+        if self._integrates:
+            state = np.concatenate([state, self._integral])
+            self._integrate(error, (sensor.roll, sensor.pitch, sensor.yaw), time_step)
         motor = np.clip(-self._gain @ state, -self._max_torque, self._max_torque)
         return TorqueCommand(*(-float(v) for v in motor))
 
     def reset(self) -> None:
-        pass  # no internal state
+        self._integral = np.zeros(3)
+
+    def _integrate(
+        self, error: np.ndarray, rotation: tuple[float, float, float], time_step: float
+    ) -> None:
+        step = error * time_step
+        if self._integral_zone is not None:
+            step = np.where(np.abs(rotation) < self._integral_zone, step, 0.0)
+        integral = self._integral + step
+        if self._integral_torque_limit is not None:
+            # Per axis: the integral term's torque |K_I,ii x_I,i| <= limit.
+            limit = self._integral_torque_limit / np.abs(np.diag(self._gain[:, 6:]))
+            integral = np.clip(integral, -limit, limit)
+        self._integral = integral
+
+
+def augment(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A_aug, B_aug (the script's eq. 25): x_r plus the integral of C x_r = q_v."""
+    c = np.hstack([np.eye(3), np.zeros((3, 3))])
+    a_aug = np.block([[a, np.zeros((6, 3))], [c, np.zeros((3, 3))]])
+    b_aug = np.vstack([b, np.zeros((3, 3))])
+    return a_aug, b_aug
+
+
+def tracking_feedforward(
+    a: np.ndarray, b: np.ndarray, state_gain: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(N_x, N_u, N) of the script's eqs. 21-22c, for u = -K x_r + N r.
+
+    The steady state for a reference r of the attitude output C x_r:
+    [[A, B], [C, 0]] [N_x; N_u] = [0; I], N = N_u + K N_x.
+    """
+    c = np.hstack([np.eye(3), np.zeros((3, 3))])
+    system = np.block([[a, b], [c, np.zeros((3, 3))]])
+    solution = np.linalg.solve(system, np.vstack([np.zeros((6, 3)), np.eye(3)]))
+    n_x, n_u = solution[:6], solution[6:]
+    return n_x, n_u, n_u + state_gain @ n_x
 
 
 def error_quaternion_vector(rotation: tuple[float, float, float]) -> np.ndarray:
