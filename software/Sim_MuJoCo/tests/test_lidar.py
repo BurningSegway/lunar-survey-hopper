@@ -6,7 +6,7 @@ import unittest
 import mujoco
 import numpy as np
 
-from jumper_sim.lidar import LIVOX_MID360, SONY_AS_DT1, SimulatedLidar, effective_range_sigma
+from jumper_sim.lidar import LIVOX_MID360, SimulatedLidar
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 
@@ -41,22 +41,6 @@ class LidarPatternTests(unittest.TestCase):
         tenth = replace(LIVOX_MID360, point_fraction=0.1)
         # Every 10th recorded direction: the pattern still advances in real time.
         np.testing.assert_allclose(tenth.directions(5, 3), LIVOX_MID360.directions(50, 21)[::10])
-
-    def test_as_dt1_measures_the_same_24_by_24_grid_every_frame(self) -> None:
-        frame = SONY_AS_DT1.directions(0, 576)
-        np.testing.assert_allclose(SONY_AS_DT1.directions(576, 576), frame)
-        np.testing.assert_allclose(np.linalg.norm(frame, axis=1), 1.0)
-        self.assertEqual(len(np.unique(frame.round(9), axis=0)), 576)
-        # A 30 x 30 deg square around the axis: outer pixel centres half a
-        # pixel inside its edges.
-        for angle in (np.degrees(np.arctan2(frame[:, 0], frame[:, 2])),
-                      np.degrees(np.arctan2(frame[:, 1], frame[:, 2]))):
-            self.assertAlmostEqual(angle.max(), -angle.min())
-            self.assertLess(angle.max(), 15.0)
-            self.assertGreater(angle.max(), 14.0)
-        self.assertEqual(SONY_AS_DT1.point_rate * SONY_AS_DT1.batch_period, 576)  # one frame
-
-
 
 @unittest.skipUnless(MODEL_PATH.is_file(), "needs the robot model")
 class SimulatedLidarTests(unittest.TestCase):
@@ -109,28 +93,6 @@ class SimulatedLidarTests(unittest.TestCase):
         self.assertGreater(close.sum(), 1000)
         self.assertAlmostEqual(float(np.std(error[close])), 0.04, delta=0.005)
         self.assertAlmostEqual(float(np.std(error[far])), 0.02, delta=0.005)
-
-    def test_as_dt1_looks_down_from_the_bottom_with_rounded_ranges(self) -> None:
-        returns = SimulatedLidar(self.model, SONY_AS_DT1, FlatGround()).scan(
-            self.data, SONY_AS_DT1.batch_period)
-        self.assertEqual(len(returns.ranges), 576)  # one frame, all on the ground
-        site = self.model.site("lidar_down").id
-        np.testing.assert_allclose(returns.origin, self.data.site_xpos[site])
-        # Its axis is tilted 10 deg from body -z towards +x; body -z (what the
-        # robot points at the target) stays 5 deg inside the grid.
-        axis = -self.data.site_xmat[site].reshape(3, 3)[:, 2]
-        np.testing.assert_allclose(axis, (math.sin(math.radians(10.0)), 0.0,
-                                          -math.cos(math.radians(10.0))), atol=1e-9)
-        height = returns.origin[2]
-        offset = returns.points[:, :2] - returns.origin[:2]
-        across = np.degrees(np.arctan2(offset[:, 0], height))
-        self.assertAlmostEqual(float(across.min()), 10.0 - 14.4, delta=0.3)
-        self.assertAlmostEqual(float(across.max()), 10.0 + 14.4, delta=0.3)
-        # Reported in 25 mm steps; noise 5 mm plus that rounding.
-        np.testing.assert_allclose(returns.ranges / 0.025, np.round(returns.ranges / 0.025),
-                                   atol=1e-9)
-        self.assertAlmostEqual(effective_range_sigma(SONY_AS_DT1), 0.0087, delta=0.0002)
-
 
 if __name__ == "__main__":
     unittest.main()

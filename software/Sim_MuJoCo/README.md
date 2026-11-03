@@ -98,16 +98,10 @@ Options:
   default: `pointclouds/target_scan.ply`). `--no-scan` turns scanning off.
   `--no-scan-window` keeps the file but does not open the live point cloud
   window.
-- The lidar is the Livox Mid-360S on the side (used for development).
-  `--lidar as-dt1` launches the other sensor under consideration, the Sony
-  AS-DT1 under the bottom, with the robot facing its direction of travel in
-  flight (see "Lidar option: Sony AS-DT1" below).
-- `--spin` makes the robot spin slowly (45 deg/s) about the vertical in
-  flight, with either lidar (for the AS-DT1 instead of facing travel); it
-  stops 1 s before the predicted touchdown.
+- The lidar is the Livox Mid-360S on the side.
 - `--lidar-fraction F` sets the fraction of the lidar's real point rate
-  that is simulated (default: 1; for the Mid-360S 0.1 without an NVIDIA
-  GPU); see "Lidar" below.
+  that is simulated (default: 1; 0.1 without an NVIDIA GPU); see "Lidar"
+  below.
 - `--smooth` simulates 3 % of the Mid-360S's point rate (6000 points/s) so
   the viewer runs without stutter on a CPU; `--lidar-fraction` overrides it.
   Measured over a Moon hop, stepping in the viewer's 8.3 ms slices: 1.7 % of
@@ -276,7 +270,7 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 |---|---|---|
 | GROUND | still (~1 g, body rate < 0.2 rad/s) for 0.5 s after landing | leaning towards the target (next section); wheels spin down |
 | TAKEOFF | jump command (`Space`) | legs held as they are; after lift-off the lift-off attitude is held |
-| ASCENT | airborne and 0.5 m above the standing height | the robot's bottom tracks the target and it turns to face its travel (AS-DT1); lidar scans |
+| ASCENT | airborne and 0.5 m above the standing height | the robot's bottom tracks the target, heading held; lidar scans |
 | DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on for half the ascent's time; then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
 | LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or ground contact | the landing plane keeps updating until impact; legs straight |
 
@@ -451,45 +445,10 @@ A wide-field lidar spreads its points over everything it sees, so a 0.3 m
 object 5-20 m away gets few of them. (Before choosing the Mid-360S, a Livox
 Avia, 70.4 x 77.2 deg cone on its axis, put 7.2k-15k points near the target
 on the same hops, ~30x more; and the earlier RealSense D435 stand-in cast
-rays only towards the target.)
-
-### Lidar option: Sony AS-DT1
-
-The other sensor under consideration, a Sony AS-DT1 stand-in
-(`jumper_sim/lidar.py`; 34 g, 29 x 29 x 31 mm, a fifth of the Mid-360S's
-weight): a solid-state dToF (SPAD) lidar that measures the same 24 x 24 grid
-every frame. It scans while the robot is airborne; its points feed the
-landing-plane reference (below) and the point cloud. Each 15 fps frame (576
-points) is cast at once, from that frame's pose. Rays are not blocked by the
-robot itself.
-
-It sits on site `lidar_down` under the bottom face, its axis tilted 10 deg
-from body -z towards body +x. Body -z, which the robot points at the target
-on the way up, stays 5 deg inside its 30 deg view. Since it does not scan on
-its own, the robot's heading does the job:
-
-- **Facing travel (`--lidar as-dt1`):** in ASCENT and DESCENT the robot turns about
-  the vertical (at most 90 deg/s, 90 deg/s^2) so body +x, and with it the
-  lidar's tilt, faces its horizontal velocity: the lidar looks ahead, where
-  the robot will land. Turning does not move body -z, so target tracking is
-  unaffected. Straight up or down (< 0.2 m/s horizontally) it keeps its heading.
-- **`--lidar as-dt1 --spin`:** it spins slowly (45 deg/s, 8 s a turn) instead, sweeping the
-  lidar round a cone ~25 deg around body -z. The spin stops 1 s before the
-  predicted touchdown, keeping the heading reached. More ground is covered,
-  but the landing spot is seen only part of the time.
-
-Both live in `FlightReferenceConfig` (`face_travel`, `spin`, rates).
-
-| datasheet | modelled as |
-|---|---|
-| HFoV 30 deg or more (VFoV not given) | 30 x 30 deg (square pixels assumed) |
-| 576 points (24 x 24), 30 fps; 15 fps in max-range mode | 8640 points/s, 15 fps |
-| 20 m outdoor, 40 m indoor (50 % reflectivity, centre) | 20 m |
-| accuracy +-5 mm at 10 m, distance resolution 25 mm | 5 mm (1 sigma) noise, ranges rounded to 25 mm |
-| min range, angular precision: not given | 0.1 m, none |
-
-Regolith reflects ~10 %, and the sensor will see full sunlight with no
-atmosphere, so the real range on the Moon is likely well under 20 m.
+rays only towards the target. A Sony AS-DT1, 24 x 24 grid over 30 deg under
+the bottom, with the robot turning to face its travel or spinning slowly in
+flight, was also tried and removed: p90 5.1 deg off at touchdown in the
+landing benchmark, ~10x fewer points and ~10x less ground covered.)
 
 ### Lidar point cloud
 
@@ -572,11 +531,6 @@ misalignment of body z to the true ground plane at touchdown):
 | Mid-360S on the bottom facing down (blind straight below) | 0.35 deg | 0.96 deg | 2.17 deg |
 | Mid-360S on the side, 22.5 deg down, freezing near touchdown | 0.35 deg | 1.28 deg | 4.72 deg |
 | **Mid-360S on the side, updating until impact (current)** | **0.23 deg** | **1.05 deg** | **4.72 deg** |
-| Mid-360S, freezing near touchdown, `--spin` | 0.29 deg | 1.09 deg | 12.82 deg |
-| AS-DT1 under the bottom, facing straight down | 1.19 deg | 9.47 deg | 13.59 deg |
-| AS-DT1 facing straight down, spinning | 1.29 deg | 9.78 deg | 16.82 deg |
-| AS-DT1 tilted 10 deg, spinning (`--lidar as-dt1 --spin`) | 0.76 deg | 9.73 deg | 16.66 deg |
-| AS-DT1 tilted 10 deg, facing travel (`--lidar as-dt1`) | 0.57 deg | 5.07 deg | 12.27 deg |
 
 The camera only saw the ground straight below, which on a hop is not where
 the robot lands, and from 3 m apex it had too few usable frames (median
@@ -594,19 +548,6 @@ the spawn, which also tracks the target for half its ascent time into the
 descent now, lands 0.37 deg off and stays upright (before: 0.17 deg, then
 tipped; camera: 3.15 deg). Wheel peak 17.1 rev/s (before 16.2).
 
-The AS-DT1's 30 deg view covers little ground, so what matters is where it
-looks during the descent. Facing straight down it saw the landing spot of a
-hop late; spinning spreads its points round a cone, so the spot is in view
-only part of the time (a 6 m hop onto 17 deg got 6 fits and landed 4.5 deg
-off; the wheels peaked at 20 % and the spin was stopped as planned, it is
-coverage). Facing travel keeps the tilted view ahead on the landing spot:
-by apex (median), 3.15 deg from 3 m, 0.24 deg from 6 m and 0.35 deg from
-10 m (spin: 6.39 / 0.34 / 0.23; facing down: 4.92 / 0.80 / 0.34). Low (3 m)
-hops onto 9-16 deg slopes are still its weak spot (up to 12 deg), with only
-~16 fits. In the contact benchmark's vertical drops it lands 0.12-2.34 deg
-off and none tip (Mid-360S: 0.11-0.41 deg, none; AS-DT1 facing down:
-up to 4.7 deg, 3 tipped).
-
 Points per hop from the spawn (8.5 s of flight; targets 3, 8 and 15 m away;
 bunny = within 0.3 m of the target, above the ground; landing disc = within
 0.5 m of the touchdown point):
@@ -614,12 +555,6 @@ bunny = within 0.3 m of the target, above the ground; landing disc = within
 | lidar | points | on the bunny | landing disc | ground covered (0.5 m cells) |
 |---|---|---|---|---|
 | **Mid-360S (side, current)** | **603-674k** | 166 / 102 / 47 | 6.1-6.5k | 2345-2932 m^2 |
-| AS-DT1, `--lidar as-dt1 --spin` | 53-73k | 40 / 23 / 4 | 1.3k | 302-362 m^2 |
-| AS-DT1, `--lidar as-dt1` (facing travel) | 56-73k | 49 / 16 / 7 | 3.0-3.2k | 179-283 m^2 |
-
-The AS-DT1 casts ~9-11x fewer points, nearly all of which hit (8640/s); it
-puts about a third as many on the target, half as many in the landing disc
-(the spin: a fifth) and covers ~10x less ground.
 
 - The trajectory uses the true position and velocity; on the robot they
   come from the state estimate.

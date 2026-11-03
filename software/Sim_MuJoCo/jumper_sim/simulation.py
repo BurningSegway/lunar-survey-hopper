@@ -27,7 +27,7 @@ from .cube_model import JUMP_SPRING, JUMP_SPRING_COUNT
 from .flight_phase import FlightPhase, FlightPhaseDetector, gravity_magnitude
 from .flight_reference import FlightReference, FlightReferenceConfig
 from .jump_aim import JumpAim
-from .ray_casting import TERRAIN_GEOM, HeightfieldRayCaster, MeshRayCaster
+from .ray_casting import LIDAR_SITE, TERRAIN_GEOM, HeightfieldRayCaster, MeshRayCaster
 from .landing_reference import (
     GroundMap,
     LandingReference,
@@ -37,7 +37,7 @@ from .landing_reference import (
     quaternion_to_matrix,
 )
 from .gpu_ray_caster import WarpRayCaster, gpu_available
-from .lidar import LIVOX_MID360, LidarSpec, SimulatedLidar, effective_range_sigma
+from .lidar import LIVOX_MID360, LidarSpec, SimulatedLidar
 from .pointcloud import PointCloudRecorder
 from .recovery import RecoveryAttempt, RecoveryStage, level_quaternion, righting_axis
 from .telemetry import TelemetryPayload, make_telemetry_payload
@@ -156,14 +156,12 @@ class LidarLandingReference:
         self._point_sigma = point_sigma
         self._next_fit = 0.0
         self.visual: LandingVisual | None = None
-        self.touchdown_at: float | None = None  # predicted at the last fit [s]
 
     def reset(self, time: float) -> None:
         self.filter.reset(time)
         self.map.clear()
         self._next_fit = time
         self.visual = None
-        self.touchdown_at = None
 
     def add_points(self, points: np.ndarray) -> None:
         self.map.add(points)
@@ -179,8 +177,7 @@ class LidarLandingReference:
         if landing is None:
             self.filter.update(PlaneEstimate(False, timestamp=time))
             return
-        spot, touchdown_in = landing
-        self.touchdown_at = time + touchdown_in
+        spot, _ = landing
         points = self.map.points_near(spot, self.config.roi_radius, self.config.max_points)
         estimate = fit_ground_plane(points, spot, float(position[2]), self._point_sigma,
                                     time, self.config)
@@ -219,7 +216,6 @@ class JumperSimulation:
         target_scan: PointCloudRecorder | None = None,
         gravity: float = MOON_GRAVITY,
         lidar: LidarSpec | None = None,
-        spin: bool = False,
     ) -> None:
         self.model = model
         self.data = data
@@ -252,12 +248,12 @@ class JumperSimulation:
             HeightfieldRayCaster(model)
             if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM) >= 0 else None
         )
-        # The lidar (default the side Mid-360S, used for development; full
-        # point rate with a GPU, 10 % without): scans while airborne, for the
+        # The side Mid-360S lidar (default: full point rate with a GPU, 10 %
+        # without; ``lidar`` overrides it, e.g. its point fraction): scans while airborne, for the
         # landing plane and the target scan.
         if lidar is None:
             lidar = replace(LIVOX_MID360, point_fraction=1.0 if gpu_available() else 0.1)
-        self._lidar_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, lidar.site)
+        self._lidar_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, LIDAR_SITE)
         self.lidar: SimulatedLidar | None = None
         if self._terrain is not None and self._lidar_site >= 0:
             caster = WarpRayCaster(self._terrain) if gpu_available() else self._terrain
@@ -266,7 +262,7 @@ class JumperSimulation:
         # Roll/pitch reference from the lidar points around the landing spot.
         self.landing_reference: LidarLandingReference | None = None
         if landing_reference and self.lidar is not None:
-            self.landing_reference = LidarLandingReference(effective_range_sigma(self.lidar.spec))
+            self.landing_reference = LidarLandingReference(self.lidar.spec.range_sigma)
         self._robot_geoms = _robot_geom_mask(model, self.ids.root_joint)
         self._terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM)
         # Attitude control in flight, wheel momentum bleed-off in contact
@@ -283,9 +279,7 @@ class JumperSimulation:
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
             self.flight_reference = FlightReference(
-                FlightReferenceConfig(face_travel=self.lidar.spec.face_travel and not spin,
-                                      spin=spin),
-                track_target, self._ground_height,
+                FlightReferenceConfig(), track_target, self._ground_height,
             )
         self._jump_command = False  # given since the last phase update
         self._near_at_descent = 0  # near-touchdown fits before this descent
@@ -410,8 +404,6 @@ class JumperSimulation:
             self.flight_reference.commanded = (1.0, 0.0, 0.0, 0.0)
             self.flight_reference.tracking = False
             self.flight_reference.active_target = None
-            self.flight_reference.heading_offset = 0.0
-            self.flight_reference.heading_rate = 0.0
 
     def _release_spring(self) -> None:
         self.jump_triggered = True
@@ -631,16 +623,12 @@ class JumperSimulation:
                     and self.landing_reference.filter.accepted > 0):
                 self.flight_events.append("[FLIGHT] Landing spot seen: aligning with its plane.")
         if self.flight_reference is not None and not self.in_contact:
-            touchdown_at = self.landing_reference.touchdown_at
-            dof = self.model.jnt_dofadr[self.ids.root_joint]
             self.flight_reference.update(
                 phase,
                 self.data.site_xpos[self._lidar_site],
                 self.yaw_reference,
                 self.landing_reference.reference_quaternion,
                 float(self.model.opt.timestep),
-                None if touchdown_at is None else touchdown_at - float(self.data.time),
-                self.data.qvel[dof : dof + 3],
             )
         self._update_tipped()
         self._update_recovery()

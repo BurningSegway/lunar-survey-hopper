@@ -36,7 +36,7 @@ from jumper_sim.ray_casting import TERRAIN_GEOM_GROUP, HeightfieldRayCaster
 from jumper_sim.flight_phase import FlightPhase
 from jumper_sim.pointcloud import PointCloudRecorder, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
-from jumper_sim.lidar import LIVOX_MID360, SONY_AS_DT1, effective_range_sigma
+from jumper_sim.lidar import LIVOX_MID360
 from jumper_sim.recovery import RecoveryStage, righting_axis
 from jumper_sim.visualization import draw_flight_target, draw_height_label, draw_landing_plane
 
@@ -214,25 +214,6 @@ class SimulationTests(unittest.TestCase):
         simulation.handle_key("space")
         np.testing.assert_allclose(filt.normal, (0.0, 0.0, 1.0))
         self.assertEqual(simulation.landing_reference.map.count, 0)
-
-    def test_heading_in_flight_follows_the_lidar_and_the_spin_flag(self) -> None:
-        cases = {(None, False): (False, False), (None, True): (False, True),
-                 (SONY_AS_DT1, False): (True, False), (SONY_AS_DT1, True): (False, True)}
-        for (lidar, spin), expected in cases.items():
-            simulation = JumperSimulation(self.model, self.data, "lqr", lidar=lidar, spin=spin)
-            config = simulation.flight_reference.config
-            self.assertEqual((config.face_travel, config.spin), expected, (lidar, spin))
-
-    def test_as_dt1_casts_from_the_bottom_site_for_the_landing_reference(self) -> None:
-        simulation = JumperSimulation(self.model, self.data, "lqr", lidar=SONY_AS_DT1)
-        self.assertEqual(simulation._lidar_site, self.model.site("lidar_down").id)
-        self.assertAlmostEqual(simulation.landing_reference._point_sigma,
-                               effective_range_sigma(SONY_AS_DT1))
-        self._throw(simulation, -4.0, 7.47, apex=6.0)
-        while not simulation.robot_touches_terrain() and self.data.time < 8.0:
-            simulation.step()
-        # Whole 576-point frames at 15 fps went into the ground map.
-        self.assertGreater(simulation.landing_reference.map.count, 576 * 15)
 
     def _throw(self, simulation, x, y, apex, distance=5.0, heading=0.0):
         """Launch the robot as a hop that lands on (x, y), apex ``apex`` above

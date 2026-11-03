@@ -31,7 +31,7 @@ import numpy as np
 
 from jumper_sim.ray_casting import HeightfieldRayCaster
 from jumper_sim.landing_reference import LandingReferenceConfig
-from jumper_sim.lidar import LIDARS
+from jumper_sim.lidar import LIVOX_MID360
 from jumper_sim.flight_phase import FlightPhase
 from jumper_sim.simulation import MOON_GRAVITY, JumperSimulation
 
@@ -43,8 +43,7 @@ MAX_TIME = 12.0
 HOP_DISTANCE = 5.0  # m, take-off to landing spot (horizontal)
 START_CLEARANCE = 0.6  # m, base above the ground at the start
 TOUCHDOWN_CLEARANCE = 0.3  # m, base above the ground when the legs touch
-LIDAR = None  # --lidar (None: the simulation's default)
-SPIN = False  # --spin
+LIDAR = None  # --lidar-fraction (None: the simulation's default)
 
 
 def true_plane_normal(caster: HeightfieldRayCaster, x: float, y: float,
@@ -78,7 +77,7 @@ def hop(x: float, y: float, height: float, euler_deg, use_reference: bool,
     """Throw the robot onto (x, y) along ``heading`` with apex ``height`` above it."""
     model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     data = mujoco.MjData(model)
-    sim = JumperSimulation(model, data, "lqr", landing_reference=use_reference, lidar=LIDAR, spin=SPIN)
+    sim = JumperSimulation(model, data, "lqr", landing_reference=use_reference, lidar=LIDAR)
     sim.model.opt.gravity[2] = -MOON_GRAVITY
     qa = model.jnt_qposadr[sim.ids.root_joint]
     ground = float(caster.height(np.array([x]), np.array([y]))[0])
@@ -122,17 +121,12 @@ def hop(x: float, y: float, height: float, euler_deg, use_reference: bool,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
-    parser.add_argument("--lidar", choices=sorted(LIDARS), default=None,
-                        help="lidar (default: the simulation's, the Mid-360S)")
-    parser.add_argument("--spin", action="store_true", help="slow heading spin in flight")
     parser.add_argument("--lidar-fraction", type=float, default=None, metavar="F",
                         help="fraction of the lidar's point rate (default: the simulation's)")
     args = parser.parse_args()
-    global LIDAR, SPIN
-    SPIN = args.spin
-    LIDAR = None if args.lidar is None else LIDARS[args.lidar]
+    global LIDAR
     if args.lidar_fraction is not None:
-        LIDAR = replace(LIDAR or LIDARS["mid360s"], point_fraction=args.lidar_fraction)
+        LIDAR = replace(LIVOX_MID360, point_fraction=args.lidar_fraction)
     config = LandingReferenceConfig()
     probe = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     caster = HeightfieldRayCaster(probe)

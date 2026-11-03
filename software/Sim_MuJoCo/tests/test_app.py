@@ -12,7 +12,6 @@ import mujoco
 import numpy as np
 
 from jumper_sim import app
-from jumper_sim.lidar import LIDARS
 from jumper_sim.pointcloud import read_ply
 from jumper_sim.simulation import JumperSimulation, ReactionWheelTuning
 from jumper_sim.telemetry import TelemetryPayload
@@ -254,27 +253,20 @@ class LidarOptionTests(unittest.TestCase):
 
         def fraction(*argv):
             args = parser.parse_args(list(argv))
-            return app.lidar_fraction(args, LIDARS[args.lidar])
+            return app.lidar_fraction(args)
 
         self.assertEqual(fraction("--smooth"), app.SMOOTH_LIDAR_FRACTION)
         self.assertLess(app.SMOOTH_LIDAR_FRACTION, 0.1)
         self.assertEqual(fraction("--smooth", "--lidar-fraction", "0.2"), 0.2)
-        self.assertEqual(fraction("--smooth", "--lidar", "as-dt1"), 1.0)  # cheap already
         with patch.object(app, "gpu_available", return_value=False):
             self.assertEqual(fraction(), 0.1)
 
-    def test_lidar_defaults_to_the_mid360s_with_the_as_dt1_as_an_option(self) -> None:
+    def test_the_mid360s_is_the_only_lidar_and_there_is_no_spin(self) -> None:
         parser = app.build_argument_parser()
-        self.assertEqual(parser.parse_args([]).lidar, "mid360s")
-        self.assertEqual(parser.parse_args(["--lidar", "as-dt1"]).lidar, "as-dt1")
-        # --spin works with either lidar.
-        args = parser.parse_args(["--spin"])
-        self.assertEqual((args.lidar, args.spin), ("mid360s", True))
-        args = parser.parse_args(["--lidar", "as-dt1", "--spin"])
-        self.assertEqual((args.lidar, args.spin), ("as-dt1", True))
-        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
-            parser.parse_args(["--lidar", "avia"])
-
+        for flag in (["--lidar", "as-dt1"], ["--spin"]):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit), \
+                    patch("sys.stderr", io.StringIO()):
+                parser.parse_args(flag)
 
 class RobotFollowerTests(unittest.TestCase):
     def setUp(self) -> None:

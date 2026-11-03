@@ -17,7 +17,7 @@ import mujoco.viewer
 import numpy as np
 
 from .gpu_ray_caster import gpu_available
-from .lidar import LIDARS, LIVOX_MID360, SONY_AS_DT1, LidarSpec
+from .lidar import LIVOX_MID360
 from .pointcloud import PointCloudRecorder
 from .simulation import MOON_GRAVITY, JumperSimulation
 from .telemetry import UdpTelemetry
@@ -86,20 +86,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--no-scan", action="store_true", help="do not collect the lidar point cloud",
     )
     parser.add_argument(
-        "--lidar", choices=sorted(LIDARS), default="mid360s",
-        help="lidar: the Livox Mid-360S on the +x side face (default, used for "
-        "development), or the Sony AS-DT1 (24x24 grid, 30 deg) under the bottom "
-        "face, the robot facing its direction of travel in flight",
-    )
-    parser.add_argument(
-        "--spin", action="store_true",
-        help="spin slowly (45 deg/s) about the vertical in flight, sweeping the "
-        "lidar round; with the AS-DT1 instead of facing the direction of travel",
-    )
-    parser.add_argument(
         "--lidar-fraction", type=float, default=None, metavar="F",
         help="fraction of the lidar's real point rate that is simulated "
-        "(default: 1; for the Mid-360S 0.1 without an NVIDIA GPU, since the CPU "
+        "(default: 1; 0.1 without an NVIDIA GPU, since the CPU "
         "caster runs its full rate at about real time, but stuttering; see --smooth)",
     )
     parser.add_argument(
@@ -114,14 +103,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def lidar_fraction(args: argparse.Namespace, spec: LidarSpec) -> float:
+def lidar_fraction(args: argparse.Namespace) -> float:
     """Fraction of the lidar's point rate to simulate."""
     if args.lidar_fraction is not None:
         return args.lidar_fraction
-    if args.smooth and spec is LIVOX_MID360:
+    if args.smooth:
         return SMOOTH_LIDAR_FRACTION
-    # The AS-DT1's 8640 points/s are cheap on any hardware.
-    return 1.0 if gpu_available() or spec is SONY_AS_DT1 else 0.1
+    return 1.0 if gpu_available() else 0.1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -146,9 +134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
-    spec = LIDARS[args.lidar]
-    fraction = lidar_fraction(args, spec)
-    lidar = replace(spec, point_fraction=fraction)
+    fraction = lidar_fraction(args)
+    lidar = replace(LIVOX_MID360, point_fraction=fraction)
     print(f"[LIDAR] {lidar.name}: {fraction:.0%} of the point rate, rays cast on the "
           f"{'GPU (Warp)' if gpu_available() else 'CPU'}")
     target_scan = None
@@ -163,7 +150,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         track_target=track_target,
         target_scan=target_scan,
         lidar=lidar,
-        spin=args.spin,
     )
     if simulation.target_scan is not None:
         simulation.target_scan.start_run()  # this run starts a fresh cloud

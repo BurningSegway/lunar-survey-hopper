@@ -18,14 +18,7 @@
   descent, so "level until the landing spot is seen, then its plane" falls
   out of it directly. It keeps updating until the moment of impact
   (LANDING too), so the robot keeps aligning with the ground to the end.
-* Heading in flight (ASCENT and DESCENT; the tracking axis, body -z, is
-  not affected by it), for a lidar tilted off body -z towards body +x:
-  with ``face_travel`` the robot turns so body +x faces its horizontal
-  velocity, so the lidar looks ahead to where it will land; with ``spin``
-  it turns slowly (``spin_rate``) instead, sweeping the lidar round a cone,
-  and stops once the predicted touchdown is within ``spin_stop_time``.
-  Turns are limited to ``turn_rate`` and ``turn_acceleration``; in LANDING
-  the turn stops and the heading reached is kept.
+* Heading in flight: the yaw reference (the lift-off heading) throughout.
 * The commanded reference never jumps: it slews towards the desired one at
   ``slew_rate`` (also at lift-off, starting from the attitude the robot left
   the ground with), so the controller is not hit with large reference steps.
@@ -61,14 +54,6 @@ class FlightReferenceConfig:
     descent_track_fraction: float = 0.5
     # Without a ground height, the ground is taken as the take-off ground.
     standing_height: float = 0.27  # m, body origin above the ground when standing
-    # Heading in flight (neither: hold the lift-off heading).
-    face_travel: bool = False  # body +x towards the horizontal velocity
-    spin: bool = False  # slow spin instead
-    spin_rate: float = math.radians(45.0)  # rad/s, 8 s a turn
-    spin_stop_time: float = 1.0  # s before the predicted touchdown: stopped
-    turn_rate: float = math.radians(90.0)  # rad/s, max turn rate to face travel
-    turn_acceleration: float = math.radians(90.0)  # rad/s^2
-    min_travel_speed: float = 0.2  # m/s, slower: no travel direction
 
 GroundHeight = Callable[[float, float], float]  # terrain height [m] at (x, y)
 
@@ -143,8 +128,6 @@ class FlightReference:
         self.active_target: np.ndarray | None = None
         self.commanded: Quaternion = (1.0, 0.0, 0.0, 0.0)
         self.tracking = False
-        self.heading_offset = 0.0  # rad, heading turned since lift-off
-        self.heading_rate = 0.0  # rad/s, current turn rate
         self.ascent_time = 0.0  # s, lift-off to apex
         self.descent_time = 0.0  # s, since apex
 
@@ -170,8 +153,6 @@ class FlightReference:
         """Called at lift-off; ``track`` is True for flights started by a jump."""
         self.commanded = tuple(float(v) for v in attitude)
         self.tracking = track
-        self.heading_offset = 0.0
-        self.heading_rate = 0.0
         self.ascent_time = 0.0
         self.descent_time = 0.0
         if track:
@@ -181,20 +162,15 @@ class FlightReference:
             )
 
     def update(self, phase: FlightPhase, sensor_position: np.ndarray, yaw_reference: float,
-               landing_reference: Callable[[float], Quaternion], dt: float,
-               touchdown_in: float | None = None,
-               velocity: np.ndarray | None = None) -> Quaternion:
-        """``landing_reference(yaw)``: the landing attitude with that heading;
-        ``touchdown_in``: predicted time to touchdown [s] (None: unknown);
-        ``velocity``: the robot's (world) velocity, for ``face_travel``."""
+               landing_reference: Callable[[float], Quaternion], dt: float) -> Quaternion:
+        """``landing_reference(yaw)``: the landing attitude with that heading."""
         if phase in (FlightPhase.TAKEOFF, FlightPhase.ASCENT):
             self.ascent_time += dt
         elif phase is FlightPhase.DESCENT:
             self.descent_time += dt
         if phase is FlightPhase.TAKEOFF:
             return self.commanded  # hold the lift-off attitude until clear of the ground
-        self._update_heading(phase, dt, yaw_reference, touchdown_in, velocity)
-        yaw = yaw_reference + self.heading_offset
+        yaw = yaw_reference
         if self.tracking_target(phase):
             desired = look_at_quaternion(sensor_position, self.active_target, yaw,
                                          self.config.max_track_tilt)
@@ -211,26 +187,6 @@ class FlightReference:
             return True
         return (phase is FlightPhase.DESCENT
                 and self.descent_time < self.config.descent_track_fraction * self.ascent_time)
-
-    def _update_heading(self, phase: FlightPhase, dt: float, yaw_reference: float,
-                        touchdown_in: float | None, velocity: np.ndarray | None) -> None:
-        config = self.config
-        wanted = 0.0
-        if phase in (FlightPhase.ASCENT, FlightPhase.DESCENT):
-            if config.spin:
-                if touchdown_in is None or touchdown_in > config.spin_stop_time:
-                    wanted = config.spin_rate
-            elif (config.face_travel and velocity is not None
-                  and math.hypot(velocity[0], velocity[1]) > config.min_travel_speed):
-                error = math.atan2(velocity[1], velocity[0]) - (yaw_reference + self.heading_offset)
-                error = math.atan2(math.sin(error), math.cos(error))
-                # Fastest turn that can still stop on the heading.
-                wanted = math.copysign(
-                    min(config.turn_rate, math.sqrt(2.0 * config.turn_acceleration * abs(error))),
-                    error)
-        step = config.turn_acceleration * dt
-        self.heading_rate += max(-step, min(step, wanted - self.heading_rate))
-        self.heading_offset += self.heading_rate * dt
 
     def axis_target_angle(self, attitude: Quaternion, sensor_position: np.ndarray) -> float:
         """Angle [rad] between body -z and the target direction."""

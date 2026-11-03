@@ -29,7 +29,6 @@ import numpy as np
 
 from jumper_sim.ray_casting import HeightfieldRayCaster
 from jumper_sim.landing_reference import LandingReferenceConfig
-from jumper_sim.lidar import LIDARS
 from jumper_sim.simulation import MOON_GRAVITY, JumperSimulation
 
 from .landing_benchmark import pick_spots, true_plane_normal
@@ -39,8 +38,6 @@ AFTER_TOUCHDOWN = 5.0
 # A full hop on MuJoCo 3.2.3 (the pinned version) flies ~6.5 s on the Moon.
 JUMP_DURATION = 14.0
 SATURATION_FRACTION = 0.98
-LIDAR = None  # --lidar (None: the simulation's default)
-SPIN = False  # --spin
 
 
 def _wheel_speeds(model, data, sim) -> np.ndarray:
@@ -51,7 +48,7 @@ def run(kind: str, gating: bool, caster, radius, x=0.0, y=0.0, height=0.0,
         euler=(0.0, 0.0, 0.0)) -> dict:
     model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     data = mujoco.MjData(model)
-    sim = JumperSimulation(model, data, "lqr", contact_gating=gating, lidar=LIDAR, spin=SPIN)
+    sim = JumperSimulation(model, data, "lqr", contact_gating=gating)
     sim.model.opt.gravity[2] = -MOON_GRAVITY
     sim.selected_gravity = MOON_GRAVITY
     qa = model.jnt_qposadr[sim.ids.root_joint]
@@ -117,13 +114,7 @@ def run(kind: str, gating: bool, caster, radius, x=0.0, y=0.0, height=0.0,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
-    parser.add_argument("--lidar", choices=sorted(LIDARS), default=None,
-                        help="lidar (default: the simulation's, the Mid-360S)")
-    parser.add_argument("--spin", action="store_true", help="slow heading spin in flight")
     args = parser.parse_args()
-    global LIDAR, SPIN
-    SPIN = args.spin
-    LIDAR = None if args.lidar is None else LIDARS[args.lidar]
     radius = LandingReferenceConfig().roi_radius
     caster = HeightfieldRayCaster(mujoco.MjModel.from_xml_path(str(MODEL_PATH)))
     rng = np.random.default_rng(21)

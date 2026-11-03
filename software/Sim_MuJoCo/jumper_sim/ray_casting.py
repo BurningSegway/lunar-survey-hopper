@@ -20,7 +20,6 @@ import numpy as np
 TERRAIN_GEOM = "terrain_collision"
 TERRAIN_GEOM_GROUP = 2
 LIDAR_SITE = "lidar"
-LIDAR_DOWN_SITE = "lidar_down"  # Sony AS-DT1, bottom face
 
 
 class RayCaster(Protocol):
