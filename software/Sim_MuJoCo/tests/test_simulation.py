@@ -37,7 +37,6 @@ from jumper_sim.flight_phase import FlightPhase
 from jumper_sim.pointcloud import PointCloudRecorder, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
 from jumper_sim.lidar import LIVOX_MID360
-from jumper_sim.recovery import RecoveryStage, righting_axis
 from jumper_sim.visualization import draw_flight_target, draw_height_label, draw_landing_plane
 
 def mujoco_ray_distances(model, data, origin, directions, max_range):
@@ -453,44 +452,15 @@ class SimulationTests(unittest.TestCase):
             simulation.step()
         self.assertTrue(simulation.tipped)
 
-    def test_space_while_tipped_attempts_a_recovery(self) -> None:
+    def test_tipped_robot_does_not_jump_and_reset_rights_it(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
         self._tip_over(simulation, (90.0, 0.0, 0.0))
-        self.assertIn("[RECOVERY]", simulation.handle_key("space"))
-        self.assertIsNone(simulation.handle_key("space"))  # one attempt at a time
-        start = float(self.data.time)
-        body = self.model.jnt_bodyid[simulation.ids.root_joint]
-        simulation.step()
-        # Spin-up: wheel torque along the righting axis, i.e. the body is
-        # pushed away from upright (into the ground).
-        torque = np.array([self.data.ctrl[a] for a in simulation.ids.wheel_actuators])
-        axis = righting_axis(self.data.xmat[body].reshape(3, 3))
-        self.assertGreater(float(torque @ axis), 1.0)
+        self.assertIn("press R", simulation.handle_key("space"))
         self.assertFalse(simulation.jump_triggered)
-        while simulation.recovery.stage is RecoveryStage.SPIN_UP:
-            simulation.step()
-        self.assertTrue(simulation.jump_triggered)  # spring released ...
-        self.assertAlmostEqual(simulation.jump_start_time - start, 0.15, delta=0.002)  # ... after 0.15 s
-        levelled = False
-        while simulation.recovery is not None and self.data.time < start + 10.0:
-            simulation.step()
-            if not simulation.in_contact:
-                # In the air the controller aims for level.
-                q = simulation.reference_quaternion()
-                levelled = levelled or (abs(q[1]) < 1e-9 and abs(q[2]) < 1e-9)
-        self.assertTrue(levelled)
-        self.assertIsNone(simulation.recovery)
+        simulation.handle_key("r")
         self.assertFalse(simulation.tipped)
-        self.assertTrue(any(e == "[RECOVERY] Upright." for e in simulation.flight_events))
-        # A recovery hop neither tracks the target nor counts as a scan jump.
-        self.assertFalse(simulation.flight_reference.tracking)
-
-    def test_recovery_needs_the_wheels(self) -> None:
-        simulation = JumperSimulation(self.model, self.data, "lqr")
-        self._tip_over(simulation, (90.0, 0.0, 0.0))
-        simulation.handle_key("x")
-        self.assertIn("press C", simulation.handle_key("space"))
-        self.assertIsNone(simulation.recovery)
+        body = self.model.jnt_bodyid[simulation.ids.root_joint]
+        self.assertAlmostEqual(float(self.data.xmat[body][8]), 1.0)  # upright
 
     def test_hop_tracks_target_then_fits_landing_plane_until_impact(self) -> None:
         for controller in ("lqr", "pid"):

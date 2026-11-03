@@ -39,7 +39,6 @@ from .landing_reference import (
 from .gpu_ray_caster import WarpRayCaster, gpu_available
 from .lidar import LIVOX_MID360, LidarSpec, SimulatedLidar
 from .pointcloud import PointCloudRecorder
-from .recovery import RecoveryAttempt, RecoveryStage, level_quaternion, righting_axis
 from .telemetry import TelemetryPayload, make_telemetry_payload
 
 EARTH_GRAVITY = 9.81
@@ -67,9 +66,6 @@ TARGET_PARKED_DEPTH = 100.0  # m below the terrain while no target is set
 TIPPED_TILT = math.radians(60.0)
 UPRIGHT_TILT = math.radians(45.0)
 TIPPED_LEG_FORCE_MARGIN = 1.2  # x spring force at full stroke
-# Wheel command during a recovery spin-up: far above the motor limit, so
-# limit_wheel_command applies full torque (and the speed limit).
-RECOVERY_WHEEL_COMMAND = 100.0  # N*m
 
 
 LEGS = ("fl", "fr", "bl", "br")
@@ -300,8 +296,6 @@ class JumperSimulation:
         self.tipped = False
         # Base height (world z) when the robot last touched the ground.
         self.last_ground_z: float | None = None
-        # Space while tipped: an attempt to right the robot (recovery.py).
-        self.recovery: RecoveryAttempt | None = None
         # The scan target object, if the model has one: placed at the target.
         self._target_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TARGET_GEOM)
         # MuJoCo centres a mesh on its centre of mass: the geom sits at the
@@ -336,7 +330,7 @@ class JumperSimulation:
     def handle_key(self, key: str) -> str | None:
         if key == "space":
             if self.tipped:
-                return self._start_recovery()
+                return "[TIPPED] Can't jump while tipped over: press R to reset."
             if not self.jump_triggered:
                 self._release_spring()
                 return "[JUMP INITIATED] Releasing spring!"
@@ -383,7 +377,6 @@ class JumperSimulation:
         self.jump_start_time = 0.0
         self.tipped = False
         self.last_ground_z = None
-        self.recovery = None
         self.selected_gravity = self.default_gravity
         self.in_contact = False
         self._time_without_contact = math.inf
@@ -414,50 +407,6 @@ class JumperSimulation:
         if self.landing_reference is not None:
             self.landing_reference.reset(float(self.data.time))
         self._jump_command = True  # GROUND -> TAKEOFF
-
-    def _start_recovery(self) -> str | None:
-        if self.recovery is not None:
-            return None  # one attempt at a time
-        if self.jump_triggered:
-            return "[RECOVERY] Wait: the spring is still winding up."
-        if self.wheel_control_mode is WheelControlMode.DISABLED:
-            return "[RECOVERY] Needs the reaction wheels: press C first."
-        self.recovery = RecoveryAttempt(float(self.data.time))
-        return "[RECOVERY] Spinning up the wheels, then releasing the spring."
-
-    def _update_recovery(self) -> None:
-        attempt = self.recovery
-        if attempt is None:
-            return
-        body = self.model.jnt_bodyid[self.ids.root_joint]
-        rotation = self.data.xmat[body].reshape(3, 3)
-        if attempt.stage is RecoveryStage.FLIGHT:
-            if self.phase is FlightPhase.GROUND and self.in_contact:
-                self.recovery = None
-                tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(rotation[2, 2])))))
-                self.flight_events.append(
-                    "[RECOVERY] Upright." if not self.tipped
-                    else f"[RECOVERY] Still tipped ({tilt:.0f} deg): press Space to try again."
-                )
-            return
-        if attempt.update(float(self.data.time)):
-            self._release_spring()
-
-    def _recovery_wheel_commands(self) -> None:
-        """Spin-up: full wheel torque about the righting axis (overrides the controller)."""
-        sign = self.recovery.wheel_torque_sign if self.recovery is not None else 0.0
-        if sign == 0.0 or self.wheel_control_mode is WheelControlMode.DISABLED:
-            return
-        body = self.model.jnt_bodyid[self.ids.root_joint]
-        axis = righting_axis(self.data.xmat[body].reshape(3, 3))
-        if axis is None:
-            return
-        for actuator_id, joint_id, component in zip(
-            self.ids.wheel_actuators, self.ids.wheel_joints, sign * axis, strict=True
-        ):
-            self.data.ctrl[actuator_id] = limit_wheel_command(
-                self.model, self.data, joint_id, RECOVERY_WHEEL_COMMAND * component, self.tuning
-            )
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
         """Ground position (x, y) the lidar tracks during ascent (None: default)."""
@@ -580,11 +529,6 @@ class JumperSimulation:
         (target tracking on the way up, level then landing plane on the way
         down). Otherwise: landing plane tilt + yaw reference.
         """
-        if (self.recovery is not None and self.recovery.stage is RecoveryStage.FLIGHT
-                and not self.in_contact):
-            # Recovery hop: get level as fast as possible, keep the heading.
-            body = self.model.jnt_bodyid[self.ids.root_joint]
-            return level_quaternion(self.data.xmat[body].reshape(3, 3))
         if self.flight_reference is not None and not self.in_contact:
             return self.flight_reference.commanded
         if self.landing_reference is not None:
@@ -631,7 +575,6 @@ class JumperSimulation:
                 float(self.model.opt.timestep),
             )
         self._update_tipped()
-        self._update_recovery()
         self._update_jump_aim()
         if self._scan_open and self.in_contact:
             self._close_scan()  # touchdown
@@ -658,8 +601,8 @@ class JumperSimulation:
                 self._enter_flight_mode()
             if self.flight_reference is not None:
                 qa = self.model.jnt_qposadr[self.ids.root_joint]
-                # A jump, not a bounce or a recovery hop.
-                track = self.phase is FlightPhase.TAKEOFF and self.recovery is None
+                # A jump, not a bounce.
+                track = self.phase is FlightPhase.TAKEOFF
                 self.flight_reference.start_flight(
                     tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
                     self.data.qpos[qa : qa + 3].copy(),
@@ -676,7 +619,7 @@ class JumperSimulation:
         """Tipped over on the ground: pull the legs in as far as they go.
 
         Only an attempt: with the current hardware neither the legs nor the
-        reaction wheels can right the robot (see README).
+        reaction wheels can right the robot (see README); reset it (R).
         """
         if self.flight_reference is None:
             return
@@ -939,7 +882,6 @@ class JumperSimulation:
             self._previous_reference = None
             for actuator_id in self.ids.wheel_actuators:
                 self.data.ctrl[actuator_id] = 0.0
-        self._recovery_wheel_commands()
 
         # Leg force = spring stiffness x shortening (open loop); tipped over:
         # pull every leg in to the end of its stroke.

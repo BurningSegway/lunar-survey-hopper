@@ -115,7 +115,7 @@ Options:
 ## Controls
 
 - `Space`: initiate a jump (release the springs for 0.4 seconds, then wind them back);
-  while tipped over, attempt a recovery instead (see "Tipped over")
+  not while tipped over (see "Tipped over": press `R` instead)
 - `Backspace`: toggle Earth/Moon gravity without resetting the simulation (the
   simulation starts in Moon gravity)
 - When the robot remains below the configured linear and angular speed limits
@@ -368,27 +368,11 @@ its side):
   on its side, so they only push along the ground. A kick (pull in, release)
   rolls the robot further over; even the full 1000 N motor push did not help.
 
-**Space while tipped** therefore attempts a recovery in the air
-(`jumper_sim/recovery.py`):
-
-1. for 0.15 s the wheels torque the body away from upright, into the ground;
-   this does nothing to the body but spins them up;
-2. the jump spring is released. The foot points sideways, but it catches the
-   ground often enough to throw the robot up;
-3. in the air the attitude controller aims for level (keeping the heading)
-   instead of the hop reference. Because the wheels start spun up the other
-   way, they can use their whole speed range to swing the body upright.
-
-The console prints `[RECOVERY] Upright.` or `[RECOVERY] Still tipped (...)`.
-Each attempt starts from wherever the last one left the robot, so pressing
-Space again is worth it. Measured (on the old 6 kg model with the old
-spring, not yet redone for the 4.2 kg cube) on 16 terrain spots x 4 sides in
-Moon gravity, via the Space key: upright after one attempt 41/54 and 40/55,
-after up to three 51/54 and 54/55. In Earth gravity the hop is too short
-for this: 0/57. Rocking the body up before releasing the spring, or
-extending the legs, made it worse (see the module docstring). The attempt
-needs the wheels (not after X; press C first), and it neither tracks the
-target nor adds to the point cloud.
+Space does not jump while tipped over; press `R` to reset the simulation
+instead. (An attempt to right it in the air, Space while tipped: spin the
+wheels up into the ground, release the spring, aim for level in the air,
+was tried and removed in favour of the reset: on the old 6 kg model it got
+upright in 41/54 cases per press in Moon gravity, 0/57 on Earth.)
 
 ### Lidar (Livox Mid-360S)
 
@@ -452,7 +436,7 @@ landing benchmark, ~10x fewer points and ~10x less ground covered.)
 
 ### Lidar point cloud
 
-From lift-off to touchdown of every jump (not recovery hops), every lidar
+From lift-off to touchdown of every jump (not bounces), every lidar
 point is added to a point cloud (`jumper_sim/pointcloud.py`), so it holds the
 target as well as everything else the lidar saw, e.g. the landing area. It is
 a binary PLY with `x y z` (m, world), `jump` (jump number in this run), `t`
