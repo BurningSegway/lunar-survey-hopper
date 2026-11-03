@@ -1,0 +1,69 @@
+{
+   "widgets": [
+      {
+         "type": "chart",
+         "gridPos": {
+            "h": 6,
+            "w": 6,
+            "x": 0,
+            "y": 0
+         },
+         "series": [
+            {
+               "name": "Yaw",
+               "sourceNames": [
+                  "Yaw"
+               ],
+               "formula": "",
+               "options": {
+                  "_serie": "Yaw",
+                  "_id": "data-serie-25",
+                  "stroke": "rgba(231,76,60,1)",
+                  "fill": "rgba(231,76,60,0.1)"
+               },
+               "type": "number"
+            },
+            {
+               "name": "Yaw-reference",
+               "sourceNames": [
+                  "Yaw-reference"
+               ],
+               "formula": "",
+               "options": {
+                  "_serie": "Yaw-reference",
+                  "_id": "data-serie-26",
+                  "stroke": "rgba(52,152,219,1)",
+                  "fill": "rgba(52,152,219,0.1)"
+               },
+               "type": "number"
+            }
+         ]
+      },
+      {
+         "type": "chart",
+         "gridPos": {
+            "h": 6,
+            "w": 6,
+            "x": 0,
+            "y": 0
+         },
+         "series": [
+            {
+               "name": "PID-Output-z",
+               "sourceNames": [
+                  "PID-Output-z"
+               ],
+               "formula": "",
+               "options": {
+                  "_serie": "PID-Output-z",
+                  "_id": "data-serie-27",
+                  "stroke": "rgba(231,76,60,1)",
+                  "fill": "rgba(231,76,60,0.1)"
+               },
+               "type": "number"
+            }
+         ]
+      }
+   ],
+   "viewDuration": "60"
+}
