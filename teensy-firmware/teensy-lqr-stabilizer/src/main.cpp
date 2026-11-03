@@ -468,7 +468,7 @@ void commandZeroTorque() {
   }
 }
 
-// Level reference at the current heading: q_ref = yaw-only rotation.
+// Level reference at the current heading: q_ref = yaw-only rotation. Overvej om skal sættes til 0 i stedet for yaw
 void captureReferenceAttitude() {
   const float w = quaternion_wxyz[0];
   const float x = quaternion_wxyz[1];
