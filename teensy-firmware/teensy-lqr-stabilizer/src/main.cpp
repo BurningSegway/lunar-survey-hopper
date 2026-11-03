@@ -7,9 +7,6 @@
 #include "xsens_mti.h"      // Main library
 #include "xsens_utility.h"  // Needed for quaternion conversion function
 
-//PID includes
-#include "PID_v1.h"         // PID library
-
 //MTI vars
 // Cache a copy of IMU data
 float    temperature     = 0;       // in degress celcius
@@ -18,6 +15,17 @@ float    euler_pry[3]    = { 0 };   // -180 to +180 degress
 float    acceleration[3] = { 0 };   // in m/s^2
 uint32_t lastAccelerationMs = 0;
 uint32_t accelerationSampleCount = 0;
+
+// Attitude quaternion as delivered by the MTi: scalar-first {w, x, y, z}.
+float    quaternion_wxyz[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+uint32_t lastQuaternionMs   = 0;
+bool     receivedQuaternion = false;
+
+// Body angular rate (rate of turn) in rad/s, sensor frame.
+// NOTE: the MTi must be configured to output "Rate of Turn" for this to update.
+float    gyro_rad_s[3]   = { 0 };
+uint32_t lastGyroMs      = 0;
+bool     receivedGyro    = false;
 
 constexpr float GRAVITY_M_S2 = 9.81f;
 constexpr float LAUNCH_ACCEL_THRESHOLD_M_S2 = 1.25f * GRAVITY_M_S2;
@@ -40,26 +48,47 @@ enum class FlightState {
 FlightState flightState = FlightState::WAITING_FOR_LAUNCH;
 float accelerationMagnitude = 0.0f;
 
-void setPidControlEnabled(bool enabled);
+void setAttitudeControlEnabled(bool enabled);
 
-//PID vars
-//Define Variables we'll be connecting to
-double z_Setpoint, z_Input, z_Output;
+/* LQR attitude controller -----------------------------------------------------
+ * Model (angular_momentum_tau.mlx, reduced 6-state system A6/B6):
+ *   x = [q_e1, q_e2, q_e3, omega_x, omega_y, omega_z]
+ *       q_e   = vector part of the attitude error quaternion (scalar-last model,
+ *               equilibrium q = [0 0 0 1])
+ *       omega = body angular rate [rad/s]
+ *   u = [tau_x, tau_y, tau_z]  reaction wheel torques [Nm]
+ *   u = K * x   with K = -lqr(A6, B6, Q, R)   (Bryson weights, rho = 0.1)
+ *
+ * Paste a new K straight from MATLAB here if you retune.
+ */
+constexpr float LQR_K[3][6] = {
+  // q_e1        q_e2        q_e3        omega_x     omega_y     omega_z
+  { 11.8374307f, 0.0f,       0.0f,       1.73950634f, 0.0f,       0.0f        },  // tau_x
+  { 0.0f,        11.8374307f, 0.0f,      0.0f,       1.73954037f, 0.0f        },  // tau_y
+  { 0.0f,        0.0f,       11.8374307f, 0.0f,      0.0f,        1.74856749f },  // tau_z
+};
 
-//Specify the links and initial tuning parameters
-double z_Kp=1.1, z_Ki=0.15, z_Kd=0.13;
-PID z_PID(&z_Input, &z_Output, &z_Setpoint, z_Kp, z_Ki, z_Kd, DIRECT);
+// Max wheel torque used in the Bryson weighting (tau_max in MATLAB) [Nm].
+constexpr float TAU_MAX_NM = 0.49f;
 
-double x_Setpoint, x_Input, x_Output;
-double x_Kp=1.1, x_Ki=0.15, x_Kd=0.13;
-PID x_PID(&x_Input, &x_Output, &x_Setpoint, x_Kp, x_Ki, x_Kd, DIRECT);
+// Map model torque axes to ODrives (same mapping the PID used:
+// odrv0 = z, odrv1 = x, odrv2 = y), and the sign between the model's tau
+// (torque applied ON the wheel, positive about +body axis) and a positive
+// ODrive torque command. Verify each sign on the bench and flip if needed.
+constexpr size_t TAU_X = 0, TAU_Y = 1, TAU_Z = 2;
+constexpr size_t ODRIVE_FOR_AXIS[3]   = { 1, 2, 0 };
+constexpr float  WHEEL_TORQUE_SIGN[3] = { 1.0f, 1.0f, 1.0f };
 
-double y_Setpoint, y_Input, y_Output;
-double y_Kp=1.1, y_Ki=0.15, y_Kd=0.13;
-PID y_PID(&y_Input, &y_Output, &y_Setpoint, y_Kp, y_Ki, y_Kd, DIRECT);
+// IMU data older than this disables torque output.
+constexpr uint32_t ATTITUDE_STALE_TIMEOUT_MS = 50;
 
-double min_output = -10.0;
-double max_output = 10.0;
+// Reference attitude (scalar-first {w, x, y, z}). Captured when control is
+// enabled: level (roll = pitch = 0) at the current heading, so the controller
+// never has to swing through a large yaw error at engagement.
+float q_ref_wxyz[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+
+float lqr_state[6]  = { 0 };
+float lqr_torque[3] = { 0 };   // model-frame tau_x, tau_y, tau_z after saturation
 
 void updateFlightState(uint32_t now) {
   static uint32_t processedSampleCount = 0;
@@ -84,7 +113,7 @@ void updateFlightState(uint32_t now) {
       flightCandidateActive = false;
       landingCandidateActive = false;
       landingDecelerationCandidateActive = false;
-      setPidControlEnabled(false);
+      setAttitudeControlEnabled(false);
       Serial.println("IMU acceleration stale; attitude control disabled");
     }
     return;
@@ -121,7 +150,7 @@ void updateFlightState(uint32_t now) {
       if (accelerationMagnitude < PROPULSION_END_ACCEL_THRESHOLD_M_S2) {
         flightState = FlightState::AIRBORNE_WAITING_FOR_FLIGHT;
         flightCandidateActive = false;
-        setPidControlEnabled(true);
+        setAttitudeControlEnabled(true);
         Serial.println("Propulsion ended; attitude control enabled");
       }
       break;
@@ -154,7 +183,7 @@ void updateFlightState(uint32_t now) {
                    LANDING_DEBOUNCE_MS) {
           flightState = FlightState::WAITING_FOR_LAUNCH;
           landingCandidateActive = false;
-          setPidControlEnabled(false);
+          setAttitudeControlEnabled(false);
           Serial.println("Landing detected; attitude control disabled");
         }
       } else if (landingDecelerationCandidateActive &&
@@ -164,7 +193,7 @@ void updateFlightState(uint32_t now) {
           flightState = FlightState::WAITING_FOR_LAUNCH;
           landingCandidateActive = false;
           landingDecelerationCandidateActive = false;
-          setPidControlEnabled(false);
+          setAttitudeControlEnabled(false);
           Serial.println("Landing detected; attitude control disabled");
         }
       } else if (hasPreviousAccelerationSample &&
@@ -430,19 +459,81 @@ ODriveCAN odrv1(wrap_can_intf(can_intf), ODRV1_NODE_ID);
 ODriveCAN odrv2(wrap_can_intf(can_intf), ODRV2_NODE_ID);
 ODriveCAN* odrives[] = {&odrv0, &odrv1, &odrv2}; // Make sure all ODriveCAN instances are accounted for here
 
-void setPidControlEnabled(bool enabled) {
-  const int mode = enabled ? AUTOMATIC : MANUAL;
-  z_PID.SetMode(mode);
-  x_PID.SetMode(mode);
-  y_PID.SetMode(mode);
+void commandZeroTorque() {
+  for (ODriveCAN* odrive : odrives) {
+    odrive->setTorque(0.0f);
+  }
+  for (float& tau : lqr_torque) {
+    tau = 0.0f;
+  }
+}
 
-  if (!enabled) {
-    z_Output = 0.0;
-    x_Output = 0.0;
-    y_Output = 0.0;
-    odrv0.setVelocity(0.0f);
-    odrv1.setVelocity(0.0f);
-    odrv2.setVelocity(0.0f);
+// Level reference at the current heading: q_ref = yaw-only rotation.
+void captureReferenceAttitude() {
+  const float w = quaternion_wxyz[0];
+  const float x = quaternion_wxyz[1];
+  const float y = quaternion_wxyz[2];
+  const float z = quaternion_wxyz[3];
+  const float yaw = atan2f(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
+  q_ref_wxyz[0] = cosf(0.5f * yaw);
+  q_ref_wxyz[1] = 0.0f;
+  q_ref_wxyz[2] = 0.0f;
+  q_ref_wxyz[3] = sinf(0.5f * yaw);
+}
+
+void setAttitudeControlEnabled(bool enabled) {
+  if (enabled) {
+    captureReferenceAttitude();
+  } else {
+    commandZeroTorque();
+  }
+}
+
+bool attitudeDataIsFresh(uint32_t now) {
+  return receivedQuaternion && receivedGyro &&
+         (uint32_t)(now - lastQuaternionMs) <= ATTITUDE_STALE_TIMEOUT_MS &&
+         (uint32_t)(now - lastGyroMs) <= ATTITUDE_STALE_TIMEOUT_MS;
+}
+
+// Builds the LQR state x = [q_e(vector), omega] from the latest IMU data.
+void updateLqrState() {
+  // Error quaternion q_e = conj(q_ref) * q  (Hamilton product, scalar-first).
+  const float rw = q_ref_wxyz[0], rx = -q_ref_wxyz[1], ry = -q_ref_wxyz[2], rz = -q_ref_wxyz[3];
+  const float qw = quaternion_wxyz[0], qx = quaternion_wxyz[1], qy = quaternion_wxyz[2], qz = quaternion_wxyz[3];
+
+  float ew = rw * qw - rx * qx - ry * qy - rz * qz;
+  float ex = rw * qx + rx * qw + ry * qz - rz * qy;
+  float ey = rw * qy - rx * qz + ry * qw + rz * qx;
+  float ez = rw * qz + rx * qy - ry * qx + rz * qw;
+
+  // q and -q are the same attitude; pick the short way around (scalar >= 0),
+  // which matches the model's equilibrium q_4 = +1.
+  if (ew < 0.0f) {
+    ew = -ew; ex = -ex; ey = -ey; ez = -ez;
+  }
+
+  lqr_state[0] = ex;
+  lqr_state[1] = ey;
+  lqr_state[2] = ez;
+  lqr_state[3] = gyro_rad_s[0];
+  lqr_state[4] = gyro_rad_s[1];
+  lqr_state[5] = gyro_rad_s[2];
+}
+
+// u = K * x, saturated to +-TAU_MAX_NM, then sent to the wheels.
+void runLqrController() {
+  updateLqrState();
+
+  for (size_t axis = 0; axis < 3; ++axis) {
+    float tau = 0.0f;
+    for (size_t j = 0; j < 6; ++j) {
+      tau += LQR_K[axis][j] * lqr_state[j];
+    }
+    lqr_torque[axis] = constrain(tau, -TAU_MAX_NM, TAU_MAX_NM);
+  }
+
+  for (size_t axis = 0; axis < 3; ++axis) {
+    odrives[ODRIVE_FOR_AXIS[axis]]->setTorque(WHEEL_TORQUE_SIGN[axis] * lqr_torque[axis]);
   }
 }
 
@@ -518,7 +609,7 @@ bool enableClosedLoopControl() {
         }
       }
 
-      odrives[i]->setVelocity(0.0f);
+      odrives[i]->setTorque(0.0f);
     }
 
     if (allDrivesClosedLoop) {
@@ -565,30 +656,6 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(115200); //TTL to RS232 converter for MTI-3 IMU
 
-  //PID
-  //initialize the variables we're linked to
-  z_Input = 0;
-  z_Setpoint = 0; //45.0/2;
-
-  x_Input = 0;
-  x_Setpoint = 0; //45.0/2;
-
-  y_Input = 0;
-  y_Setpoint = 0; //45.0/2;
-
-  // Keep the PID controllers inactive until a launch is detected.
-  z_PID.SetMode(MANUAL);
-  z_PID.SetSampleTime(10);
-  z_PID.SetOutputLimits(min_output, max_output);
-
-  x_PID.SetMode(MANUAL);
-  x_PID.SetSampleTime(10);
-  x_PID.SetOutputLimits(min_output, max_output);
-
-  y_PID.SetMode(MANUAL);
-  y_PID.SetSampleTime(10);
-  y_PID.SetOutputLimits(min_output, max_output);
-
   // Wait for up to 3 seconds for the serial port to be opened on the PC side.
   // If no PC connects, continue anyway.
   for (int i = 0; i < 30 && !Serial; ++i) {
@@ -624,17 +691,20 @@ void setup() {
 
   Serial.println("found ODrives");
 
-  Serial.println("Setting ramped vel. control mode...");
-  odrv0.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
-  odrv1.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
-  odrv2.setControllerMode(ODriveControlMode::CONTROL_MODE_VELOCITY_CONTROL, ODriveInputMode::INPUT_MODE_VEL_RAMP);
+  // Ramp rate is controller.config.torque_ramp_rate [Nm/s] on each ODrive
+  // (set with odrivetool / GUI). Keep it fast: the LQR model assumes the
+  // commanded torque is applied instantly.
+  Serial.println("Setting ramped torque control mode...");
+  for (ODriveCAN* odrive : odrives) {
+    odrive->setControllerMode(ODriveControlMode::CONTROL_MODE_TORQUE_CONTROL, ODriveInputMode::INPUT_MODE_TORQUE_RAMP);
+  }
 
   Serial.println("Enabling closed loop control...");
   if (!enableClosedLoopControl()) {
-    Serial.println("Startup halted; holding zero velocity while CAN remains serviced.");
+    Serial.println("Startup halted; holding zero torque while CAN remains serviced.");
     while (true) {
       for (ODriveCAN* odrive : odrives) {
-        odrive->setVelocity(0.0f);
+        odrive->setTorque(0.0f);
       }
       pumpEvents(can_intf);
       delay(10);
@@ -696,17 +766,6 @@ void loop() {
     staleBusVoltageReported = true;
   }
 
-  uint32_t setpointMillis = millis();
-  static uint32_t lastSetpoint = 0;
-
-  if ((uint32_t)(setpointMillis - lastSetpoint) >= 5000) {
-    lastSetpoint = setpointMillis;
-    z_Setpoint = -z_Setpoint;
-    x_Setpoint = -x_Setpoint;
-    y_Setpoint = -y_Setpoint;
-
-  }
-
   if (currentMillis - previousMillis > interval) {
     previousMillis = currentMillis;
     direction = !direction;
@@ -729,44 +788,34 @@ void loop() {
 
   updateFlightState(millis());
 
-  static uint32_t lastVelocityCommandMs = 0;
+  static uint32_t lastTorqueCommandMs = 0;
   uint32_t now = millis();
 
   static uint32_t lastPrintMs = 0;
   uint32_t nowPrint = millis();
 
-  double integralZoneThreshold = 5.0;
+  //100 hz LQR control loop
+  if ((uint32_t)(now - lastTorqueCommandMs) >= 10) {
+    lastTorqueCommandMs = now;
 
-  //100 hz command rate control loop
-  if ((uint32_t)(now - lastVelocityCommandMs) >= 10) {
-    lastVelocityCommandMs = now;
-    z_Input = euler_pry[2];
-    x_Input = euler_pry[0];
-    y_Input = euler_pry[1];
+    // WAITING_FOR_PROPULSION_CUTOFF: control not yet enabled (no reference
+    // captured), so only the two airborne states drive the wheels.
+    const bool controlActive =
+        flightState == FlightState::AIRBORNE_WAITING_FOR_FLIGHT ||
+        flightState == FlightState::AIRBORNE_LANDING_ARMED;
 
-      // Calculate the absolute distance to the setpoint
-    /*double error = abs(z_Setpoint - z_Input);
+    static bool staleAttitudeReported = false;
+    const bool attitudeFresh = attitudeDataIsFresh(now);
 
-    if (error > integralZoneThreshold) {
-      // Far from setpoint: Disable Ki to prevent windup and overshoot
-      z_PID.SetTunings(z_Kp, 0.0, z_Kd); 
+    if (controlActive && attitudeFresh) {
+      staleAttitudeReported = false;
+      runLqrController();
     } else {
-      // Close to setpoint: Enable Ki to pull the error flat to zero
-      z_PID.SetTunings(z_Kp, z_Ki, z_Kd); 
-    }*/
-
-    if (flightState != FlightState::WAITING_FOR_LAUNCH) {
-      z_PID.Compute();
-      x_PID.Compute();
-      y_PID.Compute();
-
-      odrv0.setVelocity(z_Output);
-      odrv1.setVelocity(x_Output);
-      odrv2.setVelocity(y_Output);
-    } else {
-      odrv0.setVelocity(0.0f);
-      odrv1.setVelocity(0.0f);
-      odrv2.setVelocity(0.0f);
+      if (controlActive && !staleAttitudeReported) {
+        Serial.println("WARNING: quaternion / rate-of-turn data stale; wheels at zero torque");
+        staleAttitudeReported = true;
+      }
+      commandZeroTorque();
     }
   }
 
@@ -791,12 +840,24 @@ void loop() {
     }*/
 
     /*
-    Serial.print(">PID-Output-z:");
-    Serial.println(z_Output);
-    Serial.print(">PID-Output-x:");
-    Serial.println(x_Output);
-    Serial.print(">PID-Output-y:");
-    Serial.println(y_Output);*/
+    Serial.print(">LQR-tau-x:");
+    Serial.println(lqr_torque[TAU_X], 4);
+    Serial.print(">LQR-tau-y:");
+    Serial.println(lqr_torque[TAU_Y], 4);
+    Serial.print(">LQR-tau-z:");
+    Serial.println(lqr_torque[TAU_Z], 4);
+    Serial.print(">qe-x:");
+    Serial.println(lqr_state[0], 4);
+    Serial.print(">qe-y:");
+    Serial.println(lqr_state[1], 4);
+    Serial.print(">qe-z:");
+    Serial.println(lqr_state[2], 4);
+    Serial.print(">omega-x:");
+    Serial.println(lqr_state[3], 4);
+    Serial.print(">omega-y:");
+    Serial.println(lqr_state[4], 4);
+    Serial.print(">omega-z:");
+    Serial.println(lqr_state[5], 4);*/
 
     Serial.print(">AccelerationMagnitude:");
     Serial.println(accelerationMagnitude);
@@ -813,14 +874,7 @@ void loop() {
     Serial.print(">Pitch:");
     Serial.println(euler_pry[1]);
     Serial.print(">Yaw:");
-    Serial.println(euler_pry[2]);
-
-    Serial.print(">Yaw-reference:");
-    Serial.println(z_Setpoint);
-    Serial.print(">Roll-reference:");
-    Serial.println(x_Setpoint);
-    Serial.print(">Pitch-reference:");
-    Serial.println(y_Setpoint);*/
+    Serial.println(euler_pry[2]);*/
 
   }
 
@@ -834,7 +888,15 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
         case XSENS_EVT_QUATERNION:
             if( mtdata->type == XSENS_EVT_TYPE_FLOAT4 )
             {
-                // Convert the quaternion to euler angles
+                // Keep the raw quaternion (scalar-first w, x, y, z) for the LQR
+                quaternion_wxyz[0] = mtdata->data.f4x4[0];
+                quaternion_wxyz[1] = mtdata->data.f4x4[1];
+                quaternion_wxyz[2] = mtdata->data.f4x4[2];
+                quaternion_wxyz[3] = mtdata->data.f4x4[3];
+                lastQuaternionMs = millis();
+                receivedQuaternion = true;
+
+                // Convert the quaternion to euler angles (for printing only)
                 xsens_quaternion_to_euler( mtdata->data.f4x4, euler_pry );
 
                 // Convert from radians to degrees
@@ -868,6 +930,18 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 Serial.println(acceleration[1]);
                 Serial.print(">AccelZ:");
                 Serial.println(acceleration[2]);*/
+            }
+            break;
+
+        case XSENS_EVT_RATE_OF_TURN:
+            if( mtdata->type == XSENS_EVT_TYPE_FLOAT3 )
+            {
+                // Body angular rate in rad/s
+                gyro_rad_s[0] = mtdata->data.f4x3[0];
+                gyro_rad_s[1] = mtdata->data.f4x3[1];
+                gyro_rad_s[2] = mtdata->data.f4x3[2];
+                lastGyroMs = millis();
+                receivedGyro = true;
             }
             break;
 
