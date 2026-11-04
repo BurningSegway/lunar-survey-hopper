@@ -68,16 +68,34 @@ constexpr float LQR_K[3][6] = {
   { 0.0f,        0.0f,       11.8374307f, 0.0f,      0.0f,        1.74856749f },  // tau_z
 };
 
+// Bench-tuning multipliers on K (1.0 = MATLAB design).
+//   ANGLE scales the q_e columns (stiffness), RATE scales the omega columns
+//   (damping). Lowering both by the same factor keeps the shape but slows the
+//   loop (more tolerant of delay); damping ratio ~ RATE / sqrt(ANGLE).
+// Growing oscillations -> lower both. Overshoot but decaying -> raise RATE.
+constexpr float LQR_ANGLE_GAIN_SCALE = 1.0f;
+constexpr float LQR_RATE_GAIN_SCALE  = 1.0f;
+
 // Max wheel torque used in the Bryson weighting (tau_max in MATLAB) [Nm].
 constexpr float TAU_MAX_NM = 0.49f;
 
 // Map model torque axes to ODrives (same mapping the PID used:
 // odrv0 = z, odrv1 = x, odrv2 = y), and the sign between the model's tau
 // (torque applied ON the wheel, positive about +body axis) and a positive
-// ODrive torque command. Verify each sign on the bench and flip if needed.
+// ODrive torque command.
+//
+// -1 = the ODrive's positive direction points along the NEGATIVE IMU axis.
+// Derived from the old PID, which was stable: it commanded
+// wheel_vel = -Kp*angle, and with momentum exchange that is only stable if
+// +ODrive spins the wheel about -axis. +1 here ran away (wheel spun up and the
+// cube rotated with it = positive feedback).
+// x/y assume the PID was also stable on those axes; check before enabling.
 constexpr size_t TAU_X = 0, TAU_Y = 1, TAU_Z = 2;
 constexpr size_t ODRIVE_FOR_AXIS[3]   = { 1, 2, 0 };
-constexpr float  WHEEL_TORQUE_SIGN[3] = { 1.0f, 1.0f, 1.0f };
+constexpr float  WHEEL_TORQUE_SIGN[3] = { -1.0f, -1.0f, -1.0f };
+
+// Per-axis enable {x, y, z}. Disabled axes get zero torque.
+constexpr bool   LQR_AXIS_ENABLED[3]  = { false, false, true };
 
 // IMU data older than this disables torque output.
 constexpr uint32_t ATTITUDE_STALE_TIMEOUT_MS = 50;
@@ -214,99 +232,29 @@ void updateFlightState(uint32_t now) {
 }
 
 
-//MTI Callback function used by the library and such
-// Callback function used by the library
+// Xsens MTi: the library holds parser state and calls imu_callback()
+// (defined at the bottom of this file) for every decoded data field.
 void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata );
-
-// The library holds state and pointers to callbacks in this structure
 xsens_interface_t imu_interface = XSENS_INTERFACE_RX( &imu_callback );
 
-//Back to odrive example code
-// Documentation for this example can be found here:
-// https://docs.odriverobotics.com/v/latest/guides/arduino-can-guide.html
-
-
-/* Configuration of example sketch -------------------------------------------*/
-//Vars 
-
-bool direction = true;
+/* Hardware configuration ----------------------------------------------------*/
+// ODrive CAN guide: https://docs.odriverobotics.com/v/latest/guides/arduino-can-guide.html
 
 constexpr uint8_t LOW_VOLTAGE_WARNING_PIN = 5;
 
-// CAN bus baudrate. Make sure this matches for every device on the bus
-#define CAN_BAUDRATE 1000000
+// CAN bus baudrate. Must match every device on the bus.
+constexpr uint32_t CAN_BAUDRATE = 1000000;
 
-// ODrive node_id for odrv0
-#define ODRV0_NODE_ID 01
-#define ODRV1_NODE_ID 02
-#define ODRV2_NODE_ID 03
+// ODrive CAN node IDs
+constexpr uint8_t ODRV0_NODE_ID = 1;
+constexpr uint8_t ODRV1_NODE_ID = 2;
+constexpr uint8_t ODRV2_NODE_ID = 3;
 
-// Uncomment below the line that corresponds to your hardware.
-// See also "Board-specific settings" to adapt the details for your hardware setup.
+/* CAN (Teensy 4.1 built-in CAN1 via FlexCAN_T4) -----------------------------*/
 
-#define IS_TEENSY_BUILTIN // Teensy boards with built-in CAN interface (e.g. Teensy 4.1). See below to select which interface to use.
-// #define IS_ARDUINO_BUILTIN // Arduino boards with built-in CAN interface (e.g. Arduino Uno R4 Minima)
-// #define IS_MCP2515 // Any board with external MCP2515 based extension module. See below to configure the module.
-// #define IS_STM32_BUILTIN // STM32 boards with built-in CAN interface (e.g. STM32F4 Discovery).
-// #define IS_ESP32_TWAI // ESP32 boards with built-in TWAI (CAN) interface. Directly uses the ESP-IDF TWAI driver.
-
-
-/* Board-specific includes ---------------------------------------------------*/
-
-#if defined(IS_TEENSY_BUILTIN) + defined(IS_ARDUINO_BUILTIN) + defined(IS_MCP2515) + defined(IS_STM32_BUILTIN) + defined(IS_ESP32_TWAI) != 1
-#warning "Select exactly one hardware option at the top of this file."
-
-#if CAN_HOWMANY > 0 || CANFD_HOWMANY > 0
-#define IS_ARDUINO_BUILTIN
-#warning "guessing that this uses HardwareCAN"
-#else
-#error "cannot guess hardware version"
-#endif
-
-#endif
-
-#ifdef IS_ARDUINO_BUILTIN
-// See https://github.com/arduino/ArduinoCore-API/blob/master/api/HardwareCAN.h
-// and https://github.com/arduino/ArduinoCore-renesas/tree/main/libraries/Arduino_CAN
-
-#include <Arduino_CAN.h>
-#include <ODriveHardwareCAN.hpp>
-#endif // IS_ARDUINO_BUILTIN
-
-#ifdef IS_MCP2515
-// See https://github.com/sandeepmistry/arduino-CAN/
-#include "MCP2515.h"
-#include "ODriveMCPCAN.hpp"
-#endif // IS_MCP2515
-
-#ifdef IS_TEENSY_BUILTIN
-// See https://github.com/tonton81/FlexCAN_T4
-// clone https://github.com/tonton81/FlexCAN_T4.git into /src
 #include <FlexCAN_T4.h>
 #include "ODriveFlexCAN.hpp"
 struct ODriveStatus; // hack to prevent teensy compile error
-#endif // IS_TEENSY_BUILTIN
-
-#ifdef IS_STM32_BUILTIN
-// See https://github.com/pazi88/STM32_CAN
-#include <STM32_CAN.h>
-#include "ODriveSTM32CAN.hpp"
-#endif // IS_STM32_BUILTIN
-
-#ifdef IS_ESP32_TWAI
-// See https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/twai.html
-#include "driver/twai.h"
-#include "ODriveESP32TWAI.hpp"
-#endif // IS_ESP32_TWAI
-
-
-
-/* Board-specific settings ---------------------------------------------------*/
-
-
-/* Teensy */
-
-#ifdef IS_TEENSY_BUILTIN
 
 void onCanMessage(const CanMsg& msg);
 
@@ -330,131 +278,9 @@ bool requestBusVoltage() {
   return can_intf.write(request) > 0;
 }
 
-#endif // IS_TEENSY_BUILTIN
+/* ODrives -------------------------------------------------------------------*/
 
-
-/* MCP2515-based extension modules -*/
-
-#ifdef IS_MCP2515
-
-MCP2515Class& can_intf = CAN;
-
-// chip select pin used for the MCP2515
-#define MCP2515_CS 10
-
-// interrupt pin used for the MCP2515
-// NOTE: not all Arduino pins are interruptable, check the documentation for your board!
-#define MCP2515_INT 2
-
-// freqeuncy of the crystal oscillator on the MCP2515 breakout board. 
-// common values are: 16 MHz, 12 MHz, 8 MHz
-#define MCP2515_CLK_HZ 8000000
-
-
-static inline void receiveCallback(int packet_size) {
-  if (packet_size > 8) {
-    return; // not supported
-  }
-  CanMsg msg = {.id = (unsigned int)CAN.packetId(), .len = (uint8_t)packet_size};
-  CAN.readBytes(msg.buffer, packet_size);
-  onCanMessage(msg);
-}
-
-bool setupCan() {
-  // configure and initialize the CAN bus interface
-  CAN.setPins(MCP2515_CS, MCP2515_INT);
-  CAN.setClockFrequency(MCP2515_CLK_HZ);
-  if (!CAN.begin(CAN_BAUDRATE)) {
-    return false;
-  }
-
-  CAN.onReceive(receiveCallback);
-  return true;
-}
-
-#endif // IS_MCP2515
-
-
-/* Arduinos with built-in CAN */
-
-#ifdef IS_ARDUINO_BUILTIN
-
-HardwareCAN& can_intf = CAN;
-
-bool setupCan() {
-  return can_intf.begin((CanBitRate)CAN_BAUDRATE);
-}
-
-#endif
-
-
-/* STM32 boards with built-in CAN */
-
-#ifdef IS_STM32_BUILTIN
-
-STM32_CAN Can1( CAN1 );
-STM32_CAN& can_intf = Can1;
-
-bool setupCan() {
-  can_intf.begin();
-  can_intf.setBaudRate(CAN_BAUDRATE);
-  return true;
-}
-
-#endif // IS_STM32_BUILTIN
-
-
-/* ESP32 boards with built-in TWAI (CAN) */
-
-#ifdef IS_ESP32_TWAI
-
-// Pins used to connect to CAN bus transceiver
-#define ESP32_TWAI_TX_PIN 26
-#define ESP32_TWAI_RX_PIN 25
-
-ESP32TWAIIntf can_intf;
-
-bool setupCan() {
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        (gpio_num_t)ESP32_TWAI_TX_PIN,
-        (gpio_num_t)ESP32_TWAI_RX_PIN,
-        TWAI_MODE_NORMAL
-    );
-
-    twai_timing_config_t t_config;
-    switch (CAN_BAUDRATE) {
-        case 1000000: t_config = TWAI_TIMING_CONFIG_1MBITS(); break;
-        case 800000:  t_config = TWAI_TIMING_CONFIG_800KBITS(); break;
-        case 500000:  t_config = TWAI_TIMING_CONFIG_500KBITS(); break;
-        case 250000:  t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
-        case 125000:  t_config = TWAI_TIMING_CONFIG_125KBITS(); break;
-        case 100000:  t_config = TWAI_TIMING_CONFIG_100KBITS(); break;
-        case 50000:   t_config = TWAI_TIMING_CONFIG_50KBITS(); break;
-        case 25000:   t_config = TWAI_TIMING_CONFIG_25KBITS(); break;
-        default:      t_config = TWAI_TIMING_CONFIG_250KBITS(); break;
-    }
-
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        return false;
-    }
-
-    if (twai_start() != ESP_OK) {
-        twai_driver_uninstall();
-        return false;
-    }
-
-    return true;
-}
-
-#endif // IS_ESP32_TWAI
-
-
-/* Example sketch ------------------------------------------------------------*/
-
-// Instantiate ODrive objects
-ODriveCAN odrv0(wrap_can_intf(can_intf), ODRV0_NODE_ID); // Standard CAN message ID
+ODriveCAN odrv0(wrap_can_intf(can_intf), ODRV0_NODE_ID);
 ODriveCAN odrv1(wrap_can_intf(can_intf), ODRV1_NODE_ID);
 ODriveCAN odrv2(wrap_can_intf(can_intf), ODRV2_NODE_ID);
 ODriveCAN* odrives[] = {&odrv0, &odrv1, &odrv2}; // Make sure all ODriveCAN instances are accounted for here
@@ -526,8 +352,9 @@ void runLqrController() {
 
   for (size_t axis = 0; axis < 3; ++axis) {
     float tau = 0.0f;
-    for (size_t j = 0; j < 6; ++j) {
-      tau += LQR_K[axis][j] * lqr_state[j];
+    for (size_t j = 0; j < 6 && LQR_AXIS_ENABLED[axis]; ++j) {
+      const float scale = (j < 3) ? LQR_ANGLE_GAIN_SCALE : LQR_RATE_GAIN_SCALE;
+      tau += scale * LQR_K[axis][j] * lqr_state[j];
     }
     lqr_torque[axis] = constrain(tau, -TAU_MAX_NM, TAU_MAX_NM);
   }
@@ -691,12 +518,12 @@ void setup() {
 
   Serial.println("found ODrives");
 
-  // Ramp rate is controller.config.torque_ramp_rate [Nm/s] on each ODrive
-  // (set with odrivetool / GUI). Keep it fast: the LQR model assumes the
-  // commanded torque is applied instantly.
-  Serial.println("Setting ramped torque control mode...");
+  // Passthrough (no ramp): the LQR model assumes the commanded torque is
+  // applied instantly, and a ramp adds unmodelled lag. For ramped torque use
+  // INPUT_MODE_TORQUE_RAMP + controller.config.torque_ramp_rate on the ODrive.
+  Serial.println("Setting torque control mode (passthrough)...");
   for (ODriveCAN* odrive : odrives) {
-    odrive->setControllerMode(ODriveControlMode::CONTROL_MODE_TORQUE_CONTROL, ODriveInputMode::INPUT_MODE_TORQUE_RAMP);
+    odrive->setControllerMode(ODriveControlMode::CONTROL_MODE_TORQUE_CONTROL, ODriveInputMode::INPUT_MODE_PASSTHROUGH);
   }
 
   Serial.println("Enabling closed loop control...");
@@ -728,9 +555,6 @@ void loop() {
                         // for applications requiring loop times over 100Hz.
 
   uint32_t currentMillis = millis();
-  static uint32_t previousMillis = 0;
-  static int interval = 1000;
-  float vel = 0.0;
 
   static uint32_t lastBusVoltageRequestMs = 0;
   static bool busVoltageRequestFailureReported = false;
@@ -765,19 +589,6 @@ void loop() {
     Serial.println("WARNING: ODrive bus voltage reading is stale");
     staleBusVoltageReported = true;
   }
-
-  if (currentMillis - previousMillis > interval) {
-    previousMillis = currentMillis;
-    direction = !direction;
-  }
-
-  if (direction) {
-    vel = 5.0;
-  } else {
-    vel = -5.0;
-  }
-
-
 
   //MTI PART
   //Read IMU
@@ -858,6 +669,18 @@ void loop() {
     Serial.println(lqr_state[4], 4);
     Serial.print(">omega-z:");
     Serial.println(lqr_state[5], 4);*/
+
+    // LQR diagnostics: -1 age means that IMU output has never been received.
+    Serial.print(">QuatAgeMs:");
+    Serial.println(receivedQuaternion ? (long)(nowPrint - lastQuaternionMs) : -1L);
+    Serial.print(">GyroAgeMs:");
+    Serial.println(receivedGyro ? (long)(nowPrint - lastGyroMs) : -1L);
+    Serial.print(">LQR-tau-x:");
+    Serial.println(lqr_torque[TAU_X], 4);
+    Serial.print(">LQR-tau-y:");
+    Serial.println(lqr_torque[TAU_Y], 4);
+    Serial.print(">LQR-tau-z:");
+    Serial.println(lqr_torque[TAU_Z], 4);
 
     Serial.print(">AccelerationMagnitude:");
     Serial.println(accelerationMagnitude);
