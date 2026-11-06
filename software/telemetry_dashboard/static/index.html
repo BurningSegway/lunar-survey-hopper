@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hopper Telemetry</title>
+<style>
+  :root { color-scheme: dark;
+    --bg: #14171c; --panel: #1c2027; --panel2: #232831; --border: #2e3440;
+    --text: #d8dee9; --muted: #8590a2; --accent: #5aa9e6; --ok: #6cc070; --warn: #e6b450; --bad: #e06c75;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  .pill { padding: 2px 8px; border-radius: 10px; background: var(--panel2); border: 1px solid var(--border);
+    font-size: 12px; white-space: nowrap; }
+  .pill .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--muted); }
+  .spacer { flex: 1; }
+  button, select { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 5px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--accent); }
+  button.active { background: var(--warn); color: #111; border-color: var(--warn); }
+  #record.recording { background: var(--bad); color: #fff; border-color: var(--bad); }
+  #record.recording::before { content: "● "; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  main { display: grid; grid-template-columns: 240px 1fr; min-height: 0; }
+  #sidebar { border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel); }
+  #filter { width: calc(100% - 16px); margin: 8px; padding: 5px 8px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px; font: inherit; }
+  .var { display: flex; align-items: center; gap: 6px; padding: 5px 10px; cursor: grab; user-select: none;
+    border-bottom: 1px solid #1f242c; }
+  .var:hover { background: var(--panel2); }
+  .var .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .var .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .var .val { font-variant-numeric: tabular-nums; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  .var.stale .val { color: #555c68; }
+  #charts { overflow-y: auto; padding: 10px; display: grid; gap: 10px; align-content: start; }
+  .hint { color: var(--muted); padding: 30px; text-align: center; border: 1px dashed var(--border); border-radius: 8px; }
+  .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .chart.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .chart-head { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; padding: 4px 6px 0 8px; min-height: 26px; }
+  .legend-item { display: inline-flex; align-items: center; gap: 5px; padding: 1px 6px; border-radius: 4px;
+    cursor: pointer; font-size: 12px; }
+  .legend-item:hover { background: var(--panel2); text-decoration: line-through; }
+  .legend-item .lv { font-family: ui-monospace, Consolas, monospace; color: var(--muted); }
+  .chart-head .close { margin-left: auto; padding: 0 7px; border: none; background: none; color: var(--muted); font-size: 16px; }
+  .chart-head .close:hover { color: var(--bad); }
+  .chart canvas { display: block; width: 100%; height: 220px; }
+  #logs { height: 140px; overflow-y: auto; background: #0f1115; border-top: 1px solid var(--border);
+    font: 12px/1.45 ui-monospace, Consolas, monospace; padding: 4px 10px; }
+  #logs .t { color: var(--muted); margin-right: 8px; }
+  #logs .w { color: var(--warn); }
+  #logs .b { color: var(--accent); }
+  #logs-bar { display: flex; justify-content: space-between; align-items: center; padding: 2px 10px;
+    background: var(--panel); border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  #logs-bar button { padding: 1px 8px; font-size: 11px; }
+  footer.collapsed #logs { display: none; }
+  #tlm { border-bottom: 1px solid var(--border); padding: 6px 0 4px; }
+  #tlm h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 0 10px 4px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  #tlm h2 select { margin-left: auto; padding: 1px 4px; font-size: 11px; text-transform: none; letter-spacing: 0; }
+  #tlm .none { color: var(--muted); font-size: 12px; padding: 2px 10px 6px; }
+  .ch { display: flex; gap: 7px; align-items: flex-start; padding: 3px 10px; cursor: pointer; }
+  .ch:hover { background: var(--panel2); }
+  .ch input { margin: 2px 0 0; accent-color: var(--accent); cursor: pointer; }
+  .ch .cn { font-weight: 500; }
+  .ch .cv { display: block; color: var(--muted); font-size: 11px; line-height: 1.3; }
+  .ch.pending { opacity: .5; }
+  #tlm .bulk { display: flex; gap: 6px; padding: 4px 10px 2px; }
+  #tlm .bulk button { padding: 1px 8px; font-size: 11px; }
+  .var.off .name, .var.off .val { color: #5b6370; font-style: italic; }
+  .var.off .val::after { content: "off"; }
+  .var.off .val { font-size: 11px; }
+  #cmd { width: 260px; padding: 1px 6px; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
+  @media (max-width: 700px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 160px 1fr; }
+    #sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Hopper Telemetry</h1>
+    <span class="pill" id="conn"><span class="dot"></span><span>connecting…</span></span>
+    <span class="pill" id="serial"><span class="dot"></span><span>serial: ?</span></span>
+    <span class="pill" id="rate">0 lines/s</span>
+    <span class="spacer"></span>
+    <label>Window
+      <select id="window">
+        <option value="2">2 s</option><option value="5">5 s</option><option value="10" selected>10 s</option>
+        <option value="30">30 s</option><option value="60">60 s</option><option value="120">2 min</option>
+        <option value="300">5 min</option>
+      </select>
+    </label>
+    <label>Columns
+      <select id="cols"><option>1</option><option selected>2</option><option>3</option></select>
+    </label>
+    <button id="record" title="Record all incoming telemetry to a CSV file on the Pi">Record</button>
+    <button id="pause" title="Space">Pause</button>
+    <button id="addChart">+ Chart</button>
+    <button id="clear" title="Clear data on the server and in all open pages">Clear</button>
+    <button id="export" title="Download everything the server holds as CSV">Export CSV</button>
+  </header>
+  <main>
+    <aside id="sidebar">
+      <div id="tlm">
+        <h2>Teensy prints
+          <select id="tlmRate" title="Teensy print rate (all channels)" disabled>
+            <option value="10">100 Hz</option><option value="20">50 Hz</option><option value="50">20 Hz</option>
+            <option value="100">10 Hz</option><option value="200">5 Hz</option><option value="1000">1 Hz</option>
+          </select>
+        </h2>
+        <div id="tlmList"><div class="none">Waiting for channel list from the Teensy…</div></div>
+      </div>
+      <input id="filter" placeholder="Filter variables…">
+      <div id="vars"></div>
+    </aside>
+    <section id="charts"></section>
+  </main>
+  <footer id="footer">
+    <div id="logs-bar"><span>Console</span><span>
+      <input id="cmd" placeholder="Send to Teensy, e.g. tlm?  (Enter)" autocomplete="off">
+      <button id="logToggle">Hide</button></span></div>
+    <div id="logs"></div>
+  </footer>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- state ---
+const PALETTE = ["#5aa9e6", "#e06c75", "#6cc070", "#e6b450", "#c678dd", "#56b6c2",
+                 "#f0883e", "#a3be8c", "#ff79c6", "#8be9fd", "#d19a66", "#b48ead"];
+const KEEP_S = 300;                 // seconds of data kept in the browser
+const series = new Map();           // name -> {t:[], v:[], color, el, valEl, lastT}
+let catalog = null;                 // {rate, ch:[{n, on, v}]} from the Teensy (telemetry.h)
+const varChannel = new Map();       // variable name -> channel name
+let charts = [];                    // [{id, names:[], el, canvas, legend, hoverT}]
+let chartSeq = 0;
+let timeOffset = 0;                 // serverTime - localTime
+let paused = false, pauseT = 0;
+let windowS = 10;
+const $ = (id) => document.getElementById(id);
+
+const LS_KEY = "hopperTelemetryLayout";
+function saveLayout() {
+  localStorage.setItem(LS_KEY, JSON.stringify({
+    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value,
+    colors: Object.fromEntries([...series].map(([n, s]) => [n, s.color])),
+  }));
+}
+let savedColors = {};
+function loadLayout() {
+  try {
+    const l = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+    if (!l) return;
+    savedColors = l.colors || {};
+    if (l.window) { windowS = +l.window; $("window").value = l.window; }
+    if (l.cols) $("cols").value = l.cols;
+    (l.charts || []).forEach(names => addChart(names));
+  } catch (e) { console.warn(e); }
+}
+
+const serverNow = () => Date.now() / 1000 + timeOffset;
+const viewEnd = () => paused ? pauseT : serverNow();
+
+// -------------------------------------------------------------- series ---
+function getSeries(name) {
+  let s = series.get(name);
+  if (s) return s;
+  const used = new Set([...series.values()].map(x => x.color));
+  const color = savedColors[name] || PALETTE.find(c => !used.has(c)) || PALETTE[series.size % PALETTE.length];
+  s = { name, t: [], v: [], color, lastT: 0 };
+  const el = document.createElement("div");
+  el.className = "var";
+  el.draggable = true;
+  el.title = "Click: new chart · Drag onto a chart: overlay";
+  el.innerHTML = `<span class="swatch"></span><span class="name"></span><span class="val"></span>`;
+  el.querySelector(".swatch").style.background = color;
+  el.querySelector(".name").textContent = name;
+  el.addEventListener("click", () => {
+    const ch = channelOf(name);
+    if (ch && !ch.on) setChannel(ch.n, true);
+    addChart([name]); saveLayout();
+  });
+  el.addEventListener("dragstart", e => e.dataTransfer.setData("text/plain", name));
+  s.el = el; s.valEl = el.querySelector(".val");
+  series.set(name, s);
+  // keep sidebar sorted
+  const sorted = [...series.keys()].sort((a, b) => a.localeCompare(b));
+  const next = sorted[sorted.indexOf(name) + 1];
+  $("vars").insertBefore(el, next ? series.get(next).el : null);
+  applyFilter();
+  charts.forEach(renderLegend);
+  return s;
+}
+
+function pushSeries(name, ts, vs) {
+  const s = getSeries(name);
+  for (let i = 0; i < ts.length; i++) { s.t.push(ts[i]); s.v.push(vs[i]); }
+  if (ts.length) s.lastT = ts[ts.length - 1];
+}
+
+function trimSeries() {
+  const cutoff = serverNow() - KEEP_S;
+  for (const s of series.values()) {
+    const i = lowerBound(s.t, cutoff);
+    if (i > 0) { s.t.splice(0, i); s.v.splice(0, i); }
+  }
+}
+
+function lowerBound(arr, x) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; }
+  return lo;
+}
+
+function fmt(v) {
+  if (v === undefined || v === null || Number.isNaN(v)) return "–";
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return (Math.round(v * 1e4) / 1e4).toString();
+}
+
+function applyFilter() {
+  const f = $("filter").value.toLowerCase();
+  for (const [n, s] of series) s.el.style.display = n.toLowerCase().includes(f) ? "" : "none";
+}
+
+// -------------------------------------------------------------- charts ---
+function addChart(names = []) {
+  $("charts").querySelector(".hint")?.remove();
+  const c = { id: ++chartSeq, names: [...names], hoverT: null };
+  const el = document.createElement("div");
+  el.className = "chart";
+  el.innerHTML = `<div class="chart-head"><span class="legend"></span><button class="close" title="Remove chart">×</button></div><canvas></canvas>`;
+  c.el = el; c.canvas = el.querySelector("canvas"); c.legend = el.querySelector(".legend");
+  el.querySelector(".close").onclick = () => {
+    charts = charts.filter(x => x !== c); el.remove(); saveLayout(); showHintIfEmpty();
+  };
+  el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("dragover"); });
+  el.addEventListener("dragleave", () => el.classList.remove("dragover"));
+  el.addEventListener("drop", e => {
+    e.preventDefault(); el.classList.remove("dragover");
+    const n = e.dataTransfer.getData("text/plain");
+    if (n && !c.names.includes(n)) { c.names.push(n); renderLegend(c); saveLayout(); }
+  });
+  c.canvas.addEventListener("mousemove", e => {
+    const r = c.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, plotL = 56, plotR = r.width - 10;
+    if (x < plotL || x > plotR) { c.hoverT = null; return; }
+    c.hoverT = viewEnd() - windowS + (x - plotL) / (plotR - plotL) * windowS;
+  });
+  c.canvas.addEventListener("mouseleave", () => { c.hoverT = null; });
+  charts.push(c);
+  $("charts").appendChild(el);
+  renderLegend(c);
+  return c;
+}
+
+function showHintIfEmpty() {
+  if (charts.length) return;
+  const h = document.createElement("div");
+  h.className = "hint";
+  h.textContent = "Click a variable on the left to plot it. Drag variables onto a chart to overlay them.";
+  $("charts").appendChild(h);
+}
+
+function renderLegend(c) {
+  c.legend.innerHTML = "";
+  c.legendVals = {};
+  for (const n of c.names) {
+    const s = series.get(n);
+    const it = document.createElement("span");
+    it.className = "legend-item";
+    it.title = "Click to remove from chart";
+    it.innerHTML = `<span class="swatch" style="width:10px;height:10px;border-radius:2px;display:inline-block"></span><span class="ln"></span><span class="lv"></span>`;
+    it.querySelector(".swatch").style.background = s ? s.color : "#555";
+    it.querySelector(".ln").textContent = n;
+    it.onclick = () => { c.names = c.names.filter(x => x !== n); renderLegend(c); saveLayout(); };
+    c.legendVals[n] = it.querySelector(".lv");
+    c.legend.appendChild(it);
+  }
+}
+
+function niceTicks(min, max, count) {
+  const span = max - min;
+  if (!(span > 0)) return [min];
+  const raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-9; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+
+function valueAt(s, t) {
+  const i = lowerBound(s.t, t);
+  if (i === 0) return s.t.length ? s.v[0] : undefined;
+  if (i >= s.t.length) return s.v[s.v.length - 1];
+  return (t - s.t[i - 1] < s.t[i] - t) ? s.v[i - 1] : s.v[i];
+}
+
+function drawChart(c, tEnd) {
+  const cv = c.canvas, dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+
+  const L = 56, R = W - 10, T = 8, B = H - 22;
+  const t0 = tEnd - windowS;
+
+  // visible ranges + y extent
+  let ymin = Infinity, ymax = -Infinity;
+  const vis = [];
+  for (const n of c.names) {
+    const s = series.get(n);
+    if (!s) continue;
+    const a = Math.max(0, lowerBound(s.t, t0) - 1), b = Math.min(s.t.length, lowerBound(s.t, tEnd) + 1);
+    for (let i = a; i < b; i++) { const v = s.v[i]; if (v < ymin) ymin = v; if (v > ymax) ymax = v; }
+    vis.push([s, a, b, n]);
+  }
+  if (!isFinite(ymin)) { ymin = -1; ymax = 1; }
+  if (ymin === ymax) { ymin -= Math.abs(ymin) * 0.1 || 1; ymax += Math.abs(ymax) * 0.1 || 1; }
+  const pad = (ymax - ymin) * 0.06; ymin -= pad; ymax += pad;
+
+  const X = t => L + (t - t0) / windowS * (R - L);
+  const Y = v => B - (v - ymin) / (ymax - ymin) * (B - T);
+
+  // grid + axes
+  g.font = "11px ui-monospace, Consolas, monospace";
+  g.strokeStyle = "#2a2f38"; g.fillStyle = "#8590a2"; g.lineWidth = 1;
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (const v of niceTicks(ymin, ymax, Math.max(2, Math.floor((B - T) / 40)))) {
+    const y = Math.round(Y(v)) + 0.5;
+    g.beginPath(); g.moveTo(L, y); g.lineTo(R, y); g.stroke();
+    g.fillText(fmt(v), L - 6, y);
+  }
+  g.textAlign = "center"; g.textBaseline = "top";
+  for (const dt of niceTicks(-windowS, 0, Math.max(2, Math.floor((R - L) / 80)))) {
+    const x = Math.round(X(tEnd + dt)) + 0.5;
+    g.beginPath(); g.moveTo(x, T); g.lineTo(x, B); g.stroke();
+    g.textAlign = dt === 0 ? "right" : "center";
+    g.fillText(dt === 0 ? "now" : `${fmt(dt)}s`, dt === 0 ? R : x, B + 5);
+  }
+  if (ymin < 0 && ymax > 0) {
+    g.strokeStyle = "#3b4250"; const y = Math.round(Y(0)) + 0.5;
+    g.beginPath(); g.moveTo(L, y); g.lineTo(R, y); g.stroke();
+  }
+
+  // traces (min/max decimation per pixel column when dense)
+  g.save();
+  g.beginPath(); g.rect(L, T, R - L, B - T); g.clip();
+  g.lineWidth = 1.5; g.lineJoin = "round";
+  for (const [s, a, b] of vis) {
+    g.strokeStyle = s.color;
+    g.beginPath();
+    const dense = (b - a) > 2 * (R - L);
+    if (!dense) {
+      for (let i = a; i < b; i++) { const x = X(s.t[i]), y = Y(s.v[i]); i === a ? g.moveTo(x, y) : g.lineTo(x, y); }
+    } else {
+      let col = -1, lo = 0, hi = 0, first = true;
+      const flush = () => { if (col < 0) return; first ? g.moveTo(col, Y(lo)) : g.lineTo(col, Y(lo)); g.lineTo(col, Y(hi)); first = false; };
+      for (let i = a; i < b; i++) {
+        const x = Math.round(X(s.t[i])), v = s.v[i];
+        if (x !== col) { flush(); col = x; lo = hi = v; }
+        else { if (v < lo) lo = v; if (v > hi) hi = v; }
+      }
+      flush();
+    }
+    g.stroke();
+  }
+  g.restore();
+
+  // hover cursor + legend values
+  const ht = c.hoverT != null ? c.hoverT : null;
+  if (ht != null) {
+    const x = Math.round(X(ht)) + 0.5;
+    g.strokeStyle = "#8590a2"; g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(x, T); g.lineTo(x, B); g.stroke(); g.setLineDash([]);
+    g.fillStyle = "#d8dee9"; g.textAlign = "left"; g.textBaseline = "top";
+    g.fillText(`${fmt(ht - tEnd)}s`, Math.min(x + 4, R - 50), T + 2);
+    for (const [s] of vis) {
+      const v = valueAt(s, ht);
+      if (v === undefined) continue;
+      g.fillStyle = s.color; g.beginPath(); g.arc(x, Y(v), 3, 0, 2 * Math.PI); g.fill();
+    }
+  }
+  for (const n of c.names) {
+    const s = series.get(n), el = c.legendVals && c.legendVals[n];
+    if (!el) continue;
+    const v = !s ? undefined : (ht != null ? valueAt(s, ht) : (paused ? valueAt(s, tEnd) : s.v[s.v.length - 1]));
+    el.textContent = fmt(v);
+  }
+}
+
+// --------------------------------------------------------------- render ---
+let lastSidebar = 0;
+function frame() {
+  const tEnd = viewEnd();
+  for (const c of charts) drawChart(c, tEnd);
+  const now = performance.now();
+  if (now - lastSidebar > 100) {          // sidebar values at 10 Hz
+    lastSidebar = now;
+    const sn = serverNow();
+    for (const s of series.values()) {
+      s.valEl.textContent = fmt(s.v[s.v.length - 1]);
+      const ch = channelOf(s.name);
+      s.el.classList.toggle("off", !!ch && !ch.on);
+      s.el.classList.toggle("stale", sn - s.lastT > 2);
+      if (ch && !ch.on) s.valEl.textContent = "";
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------- teensy prints ---
+function channelOf(varName) {
+  if (!catalog) return null;
+  const n = varChannel.get(varName);
+  return n ? catalog.ch.find(c => c.n === n) : null;
+}
+
+function post(url, body) {
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    .then(r => { if (!r.ok) addLog(serverNow(), "[page] command not sent: is the Teensy connected?"); });
+}
+
+function setChannel(name, on) {
+  const row = document.querySelector(`.ch[data-ch="${CSS.escape(name)}"]`);
+  if (row) row.classList.add("pending");     // cleared when the Teensy confirms
+  post("tlm", { channel: name, on });
+}
+
+function renderCatalog(cat) {
+  catalog = cat && Array.isArray(cat.ch) ? cat : null;
+  const list = $("tlmList"), rate = $("tlmRate");
+  list.innerHTML = "";
+  varChannel.clear();
+  rate.disabled = !catalog;
+  if (!catalog) {
+    list.innerHTML = `<div class="none">No channel list from the Teensy (not connected, or firmware without telemetry.h).</div>`;
+    return;
+  }
+  if (![...rate.options].some(o => +o.value === catalog.rate)) rate.add(new Option(`${catalog.rate} ms`, catalog.rate));
+  rate.value = catalog.rate;
+  for (const ch of catalog.ch) {
+    const vars = (ch.v || "").split(/\s+/).filter(Boolean);
+    vars.forEach(v => { varChannel.set(v, ch.n); getSeries(v); });   // list every printable variable
+    const row = document.createElement("label");
+    row.className = "ch";
+    row.dataset.ch = ch.n;
+    row.innerHTML = `<input type="checkbox"><span><span class="cn"></span><span class="cv"></span></span>`;
+    row.querySelector("input").checked = !!ch.on;
+    row.querySelector(".cn").textContent = ch.n;
+    row.querySelector(".cv").textContent = vars.join(", ");
+    row.querySelector("input").onchange = e => setChannel(ch.n, e.target.checked);
+    list.appendChild(row);
+  }
+  const bulk = document.createElement("div");
+  bulk.className = "bulk";
+  bulk.innerHTML = `<button data-on="1">All on</button><button data-on="0">All off</button>`;
+  bulk.querySelectorAll("button").forEach(b => b.onclick = () => setChannel("all", b.dataset.on === "1"));
+  list.appendChild(bulk);
+}
+
+// ------------------------------------------------------------------ logs ---
+function addLog(t, text) {
+  const box = $("logs");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 5;
+  const line = document.createElement("div");
+  const d = new Date(t * 1000);
+  const ts = d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0");
+  line.innerHTML = `<span class="t"></span><span></span>`;
+  line.firstChild.textContent = ts;
+  line.lastChild.textContent = text;
+  if (/warn|error|fail|stale|halt/i.test(text)) line.lastChild.className = "w";
+  else if (text.startsWith("[bridge]")) line.lastChild.className = "b";
+  box.appendChild(line);
+  while (box.childElementCount > 500) box.firstChild.remove();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// ------------------------------------------------------------ transport ---
+function setPill(id, text, color) {
+  const p = $(id);
+  p.lastChild.textContent = text;
+  p.querySelector(".dot").style.background = color;
+}
+
+function applyStatus(st) {
+  if (!st) return;
+  const s = st.serial || "?";
+  const color = /connected|demo/.test(s) && !/dis/.test(s) ? "var(--ok)" : /waiting|starting/.test(s) ? "var(--warn)" : "var(--bad)";
+  setPill("serial", `serial: ${s}${st.port && !/demo/.test(s) ? " · " + st.port : ""}`, color);
+  if (st.rate !== undefined) $("rate").textContent = `${Math.round(st.rate)} lines/s`;
+  if ("recording" in st) {
+    const r = $("record"), on = !!st.recording;
+    r.classList.toggle("recording", on);
+    r.textContent = on ? "Stop recording" : "Record";
+    r.title = on ? `Recording on the Pi: recordings/${st.recording}` : "Record all incoming telemetry to a CSV file on the Pi";
+  }
+}
+
+function resetData() {
+  for (const s of series.values()) { s.t = []; s.v = []; s.lastT = 0; }
+  $("logs").innerHTML = "";
+}
+
+function connect() {
+  const es = new EventSource("events");
+  es.onopen = () => setPill("conn", "live", "var(--ok)");
+  es.onerror = () => setPill("conn", "reconnecting…", "var(--bad)");
+  es.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.now) timeOffset = m.now - Date.now() / 1000;
+    if (m.type === "snapshot" || m.type === "clear") resetData();
+    if (m.series) for (const [n, [ts, vs]] of Object.entries(m.series)) pushSeries(n, ts, vs);
+    if (m.logs) for (const [t, txt] of m.logs) addLog(t, txt);
+    applyStatus(m.status);
+    if ("tlm" in m) renderCatalog(m.tlm);
+  };
+}
+
+// ------------------------------------------------------------------- UI ---
+function setCols() { $("charts").style.gridTemplateColumns = `repeat(${$("cols").value}, minmax(0, 1fr))`; }
+function togglePause() {
+  paused = !paused; pauseT = serverNow();
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  $("pause").classList.toggle("active", paused);
+}
+$("pause").onclick = togglePause;
+$("record").onclick = () => post("record", { on: !$("record").classList.contains("recording") });
+document.addEventListener("keydown", e => {
+  if (e.code === "Space" && e.target.tagName !== "INPUT") { e.preventDefault(); togglePause(); }
+});
+$("window").onchange = e => { windowS = +e.target.value; saveLayout(); };
+$("cols").onchange = () => { setCols(); saveLayout(); };
+$("addChart").onclick = () => { addChart([]); saveLayout(); };
+$("filter").oninput = applyFilter;
+$("clear").onclick = () => { if (confirm("Clear all telemetry data on the server?")) fetch("clear", { method: "POST" }); };
+$("export").onclick = () => { location.href = "export.csv"; };
+$("tlmRate").onchange = e => post("tlm", { rate: +e.target.value });
+$("cmd").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || !e.target.value.trim()) return;
+  post("send", { text: e.target.value.trim() });
+  e.target.value = "";
+});
+$("logToggle").onclick = () => {
+  const f = $("footer"); f.classList.toggle("collapsed");
+  $("logToggle").textContent = f.classList.contains("collapsed") ? "Show" : "Hide";
+};
+
+loadLayout();
+setCols();
+showHintIfEmpty();
+setInterval(trimSeries, 1000);
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

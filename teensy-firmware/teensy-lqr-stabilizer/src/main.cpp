@@ -7,6 +7,43 @@
 #include "xsens_mti.h"      // Main library
 #include "xsens_utility.h"  // Needed for quaternion conversion function
 
+#include "telemetry.h"
+
+/* Telemetry channels ----------------------------------------------------------
+ * Switchable at runtime from the web dashboard (or a serial monitor, see
+ * telemetry.h). The 'enabled' column is the default after boot.
+ * To add a print: add an enum entry + table row (same order), then print it in
+ * the telemetry block at the end of loop().
+ */
+enum TelemetryChannelId : size_t {
+  TLM_IMU_AGE,
+  TLM_LQR_TORQUE,
+  TLM_LQR_STATE,
+  TLM_FLIGHT,
+  TLM_EULER,
+  TLM_ACCEL,
+  TLM_BUS_VOLTAGE,
+  TLM_WHEELS,
+  TLM_COUNT
+};
+
+TelemetryChannel telemetryChannels[] = {
+  // name           variables                                                   enabled
+  { "imu_age",      "QuatAgeMs GyroAgeMs",                                      true  },
+  { "lqr_torque",   "LQR-tau-x LQR-tau-y LQR-tau-z",                            true  },
+  { "lqr_state",    "qe-x qe-y qe-z omega-x omega-y omega-z",                   false },
+  { "flight",       "AccelerationMagnitude Airborne",                           true  },
+  { "euler",        "Roll Pitch Yaw",                                           false },
+  { "accel",        "AccelX AccelY AccelZ",                                     false },
+  { "bus_voltage",  "BusVoltage",                                               false },
+  { "wheels",       "odrv0-pos odrv0-vel odrv1-pos odrv1-vel odrv2-pos odrv2-vel", false },
+};
+static_assert(sizeof(telemetryChannels) / sizeof(telemetryChannels[0]) == TLM_COUNT,
+              "telemetryChannels must have one row per TelemetryChannelId");
+
+// 20 ms = 50 Hz default print rate (changeable at runtime with "tlm rate <ms>")
+Telemetry telemetry(telemetryChannels, TLM_COUNT, 20);
+
 //MTI vars
 // Cache a copy of IMU data
 float    temperature     = 0;       // in degress celcius
@@ -492,6 +529,7 @@ void setup() {
 
 
   Serial.println("Starting ODriveCAN demo");
+  telemetry.printCatalog(Serial, true);
 
   // Register callbacks for the heartbeat and encoder feedback messages
   odrv0.onFeedback(onFeedback, &odrv0_user_data);
@@ -599,11 +637,11 @@ void loop() {
 
   updateFlightState(millis());
 
+  // Telemetry on/off commands from the dashboard / serial monitor (non-blocking)
+  telemetry.poll(Serial);
+
   static uint32_t lastTorqueCommandMs = 0;
   uint32_t now = millis();
-
-  static uint32_t lastPrintMs = 0;
-  uint32_t nowPrint = millis();
 
   //100 hz LQR control loop
   if ((uint32_t)(now - lastTorqueCommandMs) >= 10) {
@@ -630,77 +668,59 @@ void loop() {
     }
   }
 
-  // print position and velocity for Serial Plotter - maybe should be put in a callback function or whatever, and the prints into the rate limited print
-  if (odrv0_user_data.received_feedback) {
-    Get_Encoder_Estimates_msg_t feedback = odrv0_user_data.last_feedback;
-    odrv0_user_data.received_feedback = false;
-    //Serial.print(">odrv0-pos:");
-    //Serial.println(feedback.Pos_Estimate);
-    //Serial.print(">odrv0-vel:");
-    //Serial.println(feedback.Vel_Estimate);
+  // Telemetry: rate limited (default 50 Hz). Printing every channel at a high
+  // rate costs loop time and the CAN line gets unhappy, so keep unneeded
+  // channels off. Switch them from the dashboard instead of commenting out.
+  if (telemetry.due(millis())) {
+    const uint32_t nowPrint = millis();
+
+    // -1 age means that IMU output has never been received.
+    if (telemetry.on(TLM_IMU_AGE)) {
+      Telemetry::value(Serial, "QuatAgeMs", receivedQuaternion ? (long)(nowPrint - lastQuaternionMs) : -1L);
+      Telemetry::value(Serial, "GyroAgeMs", receivedGyro ? (long)(nowPrint - lastGyroMs) : -1L);
+    }
+    if (telemetry.on(TLM_LQR_TORQUE)) {
+      Telemetry::value(Serial, "LQR-tau-x", lqr_torque[TAU_X]);
+      Telemetry::value(Serial, "LQR-tau-y", lqr_torque[TAU_Y]);
+      Telemetry::value(Serial, "LQR-tau-z", lqr_torque[TAU_Z]);
+    }
+    if (telemetry.on(TLM_LQR_STATE)) {
+      Telemetry::value(Serial, "qe-x", lqr_state[0]);
+      Telemetry::value(Serial, "qe-y", lqr_state[1]);
+      Telemetry::value(Serial, "qe-z", lqr_state[2]);
+      Telemetry::value(Serial, "omega-x", lqr_state[3]);
+      Telemetry::value(Serial, "omega-y", lqr_state[4]);
+      Telemetry::value(Serial, "omega-z", lqr_state[5]);
+    }
+    if (telemetry.on(TLM_FLIGHT)) {
+      Telemetry::value(Serial, "AccelerationMagnitude", accelerationMagnitude, 2);
+      Telemetry::value(Serial, "Airborne",
+                       (flightState == FlightState::AIRBORNE_WAITING_FOR_FLIGHT ||
+                        flightState == FlightState::AIRBORNE_LANDING_ARMED) ? 1L : 0L);
+    }
+    if (telemetry.on(TLM_EULER)) {
+      Telemetry::value(Serial, "Roll", euler_pry[0], 2);
+      Telemetry::value(Serial, "Pitch", euler_pry[1], 2);
+      Telemetry::value(Serial, "Yaw", euler_pry[2], 2);
+    }
+    if (telemetry.on(TLM_ACCEL)) {
+      Telemetry::value(Serial, "AccelX", acceleration[0], 2);
+      Telemetry::value(Serial, "AccelY", acceleration[1], 2);
+      Telemetry::value(Serial, "AccelZ", acceleration[2], 2);
+    }
+    if (telemetry.on(TLM_BUS_VOLTAGE) && busVoltageIsFresh) {
+      Telemetry::value(Serial, "BusVoltage", odrv0_user_data.last_bus_voltage_current.Bus_Voltage, 2);
+    }
+    if (telemetry.on(TLM_WHEELS)) {
+      static const char* const posNames[] = {"odrv0-pos", "odrv1-pos", "odrv2-pos"};
+      static const char* const velNames[] = {"odrv0-vel", "odrv1-vel", "odrv2-vel"};
+      for (size_t i = 0; i < 3; ++i) {
+        if (!odrive_user_data[i]->received_feedback) continue;
+        Telemetry::value(Serial, posNames[i], odrive_user_data[i]->last_feedback.Pos_Estimate);
+        Telemetry::value(Serial, velNames[i], odrive_user_data[i]->last_feedback.Vel_Estimate);
+      }
+    }
   }
-
-  //50 hz print rate for serial plotter otherwise bogs system down, and the CAN line gets unhappy :(
-  if ((uint32_t)(nowPrint - lastPrintMs) >= 20) {
-    lastPrintMs = nowPrint;
-
-    /*
-    if (busVoltageIsFresh) {
-      Serial.print(">BusVoltage:");
-      Serial.println(odrv0_user_data.last_bus_voltage_current.Bus_Voltage, 2);
-    }*/
-
-    /*
-    Serial.print(">LQR-tau-x:");
-    Serial.println(lqr_torque[TAU_X], 4);
-    Serial.print(">LQR-tau-y:");
-    Serial.println(lqr_torque[TAU_Y], 4);
-    Serial.print(">LQR-tau-z:");
-    Serial.println(lqr_torque[TAU_Z], 4);
-    Serial.print(">qe-x:");
-    Serial.println(lqr_state[0], 4);
-    Serial.print(">qe-y:");
-    Serial.println(lqr_state[1], 4);
-    Serial.print(">qe-z:");
-    Serial.println(lqr_state[2], 4);
-    Serial.print(">omega-x:");
-    Serial.println(lqr_state[3], 4);
-    Serial.print(">omega-y:");
-    Serial.println(lqr_state[4], 4);
-    Serial.print(">omega-z:");
-    Serial.println(lqr_state[5], 4);*/
-
-    // LQR diagnostics: -1 age means that IMU output has never been received.
-    Serial.print(">QuatAgeMs:");
-    Serial.println(receivedQuaternion ? (long)(nowPrint - lastQuaternionMs) : -1L);
-    Serial.print(">GyroAgeMs:");
-    Serial.println(receivedGyro ? (long)(nowPrint - lastGyroMs) : -1L);
-    Serial.print(">LQR-tau-x:");
-    Serial.println(lqr_torque[TAU_X], 4);
-    Serial.print(">LQR-tau-y:");
-    Serial.println(lqr_torque[TAU_Y], 4);
-    Serial.print(">LQR-tau-z:");
-    Serial.println(lqr_torque[TAU_Z], 4);
-
-    Serial.print(">AccelerationMagnitude:");
-    Serial.println(accelerationMagnitude);
-    Serial.print(">Airborne:");
-    Serial.println(
-        flightState == FlightState::AIRBORNE_WAITING_FOR_FLIGHT ||
-                flightState == FlightState::AIRBORNE_LANDING_ARMED
-            ? 1
-            : 0);
-
-/*
-    Serial.print(">Roll:");
-    Serial.println(euler_pry[0]);
-    Serial.print(">Pitch:");
-    Serial.println(euler_pry[1]);
-    Serial.print(">Yaw:");
-    Serial.println(euler_pry[2]);*/
-
-  }
-
 }
 
 // Called when the library decoded an inbound packet
@@ -719,21 +739,13 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 lastQuaternionMs = millis();
                 receivedQuaternion = true;
 
-                // Convert the quaternion to euler angles (for printing only)
+                // Convert the quaternion to euler angles (telemetry 'euler' channel only)
                 xsens_quaternion_to_euler( mtdata->data.f4x4, euler_pry );
 
                 // Convert from radians to degrees
                 euler_pry[0] *= (180.0 / PI);
                 euler_pry[1] *= (180.0 / PI);
                 euler_pry[2] *= (180.0 / PI);
-
-                // Output to PC formatted for the Arduino Serial Plotter
-                /*Serial.print(">Roll:");
-                Serial.println(euler_pry[0]);
-                Serial.print(">Pitch:");
-                Serial.println(euler_pry[1]);
-                Serial.print(">Yaw:");
-                Serial.println(euler_pry[2]); */
             }
             break;
 
@@ -746,13 +758,6 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 acceleration[2] = mtdata->data.f4x3[2];
                 lastAccelerationMs = millis();
                 ++accelerationSampleCount;
-
-                /*Serial.print(">AccelX:");
-                Serial.println(acceleration[0]);
-                Serial.print(">AccelY:");
-                Serial.println(acceleration[1]);
-                Serial.print(">AccelZ:");
-                Serial.println(acceleration[2]);*/
             }
             break;
 

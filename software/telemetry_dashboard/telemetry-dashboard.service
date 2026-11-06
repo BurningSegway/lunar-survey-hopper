@@ -1,0 +1,19 @@
+# systemd unit: start the telemetry dashboard on boot on the Raspberry Pi.
+# Adjust User and the paths, then:
+#   sudo cp telemetry-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telemetry-dashboard
+#   journalctl -u telemetry-dashboard -f      # logs
+[Unit]
+Description=Hopper serial telemetry web dashboard
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/lunar-survey-hopper/software/telemetry_dashboard
+ExecStart=/usr/bin/python3 telemetry_server.py --http-port 8080
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
