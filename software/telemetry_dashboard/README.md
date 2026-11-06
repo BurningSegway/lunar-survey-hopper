@@ -59,6 +59,12 @@ in the comments at the top of that file.
 * **Space** (or the Pause button) freezes the view while data keeps being collected.
 * **Window** sets the visible time span. **Columns** sets the chart grid layout.
 * The chart layout is saved in the browser (localStorage), so it comes back after a reload.
+* **Cube** opens a 3D attitude view. It shows the hopper as a cube rotated by the attitude the Teensy reports, inside the
+  IMU's inertial frame (Xsens default ENU: X = East, Y = North, Z = Up, dashed axes over a ground grid). Body axes
+  are solid (x red, y green, z blue), and the faces are labelled ±X/±Y/±Z.
+  It uses the `quat` channel (q-w..q-z) when that is printing, and falls back to `euler` (Roll/Pitch/Yaw, Z-Y-X).
+  If neither is on, opening the cube switches `quat` on. Drag to orbit the view, and double-click to reset it.
+  When paused, the cube shows the paused moment. Hovering over any chart shows the attitude at that point in time.
 * **Record / Stop recording** writes everything that arrives (all variables plus console lines) to a file on the Pi.
 * **Export CSV** downloads the server's in-memory history as a wide table, like Teleplot's export. This covers all
   variables since the server started or since the last **Clear**, up to 50,000 points per variable

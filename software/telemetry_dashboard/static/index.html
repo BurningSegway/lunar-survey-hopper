@@ -75,6 +75,9 @@
   .var.off .name, .var.off .val { color: #5b6370; font-style: italic; }
   .var.off .val::after { content: "off"; }
   .var.off .val { font-size: 11px; }
+  .chart.cube canvas { height: 340px; cursor: grab; touch-action: none; }
+  .chart.cube canvas:active { cursor: grabbing; }
+  .cube-info { font: 12px ui-monospace, Consolas, monospace; color: var(--muted); margin-left: 6px; }
   #cmd { width: 260px; padding: 1px 6px; background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
   @media (max-width: 700px) {
@@ -103,6 +106,7 @@
     </label>
     <button id="record" title="Record all incoming telemetry to a CSV file on the Pi">Record</button>
     <button id="pause" title="Space">Pause</button>
+    <button id="cubeBtn" title="3D attitude view (needs the quat or euler channel)">Cube</button>
     <button id="addChart">+ Chart</button>
     <button id="clear" title="Clear data on the server and in all open pages">Clear</button>
     <button id="export" title="Download everything the server holds as CSV">Export CSV</button>
@@ -150,7 +154,7 @@ const $ = (id) => document.getElementById(id);
 const LS_KEY = "hopperTelemetryLayout";
 function saveLayout() {
   localStorage.setItem(LS_KEY, JSON.stringify({
-    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value,
+    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value, cube: !!cube,
     colors: Object.fromEntries([...series].map(([n, s]) => [n, s.color])),
   }));
 }
@@ -163,6 +167,7 @@ function loadLayout() {
     if (l.window) { windowS = +l.window; $("window").value = l.window; }
     if (l.cols) $("cols").value = l.cols;
     (l.charts || []).forEach(names => addChart(names));
+    if (l.cube) toggleCube(true, false);
   } catch (e) { console.warn(e); }
 }
 
@@ -264,7 +269,7 @@ function addChart(names = []) {
 }
 
 function showHintIfEmpty() {
-  if (charts.length) return;
+  if (charts.length || cube || $("charts").querySelector(".hint")) return;
   const h = document.createElement("div");
   h.className = "hint";
   h.textContent = "Click a variable on the left to plot it. Drag variables onto a chart to overlay them.";
@@ -403,11 +408,199 @@ function drawChart(c, tEnd) {
   }
 }
 
+// ----------------------------------------------------------------- cube ---
+// Attitude viewer: the hopper as a cube, rotated by the Teensy's attitude inside
+// the IMU's inertial frame (Xsens default ENU: X = East, Y = North, Z = Up).
+// Source: the quat channel (q-w..q-z, body -> inertial) when available, else
+// Roll/Pitch/Yaw in degrees, Z-Y-X convention as in xsens_quaternion_to_euler().
+const CUBE_VIEW = { az: -55 * Math.PI / 180, el: 25 * Math.PI / 180 };
+let cube = null;
+
+function toggleCube(show = !cube, userAction = true) {
+  if (!show) {
+    if (cube) { cube.el.remove(); cube = null; }
+    $("cubeBtn").classList.remove("active");
+    saveLayout(); showHintIfEmpty();
+    return;
+  }
+  if (cube) return;
+  const el = document.createElement("div");
+  el.className = "chart cube";
+  el.innerHTML = `<div class="chart-head"><span class="legend-item" style="cursor:default;text-decoration:none">Attitude</span>` +
+    `<span class="cube-info"></span><button class="close" title="Close">×</button></div><canvas title="Drag to rotate the view, double-click to reset"></canvas>`;
+  cube = { el, canvas: el.querySelector("canvas"), info: el.querySelector(".cube-info"), ...CUBE_VIEW, drag: null };
+  el.querySelector(".close").onclick = () => toggleCube(false);
+  const cv = cube.canvas;
+  cv.addEventListener("pointerdown", e => { cube.drag = [e.clientX, e.clientY, cube.az, cube.el]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener("pointermove", e => {
+    if (!cube.drag) return;
+    const [x0, y0, az0, el0] = cube.drag;
+    cube.az = az0 - (e.clientX - x0) * 0.01;
+    cube.el = Math.max(-1.45, Math.min(1.45, el0 + (e.clientY - y0) * 0.01));
+  });
+  cv.addEventListener("pointerup", () => { cube.drag = null; });
+  cv.addEventListener("dblclick", () => Object.assign(cube, CUBE_VIEW));
+  $("charts").querySelector(".hint")?.remove();
+  $("charts").prepend(el);
+  $("cubeBtn").classList.add("active");
+  if (userAction) { ensureAttitudeChannel(); saveLayout(); }
+}
+
+// Opening the cube switches on an attitude channel if none is printing.
+function ensureAttitudeChannel() {
+  if (!catalog) return;
+  const q = catalog.ch.find(c => c.n === "quat"), e = catalog.ch.find(c => c.n === "euler");
+  if ((q && q.on) || (e && e.on)) return;
+  const pick = q || e;
+  if (pick) setChannel(pick.n, true);
+}
+
+// Sample of a series closest to time t (null if none within 0.5 s).
+function nearest(name, t) {
+  const s = series.get(name);
+  if (!s || !s.t.length) return null;
+  let i = lowerBound(s.t, t);
+  if (i >= s.t.length) i = s.t.length - 1;
+  else if (i > 0 && t - s.t[i - 1] < s.t[i] - t) i--;
+  return Math.abs(s.t[i] - t) < 0.5 ? s.v[i] : null;
+}
+
+function attitudeAt(t) {
+  const q = ["q-w", "q-x", "q-y", "q-z"].map(n => nearest(n, t));
+  if (q.every(v => v != null)) {
+    const n = Math.hypot(...q);
+    if (n > 0.5) return { q: q.map(v => v / n), src: "quat" };
+  }
+  const e = ["Roll", "Pitch", "Yaw"].map(n => nearest(n, t));
+  if (e.every(v => v != null)) {
+    const [cr, cp, cy] = e.map(d => Math.cos(d * Math.PI / 360));
+    const [sr, sp, sy] = e.map(d => Math.sin(d * Math.PI / 360));
+    return { q: [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                 cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy], src: "euler" };
+  }
+  return null;
+}
+
+function quatToEulerDeg([w, x, y, z]) {
+  const d = 180 / Math.PI;
+  return [Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)) * d,
+          Math.asin(Math.max(-1, Math.min(1, 2 * (w * y - z * x)))) * d,
+          Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) * d];
+}
+
+function quatToMatrix([w, x, y, z]) {   // body -> inertial
+  return [[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+          [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+          [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]];
+}
+const mulMV = (M, v) => M.map(r => r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => { const n = Math.hypot(...a); return a.map(v => v / n); };
+
+function drawCube(tView) {
+  const cv = cube.canvas, dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+
+  // hovering a chart scrubs the cube to that moment
+  const hovered = charts.find(c => c.hoverT != null);
+  const t = hovered ? hovered.hoverT : tView;
+  const att = attitudeAt(t);
+
+  // camera orbiting the origin, inertial Z up
+  const D = 7, cam = [D * Math.cos(cube.el) * Math.cos(cube.az), D * Math.cos(cube.el) * Math.sin(cube.az), D * Math.sin(cube.el)];
+  const fwd = norm(cam.map(v => -v)), right = norm(cross(fwd, [0, 0, 1])), up = cross(right, fwd);
+  const F = 1.45 * Math.min(W, H);
+  const P = p => { const d = [p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]], z = dot(d, fwd);
+                   return [W / 2 + F * dot(d, right) / z, H / 2 - F * dot(d, up) / z]; };
+  const line = (a, b, color, width = 1, dash = []) => {
+    const [x0, y0] = P(a), [x1, y1] = P(b);
+    g.strokeStyle = color; g.lineWidth = width; g.setLineDash(dash);
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); g.setLineDash([]);
+  };
+  const label = (p, text, color, bold = false) => {
+    const [x, y] = P(p);
+    g.fillStyle = color; g.font = `${bold ? "600 " : ""}12px system-ui, sans-serif`;
+    g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(text, x, y);
+  };
+
+  // ground grid (inertial XY plane, below the cube) + inertial axes
+  const gz = -1.5;
+  for (let v = -2; v <= 2.001; v += 0.5) {
+    line([v, -2, gz], [v, 2, gz], "#252a32"); line([-2, v, gz], [2, v, gz], "#252a32");
+  }
+  const AX = [["#e06c75", "X·E"], ["#6cc070", "Y·N"], ["#5aa9e6", "Z·U"]];
+  for (let i = 0; i < 3; i++) {
+    const tip = [0, 0, 0]; tip[i] = 2.1;
+    const lab = [0, 0, 0]; lab[i] = 2.35;
+    line([0, 0, 0], tip, AX[i][0] + "99", 1.5, [5, 4]);
+    label(lab, AX[i][1], AX[i][0] + "cc");
+  }
+
+  if (!att) {
+    cube.info.textContent = "no attitude data: turn on the quat or euler channel";
+    return;
+  }
+  const R = quatToMatrix(att.q);
+  const [roll, pitch, yaw] = quatToEulerDeg(att.q);
+  cube.info.textContent = `R ${roll.toFixed(1)}°  P ${pitch.toFixed(1)}°  Y ${yaw.toFixed(1)}°  (${att.src}` +
+    `${hovered ? `, ${fmt(t - viewEnd())}s` : paused ? ", paused" : ""})`;
+
+  // cube faces: body axis i, sign sgn; visible if its outward normal faces the camera
+  const h = 0.75, toW = v => mulMV(R, v);
+  const faces = [];
+  for (let i = 0; i < 3; i++) for (const sgn of [1, -1]) {
+    const n = [0, 0, 0]; n[i] = sgn;
+    const a = (i + 1) % 3, b = (i + 2) % 3;
+    const corners = [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([u, v]) => {
+      const p = [0, 0, 0]; p[i] = sgn * h; p[a] = u * h; p[b] = v * h; return toW(p);
+    });
+    const nw = toW(n), center = nw.map(v => v * h);
+    const visible = dot(nw, cam.map((c, k) => c - center[k])) > 0;
+    faces.push({ i, sgn, corners, nw, center, visible });
+  }
+  const BASE = [[224, 108, 117], [108, 192, 112], [90, 169, 230]];
+  const light = norm([0.3, -0.5, 1]);
+  const bodyAxis = i => {
+    const from = [0, 0, 0]; from[i] = h;
+    const to = [0, 0, 0]; to[i] = 1.55;
+    const lab = [0, 0, 0]; lab[i] = 1.75;
+    line(toW(from), toW(to), AX[i][0], 3);
+    label(toW(lab), "xyz"[i], AX[i][0], true);
+  };
+  // +axes whose face points away are drawn first so the cube hides them
+  for (const f of faces) if (f.sgn > 0 && !f.visible) bodyAxis(f.i);
+  for (const f of faces) {
+    if (!f.visible) continue;
+    const shade = 0.45 + 0.55 * Math.max(0, dot(f.nw, light));
+    const k = (f.sgn > 0 ? 1 : 0.55) * shade;
+    const [r, gg, b] = BASE[f.i].map(c => Math.round(c * k));
+    g.fillStyle = `rgba(${r},${gg},${b},0.88)`;
+    g.strokeStyle = "#d8dee9"; g.lineWidth = 1.2;
+    g.beginPath();
+    f.corners.forEach((c, j) => { const [x, y] = P(c); j ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.closePath(); g.fill(); g.stroke();
+    label(f.center, `${f.sgn > 0 ? "+" : "−"}${"XYZ"[f.i]}`, "rgba(255,255,255,0.8)", true);
+  }
+  for (const f of faces) if (f.sgn > 0 && f.visible) bodyAxis(f.i);
+
+  g.font = "11px system-ui, sans-serif"; g.textAlign = "left"; g.textBaseline = "top"; g.fillStyle = "#8590a2";
+  g.fillText("dashed: inertial frame (ENU)   solid: body axes", 8, H - 18);
+}
+
 // --------------------------------------------------------------- render ---
 let lastSidebar = 0;
 function frame() {
   const tEnd = viewEnd();
   for (const c of charts) drawChart(c, tEnd);
+  if (cube) drawCube(tEnd);
   const now = performance.now();
   if (now - lastSidebar > 100) {          // sidebar values at 10 Hz
     lastSidebar = now;
@@ -546,6 +739,7 @@ document.addEventListener("keydown", e => {
 $("window").onchange = e => { windowS = +e.target.value; saveLayout(); };
 $("cols").onchange = () => { setCols(); saveLayout(); };
 $("addChart").onclick = () => { addChart([]); saveLayout(); };
+$("cubeBtn").onclick = () => toggleCube();
 $("filter").oninput = applyFilter;
 $("clear").onclick = () => { if (confirm("Clear all telemetry data on the server?")) fetch("clear", { method: "POST" }); };
 $("export").onclick = () => { location.href = "export.csv"; };

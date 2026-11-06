@@ -21,6 +21,7 @@ enum TelemetryChannelId : size_t {
   TLM_LQR_STATE,
   TLM_FLIGHT,
   TLM_EULER,
+  TLM_QUAT,
   TLM_ACCEL,
   TLM_BUS_VOLTAGE,
   TLM_WHEELS,
@@ -34,6 +35,7 @@ TelemetryChannel telemetryChannels[] = {
   { "lqr_state",    "qe-x qe-y qe-z omega-x omega-y omega-z",                   false },
   { "flight",       "AccelerationMagnitude Airborne",                           true  },
   { "euler",        "Roll Pitch Yaw",                                           false },
+  { "quat",         "q-w q-x q-y q-z",                                          false },
   { "accel",        "AccelX AccelY AccelZ",                                     false },
   { "bus_voltage",  "BusVoltage",                                               false },
   { "wheels",       "odrv0-pos odrv0-vel odrv1-pos odrv1-vel odrv2-pos odrv2-vel", false },
@@ -702,6 +704,12 @@ void loop() {
       Telemetry::value(Serial, "Roll", euler_pry[0], 2);
       Telemetry::value(Serial, "Pitch", euler_pry[1], 2);
       Telemetry::value(Serial, "Yaw", euler_pry[2], 2);
+    }
+    if (telemetry.on(TLM_QUAT)) {  // attitude, scalar-first, sensor -> local (ENU) frame
+      Telemetry::value(Serial, "q-w", quaternion_wxyz[0], 5);
+      Telemetry::value(Serial, "q-x", quaternion_wxyz[1], 5);
+      Telemetry::value(Serial, "q-y", quaternion_wxyz[2], 5);
+      Telemetry::value(Serial, "q-z", quaternion_wxyz[3], 5);
     }
     if (telemetry.on(TLM_ACCEL)) {
       Telemetry::value(Serial, "AccelX", acceleration[0], 2);

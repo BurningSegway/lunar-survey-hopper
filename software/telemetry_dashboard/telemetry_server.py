@@ -468,6 +468,7 @@ class DemoLink:
         ["lqr_state", "qe-x qe-y qe-z omega-x omega-y omega-z", False],
         ["flight", "AccelerationMagnitude Airborne", True],
         ["euler", "Roll Pitch Yaw", False],
+        ["quat", "q-w q-x q-y q-z", False],
     ]
 
     def __init__(self, hub: Hub, control: ChannelControl):
@@ -542,9 +543,19 @@ class DemoLink:
             if on["flight"]:
                 hub.add_line(f">AccelerationMagnitude:{9.81 + random.gauss(0, 0.05) - (9.0 if airborne else 0):.2f}")
                 hub.add_line(f">Airborne:{airborne}")
+            roll, pitch = 2.0 * angles[0], 1.5 * angles[1]
+            yaw = math.atan2(math.sin(0.25 * t), math.cos(0.25 * t))  # slow turn, wrapped to +-pi
             if on["euler"]:
-                for name, a in zip(("Roll", "Pitch", "Yaw"), angles):
+                for name, a in zip(("Roll", "Pitch", "Yaw"), (roll, pitch, yaw)):
                     hub.add_line(f">{name}:{math.degrees(a):.2f}")
+            if on["quat"]:  # Z-Y-X (yaw, pitch, roll), scalar first, like the MTi
+                cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+                cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+                cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+                q = (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                     cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+                for name, v in zip(("q-w", "q-x", "q-y", "q-z"), q):
+                    hub.add_line(f">{name}:{v:.5f}")
             time.sleep(self.rate_ms / 1000)
 
 
