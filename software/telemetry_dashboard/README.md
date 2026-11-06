@@ -63,7 +63,8 @@ in the comments at the top of that file.
   IMU's inertial frame (Xsens default ENU: X = East, Y = North, Z = Up, dashed axes over a ground grid). Body axes
   are solid (x red, y green, z blue), and the faces are labelled ±X/±Y/±Z.
   It uses the `quat` channel (q-w..q-z) when that is printing, and falls back to `euler` (Roll/Pitch/Yaw, Z-Y-X).
-  If neither is on, opening the cube switches `quat` on. Drag to orbit the view, and double-click to reset it.
+  If neither is on, opening the cube switches `quat` on. The cube opens in its own pane to the right of the charts.
+  Drag the divider to resize the pane, and double-click the divider to reset its width. Drag inside the cube view to orbit, and double-click to reset the view.
   When paused, the cube shows the paused moment. Hovering over any chart shows the attitude at that point in time.
 * **Record / Stop recording** writes everything that arrives (all variables plus console lines) to a file on the Pi.
 * **Export CSV** downloads the server's in-memory history as a wide table, like Teleplot's export. This covers all

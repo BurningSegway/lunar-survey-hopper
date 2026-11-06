@@ -75,13 +75,24 @@
   .var.off .name, .var.off .val { color: #5b6370; font-style: italic; }
   .var.off .val::after { content: "off"; }
   .var.off .val { font-size: 11px; }
-  .chart.cube canvas { height: 340px; cursor: grab; touch-action: none; }
-  .chart.cube canvas:active { cursor: grabbing; }
+  /* cube pane to the right of the charts, resizable with the splitter */
+  #splitter, #cubePane { display: none; }
+  main.with-cube { grid-template-columns: 240px minmax(240px, 1fr) 6px var(--cube-w, 420px); }
+  main.with-cube #splitter { display: block; cursor: col-resize; background: var(--border); touch-action: none; }
+  #splitter:hover, body.resizing #splitter { background: var(--accent); }
+  body.resizing { user-select: none; cursor: col-resize; }
+  main.with-cube #cubePane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
+  #cubePane .chart-head { border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .cube-canvas { flex: 1; position: relative; min-height: 0; }
+  .cube-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  .cube-canvas canvas:active { cursor: grabbing; }
   .cube-info { font: 12px ui-monospace, Consolas, monospace; color: var(--muted); margin-left: 6px; }
   #cmd { width: 260px; padding: 1px 6px; background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
   @media (max-width: 700px) {
     main { grid-template-columns: 1fr; grid-template-rows: 160px 1fr; }
+    main.with-cube { grid-template-columns: 1fr; grid-template-rows: 160px 1fr 320px; }
+    main.with-cube #splitter { display: none; }
     #sidebar { border-right: none; border-bottom: 1px solid var(--border); }
   }
 </style>
@@ -126,6 +137,8 @@
       <div id="vars"></div>
     </aside>
     <section id="charts"></section>
+    <div id="splitter" title="Drag to resize the cube view, double-click to reset"></div>
+    <section id="cubePane"></section>
   </main>
   <footer id="footer">
     <div id="logs-bar"><span>Console</span><span>
@@ -154,7 +167,7 @@ const $ = (id) => document.getElementById(id);
 const LS_KEY = "hopperTelemetryLayout";
 function saveLayout() {
   localStorage.setItem(LS_KEY, JSON.stringify({
-    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value, cube: !!cube,
+    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value, cube: !!cube, cubeW: cubeWidth,
     colors: Object.fromEntries([...series].map(([n, s]) => [n, s.color])),
   }));
 }
@@ -167,6 +180,7 @@ function loadLayout() {
     if (l.window) { windowS = +l.window; $("window").value = l.window; }
     if (l.cols) $("cols").value = l.cols;
     (l.charts || []).forEach(names => addChart(names));
+    if (l.cubeW) cubeWidth = +l.cubeW;
     if (l.cube) toggleCube(true, false);
   } catch (e) { console.warn(e); }
 }
@@ -269,7 +283,7 @@ function addChart(names = []) {
 }
 
 function showHintIfEmpty() {
-  if (charts.length || cube || $("charts").querySelector(".hint")) return;
+  if (charts.length || $("charts").querySelector(".hint")) return;
   const h = document.createElement("div");
   h.className = "hint";
   h.textContent = "Click a variable on the left to plot it. Drag variables onto a chart to overlay them.";
@@ -413,38 +427,66 @@ function drawChart(c, tEnd) {
 // the IMU's inertial frame (Xsens default ENU: X = East, Y = North, Z = Up).
 // Source: the quat channel (q-w..q-z, body -> inertial) when available, else
 // Roll/Pitch/Yaw in degrees, Z-Y-X convention as in xsens_quaternion_to_euler().
-const CUBE_VIEW = { az: -55 * Math.PI / 180, el: 25 * Math.PI / 180 };
+const CUBE_VIEW = { az: -55 * Math.PI / 180, elev: 25 * Math.PI / 180 };
+const CUBE_DEFAULT_W = 420;
 let cube = null;
+let cubeWidth = CUBE_DEFAULT_W;
+
+function applyCubeLayout() {
+  const m = document.querySelector("main");
+  const r = m.getBoundingClientRect();
+  const maxW = Math.max(220, r.width - $("sidebar").offsetWidth - 246);
+  cubeWidth = Math.round(Math.max(220, Math.min(maxW, cubeWidth)));
+  m.style.setProperty("--cube-w", cubeWidth + "px");
+  m.classList.toggle("with-cube", !!cube);
+}
 
 function toggleCube(show = !cube, userAction = true) {
+  const pane = $("cubePane");
   if (!show) {
-    if (cube) { cube.el.remove(); cube = null; }
+    pane.innerHTML = "";
+    cube = null;
     $("cubeBtn").classList.remove("active");
-    saveLayout(); showHintIfEmpty();
+    applyCubeLayout(); saveLayout();
     return;
   }
   if (cube) return;
-  const el = document.createElement("div");
-  el.className = "chart cube";
-  el.innerHTML = `<div class="chart-head"><span class="legend-item" style="cursor:default;text-decoration:none">Attitude</span>` +
-    `<span class="cube-info"></span><button class="close" title="Close">×</button></div><canvas title="Drag to rotate the view, double-click to reset"></canvas>`;
-  cube = { el, canvas: el.querySelector("canvas"), info: el.querySelector(".cube-info"), ...CUBE_VIEW, drag: null };
-  el.querySelector(".close").onclick = () => toggleCube(false);
+  pane.innerHTML = `<div class="chart-head"><span class="legend-item" style="cursor:default;text-decoration:none">Attitude</span>` +
+    `<span class="cube-info"></span><button class="close" title="Close">×</button></div>` +
+    `<div class="cube-canvas"><canvas title="Drag to rotate the view, double-click to reset"></canvas></div>`;
+  cube = { canvas: pane.querySelector("canvas"), info: pane.querySelector(".cube-info"), ...CUBE_VIEW, drag: null };
+  pane.querySelector(".close").onclick = () => toggleCube(false);
   const cv = cube.canvas;
-  cv.addEventListener("pointerdown", e => { cube.drag = [e.clientX, e.clientY, cube.az, cube.el]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener("pointerdown", e => { cube.drag = [e.clientX, e.clientY, cube.az, cube.elev]; cv.setPointerCapture(e.pointerId); });
   cv.addEventListener("pointermove", e => {
     if (!cube.drag) return;
     const [x0, y0, az0, el0] = cube.drag;
     cube.az = az0 - (e.clientX - x0) * 0.01;
-    cube.el = Math.max(-1.45, Math.min(1.45, el0 + (e.clientY - y0) * 0.01));
+    cube.elev = Math.max(-1.45, Math.min(1.45, el0 + (e.clientY - y0) * 0.01));
   });
   cv.addEventListener("pointerup", () => { cube.drag = null; });
   cv.addEventListener("dblclick", () => Object.assign(cube, CUBE_VIEW));
-  $("charts").querySelector(".hint")?.remove();
-  $("charts").prepend(el);
   $("cubeBtn").classList.add("active");
+  applyCubeLayout();
   if (userAction) { ensureAttitudeChannel(); saveLayout(); }
 }
+
+// Splitter between the charts and the cube pane
+(() => {
+  const sp = $("splitter");
+  let dragging = false;
+  sp.addEventListener("pointerdown", e => { dragging = true; sp.setPointerCapture(e.pointerId); document.body.classList.add("resizing"); });
+  sp.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    cubeWidth = document.querySelector("main").getBoundingClientRect().right - e.clientX - 3;
+    applyCubeLayout();
+  });
+  const end = () => { if (!dragging) return; dragging = false; document.body.classList.remove("resizing"); saveLayout(); };
+  sp.addEventListener("pointerup", end);
+  sp.addEventListener("pointercancel", end);
+  sp.addEventListener("dblclick", () => { cubeWidth = CUBE_DEFAULT_W; applyCubeLayout(); saveLayout(); });
+  window.addEventListener("resize", () => { if (cube) applyCubeLayout(); });
+})();
 
 // Opening the cube switches on an attitude channel if none is printing.
 function ensureAttitudeChannel() {
@@ -515,9 +557,9 @@ function drawCube(tView) {
   const att = attitudeAt(t);
 
   // camera orbiting the origin, inertial Z up
-  const D = 7, cam = [D * Math.cos(cube.el) * Math.cos(cube.az), D * Math.cos(cube.el) * Math.sin(cube.az), D * Math.sin(cube.el)];
+  const D = 7, cam = [D * Math.cos(cube.elev) * Math.cos(cube.az), D * Math.cos(cube.elev) * Math.sin(cube.az), D * Math.sin(cube.elev)];
   const fwd = norm(cam.map(v => -v)), right = norm(cross(fwd, [0, 0, 1])), up = cross(right, fwd);
-  const F = 1.45 * Math.min(W, H);
+  const F = 1.3 * Math.min(W, H);
   const P = p => { const d = [p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]], z = dot(d, fwd);
                    return [W / 2 + F * dot(d, right) / z, H / 2 - F * dot(d, up) / z]; };
   const line = (a, b, color, width = 1, dash = []) => {
