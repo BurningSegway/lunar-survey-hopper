@@ -327,6 +327,13 @@ class ChannelControl:
         """Call after the serial port (re)opens: ask for the catalog, re-apply on reply."""
         with self.lock:
             self.needs_apply = True
+        self.query()
+
+    def query(self):
+        # The leading empty line terminates any partial line already sitting in the
+        # Teensy's command buffer (e.g. tty echo of its own output while the port was
+        # opening), so "tlm?" always arrives as a clean line.
+        self.send("")
         self.send("tlm?")
 
     def _on_catalog(self, cat: dict):
@@ -422,9 +429,16 @@ class SerialLink:
                     waiting_logged = False
                     self.ser = ser
                     self.hub.set_status(serial="connected", port=port)
+                    time.sleep(0.1)          # let the port settle, drop what arrived meanwhile
+                    ser.reset_input_buffer()
                     self.control.connected()
+                    queried_at, queries = time.time(), 1
                     buf = b""
                     while True:
+                        # No channel list yet (reply lost, Teensy still in setup, ...): ask again.
+                        if self.hub.catalog is None and queries < 15 and time.time() - queried_at > 2.0:
+                            self.control.query()
+                            queried_at, queries = time.time(), queries + 1
                         chunk = ser.read(ser.in_waiting or 1)
                         if not chunk:
                             continue

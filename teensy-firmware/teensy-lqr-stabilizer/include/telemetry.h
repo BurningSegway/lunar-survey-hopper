@@ -99,8 +99,13 @@ class Telemetry {
       printCatalog(out);
       return;
     }
+    if (strncmp(cmd, "tlm", 3) != 0) {
+      // Not for us. Silently ignored: when the host opens the port, Linux can
+      // briefly echo our own output back to us, which arrives here as garbage.
+      return;
+    }
     if (strcmp(cmd, "tlm") != 0) {
-      out.print("Unknown command: ");
+      out.print("tlm: unknown command ");
       out.println(cmd);
       return;
     }
