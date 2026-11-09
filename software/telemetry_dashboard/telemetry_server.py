@@ -472,6 +472,9 @@ class DemoHop:
         self.dir = [0.0, 0.0, 1.0]
         self.ballistic: dict | None = None   # printed from cutoff until the next launch
         self.v0, self.pc = [0.0] * 3, [0.0] * 3
+        # "Ground truth" for the fake Vicon: true position relative to the launch point
+        # (flies 10 % shorter horizontally than predicted) and the launch point in ENU.
+        self.true, self.base = [0.0] * 3, [0.0] * 3
 
     def step(self, t: float):
         dt = t - self.since
@@ -480,6 +483,8 @@ class DemoHop:
             self.dir = [math.sin(tilt) * math.sin(hdg), math.sin(tilt) * math.cos(hdg), math.cos(tilt)]
             self.phase, self.since, dt = "burn", t, 0.0
             self.ballistic = None
+            self.base = [b + p for b, p in zip(self.base, self.true)]   # launch from where it landed
+            self.true = [0.0] * 3
         if self.phase == "burn":
             if dt >= self.BURN_S:
                 self._cutoff(t)
@@ -488,12 +493,14 @@ class DemoHop:
                 self.acc = [self.BURN_ACCEL * d for d in self.dir]
                 self.vel = [a * dt for a in self.acc]
                 self.pos = [0.5 * a * dt * dt for a in self.acc]
+                self.true = list(self.pos)
                 return
         if self.phase == "ballistic":
             self.acc = [0.0, 0.0, -self.G]
             tt = min(dt, self.ballistic["FlightTime"])
             self.pred = [self.pc[i] + self.v0[i] * tt for i in range(3)]
             self.pred[2] -= 0.5 * self.G * tt * tt
+            self.true = [self.pc[0] + 0.9 * self.v0[0] * tt, self.pc[1] + 0.9 * self.v0[1] * tt, self.pred[2]]
             # the real touchdown is detected a little after the predicted one
             if dt >= self.ballistic["FlightTime"] + 0.1:
                 self.phase, self.since, dt = "rest", t, 0.0
@@ -507,6 +514,22 @@ class DemoHop:
             elif self.ballistic and dt >= 0.14:
                 self.pos = [0.0, 0.0, 0.0]
             self.vel = [0.0, 0.0, 0.0] if dt >= 0.1 else self.vel
+
+    VICON_YAW = math.radians(30.0)          # Vicon frame heading vs ENU, for testing the alignment
+    VICON_ORIGIN = (1.5, -0.8, 0.05)        # where the first launch point sits in the Vicon frame
+
+    def vicon_lines(self, q_imu):
+        """Fake Vicon frame: position [m] and orientation in a rotated, shifted world frame."""
+        c, s = math.cos(-self.VICON_YAW), math.sin(-self.VICON_YAW)
+        e, n, u = (b + p for b, p in zip(self.base, self.true))
+        x, y, z = (c * e - s * n + self.VICON_ORIGIN[0], s * e + c * n + self.VICON_ORIGIN[1], u + self.VICON_ORIGIN[2])
+        # q_vicon = Rz(-yaw) * q_imu
+        w1, z1 = math.cos(-self.VICON_YAW / 2), math.sin(-self.VICON_YAW / 2)
+        w2, x2, y2, z2 = q_imu
+        q = (w1 * w2 - z1 * z2, w1 * x2 - z1 * y2, w1 * y2 + z1 * x2, w1 * z2 + z1 * w2)
+        vals = {"ViconX": x + random.gauss(0, 0.0005), "ViconY": y + random.gauss(0, 0.0005),
+                "ViconZ": z + random.gauss(0, 0.0005), "ViconQw": q[0], "ViconQx": q[1], "ViconQy": q[2], "ViconQz": q[3]}
+        return [f">{k}:{v:.5f}" for k, v in vals.items()]
 
     def _cutoff(self, t: float):
         g = self.G
@@ -543,8 +566,9 @@ class DemoLink:
                       "LandE LandN PredE PredN PredU", False],
     ]
 
-    def __init__(self, hub: Hub, control: ChannelControl):
+    def __init__(self, hub: Hub, control: ChannelControl, fake_vicon: bool = True):
         self.hub, self.control = hub, control
+        self.fake_vicon = fake_vicon
         self.rate_ms = 20
         self.cmds: queue.Queue = queue.Queue()
         control.link = self
@@ -619,12 +643,16 @@ class DemoLink:
             if on["euler"]:
                 for name, a in zip(("Roll", "Pitch", "Yaw"), (roll, pitch, yaw)):
                     hub.add_line(f">{name}:{math.degrees(a):.2f}")
-            if on["quat"]:  # Z-Y-X (yaw, pitch, roll), scalar first, like the MTi
-                cr, sr = math.cos(roll / 2), math.sin(roll / 2)
-                cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
-                cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
-                q = (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
-                     cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+            # Z-Y-X (yaw, pitch, roll), scalar first, like the MTi
+            cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+            cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+            cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+            q = (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                 cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+            if self.fake_vicon:  # what software/vicon_bridge would send over UDP
+                for line in hop.vicon_lines(q):
+                    hub.add_line(line)
+            if on["quat"]:
                 for name, v in zip(("q-w", "q-x", "q-y", "q-z"), q):
                     hub.add_line(f">{name}:{v:.5f}")
             if on["burn"]:
@@ -733,6 +761,59 @@ def make_handler(hub: Hub, control: ChannelControl):
     return Handler
 
 
+# --------------------------------------------------------------------------- #
+# Network input (e.g. Vicon ground truth from another machine)
+# --------------------------------------------------------------------------- #
+class UdpInput:
+    """Receives Teleplot lines over UDP, e.g. from the Vicon script on another machine.
+
+    Each datagram holds one or more newline separated lines, the same format the
+    Teensy prints:  ``>ViconX:1.234\\n>ViconY:0.567\\n>ViconZ:0.890``.
+    All lines of one datagram get the same arrival timestamp, so send one datagram
+    per motion-capture frame. Lines without ``>`` are shown in the console as
+    ``[udp <sender>] text``. Channel catalogs (``#tlm``) are ignored: only the
+    Teensy controls those. Port 47269 is Teleplot's UDP port, so senders written
+    for Teleplot work unchanged.
+    """
+
+    SILENT_S = 2.0
+
+    def __init__(self, hub: Hub, host: str, port: int):
+        import socket
+        self.hub = hub
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
+        self.sock.settimeout(0.5)
+        self.port = port
+        self.sender: str | None = None
+        self.last_rx = 0.0
+
+    def run(self):
+        self.hub.set_status(udp=f"listening :{self.port}")
+        while True:
+            try:
+                data, (ip, _) = self.sock.recvfrom(65535)
+            except OSError:  # timeout (or a transient error): check for silence
+                if self.sender and time.time() - self.last_rx > self.SILENT_S:
+                    self.hub.add_line(f"[bridge] udp input from {self.sender} stopped")
+                    self.sender = None
+                    self.hub.set_status(udp=f"listening :{self.port}")
+                continue
+            t = time.time()
+            self.last_rx = t
+            if ip != self.sender:
+                self.sender = ip
+                self.hub.set_status(udp=f"receiving from {ip}")
+                self.hub.add_line(f"[bridge] udp input from {ip}")
+            for line in data.decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(CATALOG_PREFIX):
+                    continue
+                self.hub.add_line(line if line.startswith(">") else f"[udp {ip}] {line}", t)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial port (default: auto-detect Teensy)")
@@ -747,6 +828,11 @@ def main():
     ap.add_argument("--state-file", default=str(HERE / "channels.json"),
                     help="where the dashboard's channel selection is remembered")
     ap.add_argument("--demo", action="store_true", help="generate fake data instead of reading serial")
+    ap.add_argument("--demo-no-vicon", action="store_true",
+                    help="with --demo: no fake Vicon data (e.g. to test the real Vicon bridge)")
+    ap.add_argument("--udp-port", type=int, default=47269,
+                    help="UDP port for Teleplot lines from other machines, e.g. Vicon (0 = off)")
+    ap.add_argument("--udp-host", default="0.0.0.0", help="UDP bind address (default: all interfaces)")
     args = ap.parse_args()
 
     if serial is None and not args.demo:
@@ -754,10 +840,17 @@ def main():
 
     hub = Hub(args.history, args.max_points, Recorder(Path(args.record_dir)))
     control = ChannelControl(hub, Path(args.state_file))
-    source = DemoLink(hub, control) if args.demo else SerialLink(hub, control, args.port, args.baud)
+    source = DemoLink(hub, control, not args.demo_no_vicon) if args.demo else SerialLink(hub, control, args.port, args.baud)
 
     threading.Thread(target=hub.flush_loop, daemon=True).start()
     threading.Thread(target=source.run, daemon=True).start()
+    if args.udp_port:
+        try:
+            udp = UdpInput(hub, args.udp_host, args.udp_port)
+        except OSError as e:
+            sys.exit(f"cannot listen on UDP {args.udp_host}:{args.udp_port}: {e}  (use --udp-port N or 0 to disable)")
+        threading.Thread(target=udp.run, daemon=True).start()
+        print(f"UDP input (Teleplot lines, e.g. Vicon): port {args.udp_port}")
 
     server = ThreadingHTTPServer((args.host, args.http_port), make_handler(hub, control))
     server.daemon_threads = True

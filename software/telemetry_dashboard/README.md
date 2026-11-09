@@ -43,7 +43,10 @@ dashboard first.
 | `--history 300` | 300 s | history sent to newly opened pages |
 | `--record` | off | start recording right away (otherwise use the Record button) |
 | `--record-dir DIR` | `./recordings` | where CSV recordings are written |
-| `--demo` | off | fake LQR-like data plus a repeating hop (burn + ballistic channels), for trying the UI without hardware |
+| `--udp-port 47269` | 47269 | UDP input for other machines, e.g. Vicon (`0` = off), see below |
+| `--udp-host 0.0.0.0` | all interfaces | UDP bind address |
+| `--demo` | off | fake LQR-like data plus a repeating hop (burn + ballistic channels) and fake Vicon data, for trying the UI without hardware |
+| `--demo-no-vicon` | off | with `--demo`: leave out the fake Vicon data |
 
 ### Start on boot
 
@@ -73,6 +76,10 @@ in the comments at the top of that file.
     LandE/N (`ballistic` channel), with its apex, the predicted landing point (×) and ground shadows;
   * the hopper as a small cube at its current position (PredE/N/U in flight, PosE/N/U during the burn),
     rotated by its attitude when `quat` or `euler` is on.
+
+  * purple: the **Vicon ground truth** when [`software/vicon_bridge`](../vicon_bridge/README.md) is streaming. It is
+    aligned to the launch point and rotated by the **Vicon hdg** offset (type a value, or press **from attitude**), and
+    after landing the header shows the landing error **Δland vs Vicon**.
 
   The header shows the phase and v0 (speed, elevation, heading), apex height, range and flight time. Switching to
   Trajectory turns on `burn` and `ballistic` if they are off. The cube stops at the predicted landing point. The last
@@ -112,6 +119,33 @@ The dashboard picks the new channel up automatically.
 
 Timestamps are taken on the Pi when each line arrives. A device timestamp in `>name:ts:value`
 is ignored.
+
+## Data from other machines (Vicon ground truth)
+
+The server also listens on **UDP port 47269** (Teleplot's port) for the same `>name:value` lines the Teensy
+prints. Use this to send data from another machine on the network, such as the Vicon ground-truth trajectory.
+The values show up as normal variables in the sidebar. They are charted, recorded, exported and cleared together
+with the Teensy data. A **udp** pill in the header shows who is sending.
+
+* Send **one datagram per motion-capture frame**, with one line per value separated by `\n`. All values in a datagram
+  get the same arrival timestamp on the Pi, so a frame's X/Y/Z stay together.
+* Lines that don't start with `>` appear in the console as `[udp <sender ip>] text`. `#tlm` catalog lines are ignored.
+* Timestamps are taken when the data arrives at the Pi, the same as for serial data. On a LAN this adds a few ms of latency.
+* There is no authentication: anyone on the network can send to the port. Use `--udp-host` to bind to one interface,
+  or `--udp-port 0` to turn it off.
+* If the Pi runs a firewall, open the port: `sudo ufw allow 47269/udp`.
+
+For Vicon, use the ready-made bridge in [`software/vicon_bridge`](../vicon_bridge/README.md).
+[`udp_sender_example.py`](udp_sender_example.py) is a minimal template for other senders. It needs only the Python
+standard library:
+
+```python
+from udp_sender_example import DashboardSender
+dash = DashboardSender("raspberrypi.local")   # the Pi running telemetry_server.py
+dash.send(ViconX=x, ViconY=y, ViconZ=z)       # once per frame, metres
+```
+
+Run it directly (`python3 udp_sender_example.py raspberrypi.local`) to stream a fake hop at 100 Hz for testing.
 
 ## Performance note
 
