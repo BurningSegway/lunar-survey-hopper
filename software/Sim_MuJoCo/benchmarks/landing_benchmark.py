@@ -10,7 +10,7 @@ hop.) Scored at touchdown:
 
 * misalignment -- angle between the body z axis and the true area-averaged
   ground plane (disc of ``roi_radius``) below the robot at touchdown;
-* estimate error -- angle between the filter's plane normal and that truth.
+* estimate error -- angle between the landing plane's normal and that truth.
 
 Each hop is run with the landing reference on and off (off = land level).
 
@@ -98,6 +98,8 @@ def hop(x: float, y: float, height: float, euler_deg, use_reference: bool,
     sim.flight_phase.estimator.vertical_velocity = up
     if sim.landing_reference is not None:
         sim.landing_reference.reset(float(data.time))
+    # ... and its arc latched at the cutoff.
+    sim.trajectory.latch(float(data.time), data.qpos[qa:qa + 3], data.qvel[dof:dof + 3], gravity)
     while data.time < MAX_TIME and not sim.robot_touches_terrain():
         sim.step()
     body_z = data.xmat[model.jnt_bodyid[sim.ids.root_joint]].reshape(3, 3)[:, 2]
@@ -109,12 +111,11 @@ def hop(x: float, y: float, height: float, euler_deg, use_reference: bool,
         "misalignment_deg": math.degrees(math.acos(min(1.0, float(body_z @ truth)))),
     }
     if sim.landing_reference is not None:
-        filt = sim.landing_reference.filter
+        plane = sim.landing_reference.plane
         result["estimate_error_deg"] = math.degrees(
-            math.acos(min(1.0, float(filt.normal @ truth))))
-        result["frames_accepted"] = filt.accepted
-        result["frames_rejected"] = filt.rejected
-        result["reference_sigma_deg"] = math.degrees(filt.sigma)
+            math.acos(min(1.0, float(plane.normal @ truth))))
+        result["frames_accepted"] = plane.accepted
+        result["frames_ignored"] = plane.ignored
     return result
 
 

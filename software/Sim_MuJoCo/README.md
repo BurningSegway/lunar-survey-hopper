@@ -485,16 +485,26 @@ counts too:
 1. while airborne, each lidar batch goes into a ground map of the jump
    (0.5 m grid; emptied when a jump starts);
 2. every 50 ms during descent (or, without the hop reference, whenever
-   airborne), the robot's ballistic trajectory (position, velocity, gravity)
-   is followed to where the base first comes within 0.3 m of the mapped
-   ground: the predicted landing spot;
+   airborne), the hop's ballistic arc is followed to where the base first
+   comes within 0.3 m of the mapped ground: the predicted landing spot. The
+   arc is the firmware's trajectory tracker (`jumper_sim/trajectory.py`): from
+   the jump command the IMU's linear acceleration (specific force rotated to
+   the world, gravity added back) is Euler-integrated from rest, and when the
+   push-off ends (specific force < 0.5 g after > 1.25 g) the position and
+   velocity are latched; from then on only gravity acts, so the arc is fixed
+   until touchdown ends it. The spot only moves if the mapped ground along
+   the arc does. No arc (after touchdown, so in bounces): no fits;
 3. up to 1000 of the jump's points (an even subsample) within 0.5 m of that
    spot are fitted to the area-averaged ground plane, with outlier
    rejection and an uncertainty estimate;
-4. the fits are fused in a small Kalman filter that keeps updating until the
-   moment of impact (it used to freeze when touchdown was < 1 m or < 0.3 s
-   away; `freeze_near_touchdown` restores that); a near touchdown starts
-   LANDING. The controller holds body z along that plane
+4. the newest fit is the landing plane. The map keeps every point of the
+   jump and the spot is fixed, so the newest fit already holds everything
+   the earlier fits saw; the Kalman filter that used to fuse successive fits
+   only counted the same points again, and was removed. Fits whose sensor
+   noise alone is above 3 deg (still far away) are ignored. It keeps updating
+   until the moment of impact (it used to freeze when touchdown was < 1 m or
+   < 0.3 s away; `freeze_near_touchdown` restores that); a near touchdown
+   starts LANDING. The controller holds body z along that plane
    normal (clamped to 20 deg) with the usual yaw reference. Nothing updates
    in contact; a jump resets the reference to level. PlotJuggler's
    `roll_ref`/`pitch_ref` show it.
@@ -514,7 +524,15 @@ misalignment of body z to the true ground plane at touchdown):
 | RealSense D435 stand-in, disc below the robot (as of the last commit) | 2.28 deg | 10.35 deg | 15.78 deg |
 | Mid-360S on the bottom facing down (blind straight below) | 0.35 deg | 0.96 deg | 2.17 deg |
 | Mid-360S on the side, 22.5 deg down, freezing near touchdown | 0.35 deg | 1.28 deg | 4.72 deg |
-| **Mid-360S on the side, updating until impact (current)** | **0.23 deg** | **1.05 deg** | **4.72 deg** |
+| Mid-360S on the side, updating until impact | 0.23 deg | 1.05 deg | 4.72 deg |
+| same, on the cube model with the LQI (Kalman filter on the fits) | 0.32 deg | 1.33 deg | 5.59 deg |
+| **same, newest fit instead of the Kalman filter (current)** | **0.23 deg** | **1.39 deg** | **5.00 deg** |
+
+Dropping the Kalman filter changed nothing that matters (estimate error
+median 0.35 -> 0.39 deg, p90 1.07 -> 1.26 deg); the contact benchmark's
+gated runs land the same too (median 0.23 -> 0.24 deg, the same drop
+tips). The benchmark throws the robot, so it latches the true start state;
+the IMU arc's own accuracy is in the notes below.
 
 The camera only saw the ground straight below, which on a hop is not where
 the robot lands, and from 3 m apex it had too few usable frames (median
@@ -540,13 +558,19 @@ bunny = within 0.3 m of the target, above the ground; landing disc = within
 |---|---|---|---|---|
 | **Mid-360S (side, current)** | **603-674k** | 166 / 102 / 47 | 6.1-6.5k | 2345-2932 m^2 |
 
-- The trajectory uses the true position and velocity; on the robot they
-  come from the state estimate.
-- `jumper_sim/landing_reference.py`: ground map, landing prediction, plane
-  fit, filter and reference attitude; written to run unchanged on the robot.
+- The arc comes from the simulated IMU (the body's velocity change per
+  step), as on the robot. On a hop it latches 40 ms after the release with
+  v0 within 0.02 m/s of the true velocity and stays within 1.3 cm (Earth)
+  / 13 cm (Moon, 7.6 s of flight) of the true base path. The benchmark and
+  tests that throw or drop the robot latch their known start state instead.
+- `jumper_sim/trajectory.py`: the trajectory tracker;
+  `jumper_sim/landing_reference.py`: ground map, landing prediction, plane
+  fit, landing plane and reference attitude; both written to run unchanged
+  on the robot.
 - `jumper_sim/visualization.py`: the viewer overlay.
 - Tuning: `LandingReferenceConfig` (disc radius, max points, fit period,
-  touchdown clearance, max tilt, filter noise, near-touchdown rules).
+  touchdown clearance, max tilt, max fit noise, near-touchdown rules);
+  `TrajectoryConfig` (launch and cutoff specific force).
 
 ## Terrain
 

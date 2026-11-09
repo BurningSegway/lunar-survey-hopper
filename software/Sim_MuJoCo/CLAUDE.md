@@ -10,7 +10,7 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~137 tests, ~35-45 s, all must pass
+.venv/bin/python -m unittest discover -s tests           # ~139 tests, ~35-45 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
@@ -33,8 +33,11 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
   reference, scanning); only the control law differs. The PID's gains
   silently rely on the wheel bearing friction for damping, so don't add
   friction compensation to it.
-- Keep the landing-filter outlier gate and all three benchmarks (the user
-  chose to keep them). The LQR is the project report's (ch. 4-5, user's
+- Keep all three benchmarks (the user chose to keep them). The landing
+  plane's Kalman filter (with its outlier gate) was removed on the user's
+  request: the arc is fixed at lift-off and the map keeps the whole jump,
+  so the newest fit at the spot is the plane.
+- The LQR is the project report's (ch. 4-5, user's
   choice, replacing the per-axis LQI with its gyroscopic feedforward) with
   the integral reference tracking of the user's MATLAB script
   `angular_reference_integral.mlx` (9-state LQI, eq. 25; not in the repo):
@@ -57,10 +60,11 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
 | `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot) |
 | `controller.py` | PID and the report's LQR (ch. 5) as the script's LQI: u = tau = -K_bar [q_err_vec, w - w_ref, x_I] (torque straight to the motors, clipped at the motor limit), `augment`, `tracking_feedforward`, CARE by matrix sign function, Bryson's rule + anti-windup via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
 | `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating (attitude control only in flight, wheel momentum bleed in contact, 60 ms flight debounce); jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
-| `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing filter's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
+| `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing plane's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
 | `flight_reference.py` | Hop reference: on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading: the yaw reference (lift-off heading) throughout (face-travel went with the AS-DT1; `--spin` was removed for now, user's choice). Slew limit 180 deg/s |
 | `ray_casting.py` | Exact fast heightfield ray caster (matches `mj_multiRay`; skips 8x8-cell blocks the ray passes above their highest vertex, block looked up at the skipped segment's middle: ~5x fewer march steps, 2.4-3x faster; its cost is set by the number of march steps, i.e. ray length, more than by ray count) and a mesh ray caster for objects on it (einsum, not `@`: OpenBLAS threading made it 2-3x slower); site/geom names. The RealSense D435 depth camera that used to live here was removed (lidar only) |
-| `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump), ballistic landing-spot prediction (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), Kalman filter on tilt with ignore rules; keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set) |
+| `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump), ballistic landing-spot prediction along the tracker's arc (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), `LandingPlane` = the newest fit (ignored if its noise sigma > 3 deg; the Kalman filter was removed, user's choice); keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set and the arc latched from the start state) |
+| `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; latches p, v0 when the specific force drops < 0.5 g after > 1.25 g (cutoff, ~40 ms after release); then a fixed ballistic arc until touchdown (`end`); `latch` for thrown/dropped starts. No arc, no landing fits (so none in bounces) |
 | `jump_aim.py` | On the ground, lean the body axis towards the track target (3 deg near, 8 deg at >= 30 m), closed loop on IMU tilt via a leg-shortening plane (integrator, only while still, held during release, reset at touchdown, legs capped at 10 cm, off on ground > 20 deg); motors `tilt_fl/fr/bl/br` |
 | (target, tipped) | `simulation.py`: bunny `target_object` placed on the terrain at `--track-target` (offset from `mesh_pos`; parked 100 m down otherwise), seen by `MeshRayCaster` in the terrain caster's `objects` (`JumperSimulation._terrain`); tipped (> 60 deg in GROUND) pulls all legs in, and Space then refuses to jump: R resets (user's choice; the in-air recovery, `recovery.py`, was removed). Righting on the ground is NOT possible (tested: wheel push, wheel spin-brake, wheel rock, leg kick incl. 1000 N push) |
 | `pointcloud.py` | Lidar point cloud: every point of each tracked jump, lift-off to touchdown (per-point `range`), binary PLY at `pointclouds/target_scan.ply`, emptied at program start, rewritten at each touchdown (~21 MB per full-rate hop); touchdowns in `<name>.touchdowns.json` |
@@ -129,8 +133,7 @@ above the ground (starting in it, the firm foot ejects the robot).
   the spawn hop's landing; attitude control is gated off in contact.
 - Point-cloud processing (range crop, voxel downsample, registering jumps).
 - Landing-spot prediction (could become the default track target). The
-  landing reference already predicts it ballistically, from the true
-  position and velocity (on the robot: the state estimate).
+  landing reference already predicts it along the IMU tracker's arc.
 - Lidar self-occlusion (legs, foot) is not modelled.
 - Sensor realism: IMU noise/bias/latency, attitude estimator, control rate.
 - Hardware prep: measure bearing friction; real cube mass (3.3 kg is a

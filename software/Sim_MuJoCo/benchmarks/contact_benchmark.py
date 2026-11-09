@@ -59,6 +59,7 @@ def run(kind: str, gating: bool, caster, radius, x=0.0, y=0.0, height=0.0,
         data.qpos[qa + 3:qa + 7] = euler_zyx_to_quat(*(math.radians(a) for a in euler))
         mujoco.mj_forward(model, data)
         sim.landing_reference.reset(float(data.time))
+        sim.trajectory.latch(float(data.time), data.qpos[qa:qa + 3], np.zeros(3), MOON_GRAVITY)
         end_time, touchdown, misalignment = math.inf, None, None
     else:
         mujoco.mj_forward(model, data)

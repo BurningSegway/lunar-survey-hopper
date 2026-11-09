@@ -30,7 +30,7 @@ from .jump_aim import JumpAim
 from .ray_casting import LIDAR_SITE, TERRAIN_GEOM, HeightfieldRayCaster, MeshRayCaster
 from .landing_reference import (
     GroundMap,
-    LandingReference,
+    LandingPlane,
     LandingReferenceConfig,
     PlaneEstimate,
     fit_ground_plane,
@@ -40,6 +40,7 @@ from .gpu_ray_caster import WarpRayCaster, gpu_available
 from .lidar import LIVOX_MID360, LidarSpec, SimulatedLidar
 from .pointcloud import PointCloudRecorder
 from .telemetry import TelemetryPayload, make_telemetry_payload
+from .trajectory import TrajectoryTracker
 
 EARTH_GRAVITY = 9.81
 MOON_GRAVITY = 1.62
@@ -134,12 +135,13 @@ class LandingVisual:
 
 
 class LidarLandingReference:
-    """Feeds the lidar points to the landing-plane fit and filter.
+    """Feeds the lidar points to the landing-plane fit.
 
     While the robot is airborne, every lidar batch goes into the ground map
     of the current jump (:meth:`add_points`). Every ``fit_period`` (when
     asked to fit), the landing spot is predicted from the trajectory, the
-    jump's points around it are fitted and the fit is fused. On the ground
+    jump's points around it are fitted and the fit becomes the landing
+    plane. On the ground
     nothing is updated, so the last estimate is held. :meth:`reset` (called
     at take-off) empties the map and returns to "land level".
     """
@@ -147,14 +149,14 @@ class LidarLandingReference:
     def __init__(self, point_sigma: float,
                  config: LandingReferenceConfig = LandingReferenceConfig()) -> None:
         self.map = GroundMap(config.map_cell)
-        self.filter = LandingReference(config)
+        self.plane = LandingPlane(config)
         self.config = config
         self._point_sigma = point_sigma
         self._next_fit = 0.0
         self.visual: LandingVisual | None = None
 
     def reset(self, time: float) -> None:
-        self.filter.reset(time)
+        self.plane.reset()
         self.map.clear()
         self._next_fit = time
         self.visual = None
@@ -164,20 +166,21 @@ class LidarLandingReference:
 
     def step(self, time: float, position: np.ndarray, velocity: np.ndarray,
              gravity: float) -> None:
-        """Fit and fuse if a fit is due (call only while it should fit)."""
+        """Fit if a fit is due (call only while it should fit). ``position``
+        and ``velocity``: the robot's on the trajectory estimate."""
         if time < self._next_fit:
             return
         self._next_fit = time + self.config.fit_period
         landing = self.map.predict_landing(position, velocity, gravity,
                                            self.config.touchdown_clearance)
         if landing is None:
-            self.filter.update(PlaneEstimate(False, timestamp=time))
+            self.plane.update(PlaneEstimate(False, timestamp=time))
             return
         spot, _ = landing
         points = self.map.points_near(spot, self.config.roi_radius, self.config.max_points)
         estimate = fit_ground_plane(points, spot, float(position[2]), self._point_sigma,
                                     time, self.config)
-        used = self.filter.update(estimate)
+        used = self.plane.update(estimate)
         if estimate.valid:
             self._store_visual(spot, points, estimate, float(position[2]), used)
 
@@ -195,7 +198,7 @@ class LidarLandingReference:
         )
 
     def reference_quaternion(self, yaw_reference: float) -> tuple[float, float, float, float]:
-        return self.filter.reference_quaternion(yaw_reference)
+        return self.plane.reference_quaternion(yaw_reference)
 
 
 class JumperSimulation:
@@ -272,6 +275,9 @@ class JumperSimulation:
         # level/plane coming down).
         self.flight_phase = FlightPhaseDetector()
         self._previous_velocity: np.ndarray | None = None
+        # The hop's ballistic arc from the IMU (latched at propulsion cutoff):
+        # the landing spot is predicted along it.
+        self.trajectory = TrajectoryTracker()
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
             self.flight_reference = FlightReference(
@@ -383,6 +389,7 @@ class JumperSimulation:
         self.contact_phases = 0
         self.flight_phase.reset()
         self._previous_velocity = None
+        self.trajectory.reset()
         self._jump_command = False
         self._near_at_descent = 0
         self._close_scan()  # keep what the run collected; the file stays as saved
@@ -406,6 +413,8 @@ class JumperSimulation:
         self.controller.reset()
         if self.landing_reference is not None:
             self.landing_reference.reset(float(self.data.time))
+        body = self.model.jnt_bodyid[self.ids.root_joint]
+        self.trajectory.begin(self.data.xpos[body])  # from rest at the launch point
         self._jump_command = True  # GROUND -> TAKEOFF
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
@@ -551,20 +560,19 @@ class JumperSimulation:
             # Without the hop reference: fit the ground whenever airborne.
             # With it: only on the way down (the jump's points so far include
             # the ascent's), until the moment of impact.
-            fit = not self.in_contact and (
+            # Only along a hop's arc (none after touchdown, so bounces hold
+            # the plane).
+            fit = not self.in_contact and self.trajectory.ballistic and (
                 phase in (FlightPhase.DESCENT, FlightPhase.LANDING)
                 or self.flight_reference is None
             )
-            accepted = self.landing_reference.filter.accepted
+            accepted = self.landing_reference.plane.accepted
             if fit:
-                body = self.model.jnt_bodyid[self.ids.root_joint]
-                dof = self.model.jnt_dofadr[self.ids.root_joint]
-                self.landing_reference.step(
-                    float(self.data.time), self.data.xpos[body].copy(),
-                    self.data.qvel[dof : dof + 3].copy(), -float(self.model.opt.gravity[2]),
-                )
+                time = float(self.data.time)
+                position, velocity = self.trajectory.state(time)
+                self.landing_reference.step(time, position, velocity, self.trajectory.gravity)
             if (self.flight_reference is not None and accepted == 0
-                    and self.landing_reference.filter.accepted > 0):
+                    and self.landing_reference.plane.accepted > 0):
                 self.flight_events.append("[FLIGHT] Landing spot seen: aligning with its plane.")
         if self.flight_reference is not None and not self.in_contact:
             self.flight_reference.update(
@@ -593,6 +601,7 @@ class JumperSimulation:
                 if self._awaiting_touchdown:
                     self._awaiting_touchdown = False
                     self._record_touchdown()
+                self.trajectory.end()  # touchdown
             return
         self._time_without_contact += float(self.model.opt.timestep)
         if self.in_contact and self._time_without_contact >= FLIGHT_DEBOUNCE:
@@ -738,9 +747,11 @@ class JumperSimulation:
         )
         self._previous_velocity = velocity
         specific_force = quaternion_to_matrix(quaternion).T @ (acceleration - self.model.opt.gravity)
+        self.trajectory.update(float(self.data.time), specific_force, quaternion,
+                               self.model.opt.gravity, dt)
         touchdown_near = (
             self.landing_reference is not None
-            and self.landing_reference.filter.near_touchdown > self._near_at_descent
+            and self.landing_reference.plane.near_touchdown > self._near_at_descent
         )
         phase = self.flight_phase.update(
             specific_force, quaternion, gravity_magnitude(self.model.opt.gravity),
@@ -755,9 +766,11 @@ class JumperSimulation:
         return phase
 
     def _enter_phase(self, phase: FlightPhase) -> None:
+        if phase is FlightPhase.GROUND:
+            self.trajectory.reset()  # e.g. a jump that never left the ground
         if phase is FlightPhase.DESCENT and self.landing_reference is not None:
             # Only a near-touchdown fit from this descent on counts.
-            self._near_at_descent = self.landing_reference.filter.near_touchdown
+            self._near_at_descent = self.landing_reference.plane.near_touchdown
         if self.flight_reference is None:
             return
         if phase is FlightPhase.ASCENT and self.flight_reference.tracking:

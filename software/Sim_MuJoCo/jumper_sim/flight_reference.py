@@ -13,8 +13,8 @@
   (to be replaced by a criterion from the predicted landing spot). Then the
   reference moves back towards level (the xy plane). As soon as
   the ground at the predicted landing spot has been fitted, the landing-plane
-  reference from :class:`~jumper_sim.landing_reference.LandingReference`
-  takes over -- that filter starts at "level" and only receives fits during
+  reference from :class:`~jumper_sim.landing_reference.LandingPlane`
+  takes over -- it starts at "level" and only receives fits during
   descent, so "level until the landing spot is seen, then its plane" falls
   out of it directly. It keeps updating until the moment of impact
   (LANDING too), so the robot keeps aligning with the ground to the end.

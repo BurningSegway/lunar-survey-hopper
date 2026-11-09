@@ -6,7 +6,7 @@ import numpy as np
 from jumper_sim.controller import quaternion_error
 from jumper_sim.landing_reference import (
     GroundMap,
-    LandingReference,
+    LandingPlane,
     LandingReferenceConfig,
     PlaneEstimate,
     fit_ground_plane,
@@ -115,41 +115,38 @@ class GroundMapTests(unittest.TestCase):
         self.assertTrue(math.isnan(self.map.height(5.0, 0.0)))
 
 
-class LandingReferenceFilterTests(unittest.TestCase):
+class LandingPlaneTests(unittest.TestCase):
     def estimate(self, normal, sigma_deg, timestamp=0.1):
         n = np.asarray(normal, dtype=float)
         return PlaneEstimate(True, tuple(n / np.linalg.norm(n)), math.radians(sigma_deg),
                              timestamp=timestamp)
 
-    def test_starts_level_and_confident_fit_takes_over(self) -> None:
-        reference = LandingReference()
+    def test_starts_level_and_a_fit_takes_over(self) -> None:
+        reference = LandingPlane()
         np.testing.assert_allclose(reference.normal, (0.0, 0.0, 1.0))
         target = normal_of(0.2, 0.0)
         self.assertTrue(reference.update(self.estimate(target, 0.2)))
-        self.assertLess(angle_between(reference.normal, target), 0.1)
+        self.assertLess(angle_between(reference.normal, target), 1e-9)
 
-    def test_noisy_fit_moves_reference_little(self) -> None:
-        reference = LandingReference()
-        reference.update(self.estimate(normal_of(0.2, 0.0), 30.0))
-        self.assertLess(angle_between(reference.normal, (0, 0, 1)), 3.0)
+    def test_the_newest_fit_replaces_the_earlier_ones(self) -> None:
+        # The ground map keeps all the jump's points, so the newest fit at the
+        # (fixed) spot already holds what the earlier fits saw.
+        reference = LandingPlane()
+        for k in range(5):
+            reference.update(self.estimate(normal_of(0.1, 0.0), 0.3, timestamp=0.05 * k))
+        newest = normal_of(-0.05, 0.1)
+        self.assertTrue(reference.update(self.estimate(newest, 0.3, 0.3)))
+        self.assertLess(angle_between(reference.normal, newest), 1e-9)
+        self.assertEqual(reference.accepted, 6)
 
     def test_tilt_is_clamped(self) -> None:
         config = LandingReferenceConfig(max_tilt=math.radians(20.0))
-        reference = LandingReference(config)
+        reference = LandingPlane(config)
         reference.update(self.estimate(normal_of(0.7, 0.0), 0.2))  # ~35 deg
         self.assertAlmostEqual(angle_between(reference.normal, (0, 0, 1)), 20.0, places=6)
 
-    def test_outlier_fit_is_rejected_after_convergence(self) -> None:
-        reference = LandingReference()
-        for k in range(5):
-            reference.update(self.estimate(normal_of(0.1, 0.0), 0.3, timestamp=0.03 * k))
-        before = reference.normal
-        self.assertFalse(reference.update(self.estimate(normal_of(-0.5, 0.3), 0.3, 0.16)))
-        np.testing.assert_allclose(reference.normal, before)
-        self.assertEqual(reference.rejected, 1)
-
     def test_noisy_far_fits_are_ignored(self) -> None:
-        reference = LandingReference()
+        reference = LandingPlane()
         self.assertFalse(reference.update(self.estimate(normal_of(0.2, 0.0), 6.0)))
         self.assertEqual(reference.ignored, 1)
         np.testing.assert_allclose(reference.normal, (0.0, 0.0, 1.0))
@@ -158,15 +155,15 @@ class LandingReferenceFilterTests(unittest.TestCase):
         target = normal_of(0.15, 0.0)
         other = normal_of(-0.1, 0.1)
         for freeze in (False, True):
-            reference = LandingReference(LandingReferenceConfig(freeze_near_touchdown=freeze))
+            reference = LandingPlane(LandingReferenceConfig(freeze_near_touchdown=freeze))
             # Descending at 4 m/s: fits from 3.0 m and 2.6 m ...
             for t, h in ((0.0, 3.0), (0.1, 2.6)):
                 n = target / np.linalg.norm(target)
                 self.assertTrue(reference.update(PlaneEstimate(True, tuple(n), math.radians(0.3), height=h, timestamp=t)))
             held = reference.normal
             # ... then one 0.25 s from impact (1.0 m at 4 m/s) and one below
-            # near_height: touchdown is near, and they are still fused (the
-            # old behaviour, freeze_near_touchdown, holds the reference).
+            # near_height: touchdown is near, and they still count (the old
+            # behaviour, freeze_near_touchdown, holds the reference).
             for t, h in ((0.25, 1.0), (0.35, 0.6)):
                 used = reference.update(PlaneEstimate(True, tuple(other), math.radians(0.3), height=h, timestamp=t))
                 self.assertEqual(used, not freeze)
@@ -174,14 +171,8 @@ class LandingReferenceFilterTests(unittest.TestCase):
             self.assertEqual(bool(np.allclose(reference.normal, held)), freeze)
             self.assertAlmostEqual(reference.descent_rate, 4.0, delta=1.5)
 
-    def test_fused_uncertainty_has_a_floor(self) -> None:
-        reference = LandingReference()
-        for k in range(50):
-            reference.update(self.estimate(normal_of(0.1, 0.0), 0.2, timestamp=0.03 * k))
-        self.assertGreaterEqual(reference.sigma, reference.config.min_reference_sigma - 1e-12)
-
     def test_invalid_fits_hold_and_reset_returns_level(self) -> None:
-        reference = LandingReference()
+        reference = LandingPlane()
         reference.update(self.estimate(normal_of(0.1, 0.1), 0.2))
         held = reference.normal
         self.assertFalse(reference.update(PlaneEstimate(False, timestamp=1.0)))

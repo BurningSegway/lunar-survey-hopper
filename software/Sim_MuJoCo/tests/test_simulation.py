@@ -192,11 +192,11 @@ class SimulationTests(unittest.TestCase):
         simulation.lidar.scan = scan
         while not simulation.robot_touches_terrain() and self.data.time < 8.0:
             simulation.step()
-        filt = simulation.landing_reference.filter
-        self.assertGreater(filt.accepted, 10)
+        plane = simulation.landing_reference.plane
+        self.assertGreater(plane.accepted, 10)
         # The jump's points around the predicted spot give its slope.
-        self.assertGreater(math.degrees(math.acos(filt.normal[2])), 10.0)
-        self.assertLess(math.degrees(math.acos(min(1.0, float(filt.normal @ truth)))), 3.0)
+        self.assertGreater(math.degrees(math.acos(plane.normal[2])), 10.0)
+        self.assertLess(math.degrees(math.acos(min(1.0, float(plane.normal @ truth)))), 3.0)
         body_z = self.data.xmat[self.model.jnt_bodyid[simulation.ids.root_joint]].reshape(3, 3)[:, 2]
         self.assertLess(math.degrees(math.acos(min(1.0, float(body_z @ truth)))), 3.0)
         visual = simulation.landing_reference.visual
@@ -211,7 +211,7 @@ class SimulationTests(unittest.TestCase):
         self.assertNotEqual((telemetry["roll_ref"], telemetry["pitch_ref"]), (0.0, 0.0))
         # A new jump starts from "level" with an empty map.
         simulation.handle_key("space")
-        np.testing.assert_allclose(filt.normal, (0.0, 0.0, 1.0))
+        np.testing.assert_allclose(plane.normal, (0.0, 0.0, 1.0))
         self.assertEqual(simulation.landing_reference.map.count, 0)
 
     def _throw(self, simulation, x, y, apex, distance=5.0, heading=0.0):
@@ -234,6 +234,7 @@ class SimulationTests(unittest.TestCase):
         simulation.flight_phase.phase = FlightPhase.ASCENT
         simulation.flight_phase.estimator.vertical_velocity = up
         simulation.landing_reference.reset(float(self.data.time))
+        simulation.trajectory.latch(float(self.data.time), self.data.qpos[:3], self.data.qvel[:3], g)
         g_ = np.linspace(-0.5, 0.5, 41)
         gx, gy = np.meshgrid(g_, g_)
         inside = gx**2 + gy**2 <= 0.25
@@ -250,6 +251,8 @@ class SimulationTests(unittest.TestCase):
         mujoco.mj_forward(self.model, self.data)
         if simulation.landing_reference is not None:
             simulation.landing_reference.reset(float(self.data.time))
+        simulation.trajectory.latch(float(self.data.time), self.data.qpos[:3], np.zeros(3),
+                                    -float(self.model.opt.gravity[2]))
 
     def test_contact_gating_switches_modes_and_bleeds_wheels(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
@@ -530,9 +533,33 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual({phase for phase, _ in fit_phases},
                          {FlightPhase.DESCENT, FlightPhase.LANDING})
         self.assertNotIn(True, {contact for _, contact in fit_phases})
-        self.assertGreater(simulation.landing_reference.filter.accepted, 0)
+        self.assertGreater(simulation.landing_reference.plane.accepted, 0)
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))
+
+    def test_jump_latches_the_imu_arc_at_cutoff_and_touchdown_ends_it(self) -> None:
+        simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
+        body = self.model.jnt_bodyid[simulation.ids.root_joint]
+        while self.data.time < 2.0:
+            simulation.step()
+        self.assertFalse(simulation.trajectory.ballistic)
+        simulation.handle_key("space")
+        self.assertTrue(simulation.trajectory.integrating)
+        while not simulation.trajectory.ballistic and self.data.time < 2.5:
+            simulation.step()
+        # The IMU-integrated push-off gives the true velocity and position.
+        tracker = simulation.trajectory
+        np.testing.assert_allclose(tracker.launch_velocity, self.data.qvel[:3], atol=0.05)
+        self.assertLess(np.linalg.norm(tracker.cutoff_position - self.data.xpos[body]), 0.03)
+        self.assertTrue(simulation.in_contact)  # latched before the flight debounce
+        worst = 0.0
+        while tracker.ballistic and self.data.time < 5.0:
+            simulation.step()
+            if tracker.ballistic:
+                position, _ = tracker.state(float(self.data.time))
+                worst = max(worst, float(np.linalg.norm(position - self.data.xpos[body])))
+        self.assertTrue(simulation.in_contact)  # ended at touchdown
+        self.assertLess(worst, 0.05)  # the fixed arc stays on the hop (measured 0.013 m)
 
     def test_scan_keeps_every_lidar_point_of_each_jump(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

@@ -8,24 +8,26 @@ differs):
    ground the lidar saw earlier in the hop counts too (its blind cone and
    the band's edges leave parts unseen at any one moment).
 2. :meth:`GroundMap.predict_landing` follows the robot's ballistic trajectory
-   (position, velocity, gravity) to where it first meets the mapped ground,
-   ``touchdown_clearance`` below the base.
+   (the arc latched at lift-off, :mod:`jumper_sim.trajectory`) to where it
+   first meets the mapped ground, ``touchdown_clearance`` below the base. The
+   arc is fixed, so the spot only moves if the mapped ground along it does.
 3. :func:`fit_ground_plane` fits the area-weighted "average" plane to up to
    ``max_points`` of the jump's points within ``roi_radius`` of that spot,
    with outlier rejection, and estimates how uncertain its normal is.
-4. :class:`LandingReference` fuses successive plane normals with a small
-   Kalman filter on the tilt vector (n_x, n_y): fits that are too noisy are
-   ignored, clean fits dominate, and it keeps updating until touchdown (the
-   lidar keeps seeing the spot, so the robot can still correct just before
-   impact; ``freeze_near_touchdown`` restores the old freeze). It also tells
-   when touchdown is near (it starts the LANDING phase). The tilt is clamped
-   to ``max_tilt``.
-5. :meth:`LandingReference.reference_quaternion` builds the attitude the
+4. :class:`LandingPlane` takes the newest fit as the landing plane: the map
+   keeps every point of the jump and the spot is fixed, so the newest fit
+   already holds all the data the earlier ones had (fusing them, as the
+   Kalman filter that used to be here did, only counted it again). Fits that
+   are too noisy (still far away) are ignored, and it keeps updating until
+   touchdown (``freeze_near_touchdown`` restores the old freeze). It also
+   tells when touchdown is near (it starts the LANDING phase). The tilt is
+   clamped to ``max_tilt``.
+5. :meth:`LandingPlane.reference_quaternion` builds the attitude the
    controller should hold: body z along the plane normal, heading unchanged.
 
 The points and the trajectory are in the world frame. In the simulator the
-pose and velocity are the true ones; on the robot they come from odometry /
-the state estimate.
+lidar points are placed with the true pose; on the robot that comes from
+odometry / the state estimate.
 """
 
 from __future__ import annotations
@@ -47,9 +49,6 @@ class LandingReferenceConfig:
     # lands where the base comes this close to the mapped ground.
     touchdown_clearance: float = 0.3  # m
     max_tilt: float = math.radians(20.0)  # never ask for a steeper landing
-    prior_sigma: float = math.radians(15.0)  # trust in "level" at take-off
-    process_sigma: float = math.radians(10.0)  # tilt change per sqrt(second)
-    outlier_gate: float = 4.0  # reject fits this many sigmas from the estimate
     cell_size: float = 0.0625  # m, ground grid for area-weighted fitting
     outlier_mad_factor: float = 3.0  # cells further than this many sigmas are outliers
     min_residual_floor: float = 0.02  # m, outlier threshold floor
@@ -57,9 +56,6 @@ class LandingReferenceConfig:
     # Fits whose sensor-noise uncertainty exceeds this are ignored. Terrain
     # roughness does not count here -- it does not shrink as the robot descends.
     max_fit_sigma: float = math.radians(3.0)
-    # Successive fits see the same ground, so their roughness errors are
-    # correlated; never let the fused estimate claim more certainty than this.
-    min_reference_sigma: float = math.radians(1.0)
     # Touchdown is near (the LANDING phase starts) below this height or this
     # time to touchdown. The reference keeps updating then, unless frozen.
     near_height: float = 1.0  # m of the landing plane below the robot
@@ -285,21 +281,18 @@ def _fit_height_plane(cells: np.ndarray, inliers: np.ndarray) -> tuple[np.ndarra
     return coefficients, cells[:, 2] - design @ coefficients
 
 
-class LandingReference:
-    """Kalman filter on the plane tilt vector plus the reference attitude."""
+class LandingPlane:
+    """The landing plane (newest usable fit) and the reference attitude."""
 
     def __init__(self, config: LandingReferenceConfig = LandingReferenceConfig()) -> None:
         self.config = config
         self.reset()
 
-    def reset(self, time: float | None = None) -> None:
-        """Back to "land level" with prior uncertainty (e.g. at take-off)."""
+    def reset(self) -> None:
+        """Back to "land level" (e.g. at take-off)."""
         self._tilt = np.zeros(2)
-        self._variance = self.config.prior_sigma**2
-        self._time = time
         self.last_estimate: PlaneEstimate | None = None
         self.accepted = 0
-        self.rejected = 0  # outliers
         self.ignored = 0  # too noisy (too far away)
         self.near_touchdown = 0  # fits with touchdown near
         self._last_height: tuple[float, float] | None = None  # (time, height)
@@ -319,18 +312,9 @@ class LandingReference:
         tx, ty = self.tilt_vector
         return np.array([tx, ty, math.sqrt(max(0.0, 1.0 - tx * tx - ty * ty))])
 
-    @property
-    def sigma(self) -> float:
-        return math.sqrt(self._variance)
-
     def update(self, estimate: PlaneEstimate) -> bool:
-        """Fuse one plane fit; returns whether it was accepted."""
+        """Take one plane fit; returns whether it became the landing plane."""
         self.last_estimate = estimate
-        if self._time is not None and math.isfinite(estimate.timestamp):
-            dt = max(0.0, estimate.timestamp - self._time)
-            self._variance += self.config.process_sigma**2 * dt
-        if math.isfinite(estimate.timestamp):
-            self._time = estimate.timestamp
         if not estimate.valid:
             return False
         self._update_descent_rate(estimate)
@@ -342,17 +326,7 @@ class LandingReference:
         if noise > self.config.max_fit_sigma:
             self.ignored += 1
             return False
-        measured = np.array(estimate.normal[:2])
-        measurement_variance = estimate.normal_sigma**2
-        innovation = measured - self._tilt
-        if np.linalg.norm(innovation) > self.config.outlier_gate * math.sqrt(
-            self._variance + measurement_variance
-        ):
-            self.rejected += 1
-            return False
-        gain = self._variance / (self._variance + measurement_variance)
-        self._tilt = self._tilt + gain * innovation
-        self._variance = max(self._variance * (1.0 - gain), self.config.min_reference_sigma**2)
+        self._tilt = np.array(estimate.normal[:2], dtype=float)
         self.accepted += 1
         return True
 

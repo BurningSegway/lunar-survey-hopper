@@ -78,7 +78,7 @@ def draw_landing_plane(scene: mujoco.MjvScene, simulation: JumperSimulation,
         )
     arrow = _add_geom(scene)
     if arrow is not None:
-        tip = visual.anchor + ARROW_LENGTH * reference.filter.normal
+        tip = visual.anchor + ARROW_LENGTH * reference.plane.normal
         mujoco.mjv_initGeom(arrow, mujoco.mjtGeom.mjGEOM_ARROW, np.zeros(3),
                             np.zeros(3), np.eye(3).ravel(), ARROW_RGBA)
         mujoco.mjv_connector(arrow, mujoco.mjtGeom.mjGEOM_ARROW, 0.012,
