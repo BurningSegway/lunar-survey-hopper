@@ -25,6 +25,8 @@ enum TelemetryChannelId : size_t {
   TLM_ACCEL,
   TLM_BUS_VOLTAGE,
   TLM_WHEELS,
+  TLM_BURN,
+  TLM_BALLISTIC,
   TLM_COUNT
 };
 
@@ -39,6 +41,8 @@ TelemetryChannel telemetryChannels[] = {
   { "accel",        "AccelX AccelY AccelZ",                                     false },
   { "bus_voltage",  "BusVoltage",                                               false },
   { "wheels",       "odrv0-pos odrv0-vel odrv1-pos odrv1-vel odrv2-pos odrv2-vel", false },
+  { "burn",         "AccLinE AccLinN AccLinU VelE VelN VelU PosE PosN PosU",    false },
+  { "ballistic",    "V0E V0N V0U V0Speed V0Elevation V0Heading ApexTime ApexHeight FlightTime Range LandE LandN PredE PredN PredU", false },
 };
 static_assert(sizeof(telemetryChannels) / sizeof(telemetryChannels[0]) == TLM_COUNT,
               "telemetryChannels must have one row per TelemetryChannelId");
@@ -53,6 +57,7 @@ uint32_t pressure        = 0;       // in pascals
 float    euler_pry[3]    = { 0 };   // -180 to +180 degress
 float    acceleration[3] = { 0 };   // in m/s^2
 uint32_t lastAccelerationMs = 0;
+uint32_t lastAccelerationUs = 0;    // sample timestamp for the velocity integration (dt)
 uint32_t accelerationSampleCount = 0;
 
 // Attitude quaternion as delivered by the MTi: scalar-first {w, x, y, z}.
@@ -88,6 +93,202 @@ FlightState flightState = FlightState::WAITING_FOR_LAUNCH;
 float accelerationMagnitude = 0.0f;
 
 void setAttitudeControlEnabled(bool enabled);
+
+/* Trajectory estimate (Euler integration of acceleration) ---------------------
+ * The MTi "Acceleration" output is the bias-compensated specific force in the
+ * sensor frame (reads ~+g on the up axis at rest). Every sample is rotated into
+ * the local ENU frame with the MTi attitude quaternion (sensor -> local) and
+ * gravity is removed from the up axis, giving the linear acceleration a.
+ *
+ *   Forward Euler:  p[k] = p[k-1] + v[k-1] * dt[k]
+ *                   v[k] = v[k-1] + a[k-1] * dt[k]
+ *
+ * Integration only runs during the burn: origin p = 0 is the launch point,
+ * it starts on the first above-threshold launch sample (including the step
+ * from the previous sample, so the launch debounce loses nothing), and a
+ * rejected candidate resets to rest.
+ *
+ * At propulsion cutoff p and v are latched (p_c, v0) and integration stops:
+ * after cutoff only gravity acts (drag neglected), so the flight is fully
+ * given by the drag-free ballistic arc
+ *   p_pred(t) = p_c + v0 * t - [0, 0, g/2] * t^2,   t = time since cutoff
+ * which is evaluated every IMU sample until landing (streamed on the
+ * 'ballistic' channel) and held afterwards until the next launch.
+ * v0 is also reported as speed, elevation above horizontal and compass
+ * heading (0 = north, 90 = east).
+ */
+constexpr float BALLISTIC_GRAVITY_M_S2 = GRAVITY_M_S2;  // g for the trajectory prediction
+constexpr float VELOCITY_MAX_DT_S      = 0.05f;          // larger sample gaps are not integrated
+
+float accel_lin_world[3]   = { 0 };   // linear acceleration, ENU [m/s^2]
+float velocity_world[3]    = { 0 };   // ENU [m/s]
+float position_world[3]    = { 0 };   // ENU [m], relative to the launch point
+bool  trajectoryIntegrating = false;
+
+float    prevAccelLinWorld[3]  = { 0 };
+uint32_t prevVelocitySampleUs  = 0;
+bool     hasPrevVelocitySample = false;
+
+// Latched at propulsion cutoff
+float    launch_velocity[3]   = { 0 };   // v0, ENU [m/s]
+float    launchSpeed          = 0.0f;    // |v0| [m/s]
+float    launchElevationDeg   = 0.0f;    // angle of v0 above horizontal [deg]
+float    launchHeadingDeg     = 0.0f;    // compass heading of v0, 0 = N, 90 = E [deg]
+float    cutoff_position[3]   = { 0 };   // p_c, ENU [m]
+uint32_t cutoffSampleUs       = 0;
+uint32_t cutoffSampleMs       = 0;
+bool     launchVelocityValid  = false;
+bool     ballisticActive      = false;   // cutoff -> landing: prediction is updated
+float    predicted_position[3] = { 0 };  // p_pred(t), ENU [m]
+float    ballisticApexTimeS    = 0.0f;   // time from cutoff to apex
+float    ballisticApexHeightM  = 0.0f;   // apex height above the launch point
+float    ballisticFlightTimeS  = 0.0f;   // time from cutoff back to launch height
+float    ballisticRangeM       = 0.0f;   // horizontal distance from launch point at that time
+float    ballisticLanding[2]   = { 0 };  // predicted landing point E, N [m]
+
+// Rotate a sensor-frame vector into the local (ENU) frame: out = R(q) * v,
+// q scalar-first {w, x, y, z}, sensor -> local (MTi convention).
+void rotateSensorToWorld(const float q[4], const float v[3], float out[3]) {
+  const float w = q[0], x = q[1], y = q[2], z = q[3];
+  out[0] = (1.0f - 2.0f * (y * y + z * z)) * v[0] + 2.0f * (x * y - w * z) * v[1] + 2.0f * (x * z + w * y) * v[2];
+  out[1] = 2.0f * (x * y + w * z) * v[0] + (1.0f - 2.0f * (x * x + z * z)) * v[1] + 2.0f * (y * z - w * x) * v[2];
+  out[2] = 2.0f * (x * z - w * y) * v[0] + 2.0f * (y * z + w * x) * v[1] + (1.0f - 2.0f * (x * x + y * y)) * v[2];
+}
+
+void resetTrajectoryEstimate() {
+  trajectoryIntegrating = false;
+  ballisticActive = false;
+  hasPrevVelocitySample = false;
+  for (size_t i = 0; i < 3; ++i) {
+    velocity_world[i] = 0.0f;
+    position_world[i] = 0.0f;
+    accel_lin_world[i] = 0.0f;
+    prevAccelLinWorld[i] = 0.0f;
+  }
+}
+
+// Rotates the newest sample to ENU, removes gravity and returns the time step
+// since the previous sample (0 if there is no usable previous sample).
+float measureLinearAcceleration(uint32_t sampleUs) {
+  rotateSensorToWorld(quaternion_wxyz, acceleration, accel_lin_world);
+  accel_lin_world[2] -= GRAVITY_M_S2;
+
+  float dt = 0.0f;
+  if (hasPrevVelocitySample) {
+    dt = (uint32_t)(sampleUs - prevVelocitySampleUs) * 1e-6f;
+    if (dt > VELOCITY_MAX_DT_S) dt = 0.0f;
+  }
+  return dt;
+}
+
+// One forward-Euler step using the previous sample's velocity / acceleration.
+void eulerStepTrajectory(float dt) {
+  for (size_t i = 0; i < 3; ++i) {
+    position_world[i] += velocity_world[i] * dt;
+    velocity_world[i] += prevAccelLinWorld[i] * dt;
+  }
+}
+
+// Launch detected: start from rest at the origin.
+void beginTrajectory(float dt) {
+  trajectoryIntegrating = true;
+  ballisticActive = false;
+  launchVelocityValid = false;
+  for (size_t i = 0; i < 3; ++i) {
+    velocity_world[i] = 0.0f;
+    position_world[i] = 0.0f;
+  }
+  eulerStepTrajectory(dt);
+}
+
+// Called at the end of every processed sample.
+void finishTrajectorySample(uint32_t sampleUs) {
+  for (size_t i = 0; i < 3; ++i) {
+    prevAccelLinWorld[i] = accel_lin_world[i];
+  }
+  prevVelocitySampleUs = sampleUs;
+  hasPrevVelocitySample = true;
+}
+
+void updatePredictedPosition(uint32_t sampleUs) {
+  const float t = (uint32_t)(sampleUs - cutoffSampleUs) * 1e-6f;
+  for (size_t i = 0; i < 3; ++i) {
+    predicted_position[i] = cutoff_position[i] + launch_velocity[i] * t;
+  }
+  predicted_position[2] -= 0.5f * BALLISTIC_GRAVITY_M_S2 * t * t;
+}
+
+// Propulsion cutoff: latch p_c / v0, stop integrating and predict the
+// drag-free ballistic arc.
+void latchLaunchVelocityAndPredict(uint32_t sampleUs, uint32_t sampleMs) {
+  for (size_t i = 0; i < 3; ++i) {
+    launch_velocity[i] = velocity_world[i];
+    cutoff_position[i] = position_world[i];
+  }
+  cutoffSampleUs = sampleUs;
+  cutoffSampleMs = sampleMs;
+  trajectoryIntegrating = false;
+  launchVelocityValid = true;
+  ballisticActive = true;
+  updatePredictedPosition(sampleUs);
+
+  const float g = BALLISTIC_GRAVITY_M_S2;
+  const float vUp = launch_velocity[2];
+  const float h0 = cutoff_position[2];
+  const float vHorizontal = sqrtf(launch_velocity[0] * launch_velocity[0] +
+                                  launch_velocity[1] * launch_velocity[1]);
+
+  launchSpeed        = sqrtf(vHorizontal * vHorizontal + vUp * vUp);
+  launchElevationDeg = atan2f(vUp, vHorizontal) * (180.0f / PI);
+  launchHeadingDeg   = atan2f(launch_velocity[0], launch_velocity[1]) * (180.0f / PI);
+  if (launchHeadingDeg < 0.0f) launchHeadingDeg += 360.0f;
+
+  ballisticApexTimeS   = (vUp > 0.0f) ? vUp / g : 0.0f;
+  ballisticApexHeightM = h0 + ((vUp > 0.0f) ? vUp * vUp / (2.0f * g) : 0.0f);
+  // h0 + vUp*t - g/2 t^2 = 0  ->  positive root
+  const float disc = vUp * vUp + 2.0f * g * h0;
+  ballisticFlightTimeS = (disc > 0.0f) ? (vUp + sqrtf(disc)) / g : 0.0f;
+  if (ballisticFlightTimeS < 0.0f) ballisticFlightTimeS = 0.0f;
+  ballisticLanding[0] = cutoff_position[0] + launch_velocity[0] * ballisticFlightTimeS;
+  ballisticLanding[1] = cutoff_position[1] + launch_velocity[1] * ballisticFlightTimeS;
+  ballisticRangeM = sqrtf(ballisticLanding[0] * ballisticLanding[0] +
+                          ballisticLanding[1] * ballisticLanding[1]);
+
+  
+  Serial.print("Cutoff: v0 ENU [m/s] ");
+  Serial.print(launch_velocity[0], 3); Serial.print(' ');
+  Serial.print(launch_velocity[1], 3); Serial.print(' ');
+  Serial.print(launch_velocity[2], 3);
+  Serial.print(" (");
+  Serial.print(launchSpeed, 3); Serial.print(" m/s, elev ");
+  Serial.print(launchElevationDeg, 1); Serial.print(" deg, hdg ");
+  Serial.print(launchHeadingDeg, 1); Serial.print(" deg)");
+  Serial.print(", p ENU [m] ");
+  Serial.print(cutoff_position[0], 3); Serial.print(' ');
+  Serial.print(cutoff_position[1], 3); Serial.print(' ');
+  Serial.print(cutoff_position[2], 3);
+  Serial.print(" | predicted apex ");
+  Serial.print(ballisticApexHeightM, 3); Serial.print(" m @ ");
+  Serial.print(ballisticApexTimeS, 3); Serial.print(" s, flight ");
+  Serial.print(ballisticFlightTimeS, 3); Serial.print(" s, range ");
+  Serial.print(ballisticRangeM, 3); Serial.print(" m, landing EN [m] ");
+  Serial.print(ballisticLanding[0], 3); Serial.print(' ');
+  Serial.print(ballisticLanding[1], 3); Serial.println();
+}
+
+// Landing: freeze the prediction and compare the measured flight time
+// (cutoff -> first touchdown sample) with the predicted one.
+void endTrajectory(uint32_t touchdownMs) {
+  trajectoryIntegrating = false;
+  if (!ballisticActive) return;
+  ballisticActive = false;
+
+  Serial.print("Landing: flight time measured ");
+  Serial.print((uint32_t)(touchdownMs - cutoffSampleMs) * 1e-3f, 3);
+  Serial.print(" s, predicted ");
+  Serial.print(ballisticFlightTimeS, 3);
+  Serial.println(" s");
+}
 
 /* LQR attitude controller -----------------------------------------------------
  * Model (angular_momentum_tau.mlx, reduced 6-state system A6/B6):
@@ -164,6 +365,7 @@ void updateFlightState(uint32_t now) {
     processedSampleCount = accelerationSampleCount;
     launchCandidateActive = false;
     hasPreviousAccelerationSample = false;
+    resetTrajectoryEstimate();
 
     if (flightState != FlightState::WAITING_FOR_LAUNCH) {
       flightState = FlightState::WAITING_FOR_LAUNCH;
@@ -186,6 +388,14 @@ void updateFlightState(uint32_t now) {
       acceleration[1] * acceleration[1] +
       acceleration[2] * acceleration[2]);
   const uint32_t sampleMs = lastAccelerationMs;
+  const uint32_t sampleUs = lastAccelerationUs;
+
+  // Trajectory estimate: step with the previous sample first, so a state
+  // change on this sample sees the trajectory up to this sample.
+  const float dt = measureLinearAcceleration(sampleUs);
+  if (trajectoryIntegrating) {
+    eulerStepTrajectory(dt);
+  }
 
   switch (flightState) {
     case FlightState::WAITING_FOR_LAUNCH:
@@ -193,12 +403,19 @@ void updateFlightState(uint32_t now) {
         if (!launchCandidateActive) {
           launchCandidateSince = sampleMs;
           launchCandidateActive = true;
+          // Start integrating from rest at the origin, including the step
+          // from the last pre-threshold sample to this one.
+          beginTrajectory(dt);
         } else if ((uint32_t)(sampleMs - launchCandidateSince) >=
                    LAUNCH_DEBOUNCE_MS) {
           flightState = FlightState::WAITING_FOR_PROPULSION_CUTOFF;
           launchCandidateActive = false;
         }
       } else {
+        // Candidate rejected (or never started): back to rest.
+        if (launchCandidateActive) {
+          resetTrajectoryEstimate();
+        }
         launchCandidateActive = false;
       }
       break;
@@ -207,6 +424,7 @@ void updateFlightState(uint32_t now) {
       if (accelerationMagnitude < PROPULSION_END_ACCEL_THRESHOLD_M_S2) {
         flightState = FlightState::AIRBORNE_WAITING_FOR_FLIGHT;
         flightCandidateActive = false;
+        latchLaunchVelocityAndPredict(sampleUs, sampleMs);
         setAttitudeControlEnabled(true);
         Serial.println("Propulsion ended; attitude control enabled");
       }
@@ -240,6 +458,7 @@ void updateFlightState(uint32_t now) {
                    LANDING_DEBOUNCE_MS) {
           flightState = FlightState::WAITING_FOR_LAUNCH;
           landingCandidateActive = false;
+          endTrajectory(landingCandidateSince);
           setAttitudeControlEnabled(false);
           Serial.println("Landing detected; attitude control disabled");
         }
@@ -250,6 +469,7 @@ void updateFlightState(uint32_t now) {
           flightState = FlightState::WAITING_FOR_LAUNCH;
           landingCandidateActive = false;
           landingDecelerationCandidateActive = false;
+          endTrajectory(landingCandidateSince);
           setAttitudeControlEnabled(false);
           Serial.println("Landing detected; attitude control disabled");
         }
@@ -265,6 +485,11 @@ void updateFlightState(uint32_t now) {
       }
       break;
   }
+
+  if (ballisticActive) {
+    updatePredictedPosition(sampleUs);
+  }
+  finishTrajectorySample(sampleUs);
 
   previousAccelerationMagnitude = accelerationMagnitude;
   hasPreviousAccelerationSample = true;
@@ -728,6 +953,35 @@ void loop() {
         Telemetry::value(Serial, velNames[i], odrive_user_data[i]->last_feedback.Vel_Estimate);
       }
     }
+    if (telemetry.on(TLM_BURN)) {  // integrated during the burn, ENU, origin = launch point
+      Telemetry::value(Serial, "AccLinE", accel_lin_world[0], 2);
+      Telemetry::value(Serial, "AccLinN", accel_lin_world[1], 2);
+      Telemetry::value(Serial, "AccLinU", accel_lin_world[2], 2);
+      Telemetry::value(Serial, "VelE", velocity_world[0], 3);
+      Telemetry::value(Serial, "VelN", velocity_world[1], 3);
+      Telemetry::value(Serial, "VelU", velocity_world[2], 3);
+      Telemetry::value(Serial, "PosE", position_world[0], 3);
+      Telemetry::value(Serial, "PosN", position_world[1], 3);
+      Telemetry::value(Serial, "PosU", position_world[2], 3);
+    }
+    if (telemetry.on(TLM_BALLISTIC) && launchVelocityValid) {
+      Telemetry::value(Serial, "V0E", launch_velocity[0], 3);
+      Telemetry::value(Serial, "V0N", launch_velocity[1], 3);
+      Telemetry::value(Serial, "V0U", launch_velocity[2], 3);
+      Telemetry::value(Serial, "V0Speed", launchSpeed, 3);
+      Telemetry::value(Serial, "V0Elevation", launchElevationDeg, 1);
+      Telemetry::value(Serial, "V0Heading", launchHeadingDeg, 1);
+      Telemetry::value(Serial, "ApexTime", ballisticApexTimeS, 3);
+      Telemetry::value(Serial, "ApexHeight", ballisticApexHeightM, 3);
+      Telemetry::value(Serial, "FlightTime", ballisticFlightTimeS, 3);
+      Telemetry::value(Serial, "Range", ballisticRangeM, 3);
+      Telemetry::value(Serial, "LandE", ballisticLanding[0], 3);
+      Telemetry::value(Serial, "LandN", ballisticLanding[1], 3);
+      // Estimated trajectory p_pred(t), ENU, origin = launch point
+      Telemetry::value(Serial, "PredE", predicted_position[0], 3);
+      Telemetry::value(Serial, "PredN", predicted_position[1], 3);
+      Telemetry::value(Serial, "PredU", predicted_position[2], 3);
+    }
   }
 }
 
@@ -765,6 +1019,7 @@ void imu_callback( XsensEventFlag_t event, XsensEventData_t *mtdata )
                 acceleration[1] = mtdata->data.f4x3[1];
                 acceleration[2] = mtdata->data.f4x3[2];
                 lastAccelerationMs = millis();
+                lastAccelerationUs = micros();
                 ++accelerationSampleCount;
             }
             break;
