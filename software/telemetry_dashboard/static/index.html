@@ -717,38 +717,57 @@ function trajectoryAt(t) {
   const maxAge = Math.max(0.5, 4 * (catalog ? catalog.rate : 20) / 1000);
   const out = { burn: [], pos: null, arc: [], pc: null, v0: null, apex: null, land: null, pred: null, b: null };
 
-  // Burn path: walk back from t while the position gets closer to the launch point.
-  // That stops at the launch (position reset to 0) or at the previous flight's frozen p_c.
   const [pe, pn, pu] = ["PosE", "PosN", "PosU"].map(n => series.get(n));
-  if (pe && pn && pu && pe.t.length && pn.t.length && pu.t.length) {
-    const i = upperBound(pe.t, t) - 1;
-    if (i >= 0 && t - pe.t[i] <= maxAge) {
-      const at = k => [pe.v[k], valueAt(pn, pe.t[k]), valueAt(pu, pe.t[k])];
-      let cur = at(i);
-      out.pos = cur;
-      const pts = [cur];
-      for (let k = i - 1; k >= 0 && i - k < 6000; k--) {
-        if (pe.t[k + 1] - pe.t[k] > 1) break;
-        const p = at(k);
-        if (Math.hypot(...p) > Math.hypot(...cur) + 1e-3) break;
-        if (p.some((v, j) => v !== cur[j])) pts.push(p);
-        cur = p;
-        if (Math.hypot(...p) < 1e-6) break;
-      }
-      out.burn = pts.reverse();
+  const hasPos = pe && pn && pu && pe.t.length && pn.t.length && pu.t.length;
+  const posAt = k => [pe.v[k], valueAt(pn, pe.t[k]), valueAt(pu, pe.t[k])];
+  // Burn path ending at sample i: walk back while the position gets closer to the launch
+  // point. That stops at the launch (position reset to 0) or at the previous hop's frozen p_c.
+  const burnPath = i => {
+    let cur = posAt(i);
+    const pts = [cur];
+    for (let k = i - 1; k >= 0 && i - k < 6000; k--) {
+      if (pe.t[k + 1] - pe.t[k] > 1) break;
+      const p = posAt(k);
+      if (Math.hypot(...p) > Math.hypot(...cur) + 1e-3) break;
+      if (p.some((v, j) => v !== cur[j])) pts.push(p);
+      cur = p;
+      if (Math.hypot(...p) < 1e-6) break;
     }
-  }
+    return pts.reverse();
+  };
+  const iPos = hasPos ? upperBound(pe.t, t) - 1 : -1;
+  if (iPos >= 0 && t - pe.t[iPos] <= maxAge) out.pos = posAt(iPos);
+  const atRest = !out.pos || Math.hypot(...out.pos) < 1e-6;
 
   // Ballistic prediction
   const names = ["V0E", "V0N", "V0U", "FlightTime", "LandE", "LandN", "ApexTime", "ApexHeight",
                  "V0Speed", "V0Elevation", "V0Heading", "Range", "PredE", "PredN", "PredU"];
-  const b = Object.fromEntries(names.map(n => [n, latestAt(n, t, maxAge)]));
-  // The firmware stops printing these at the next launch: if the burn channel kept
+  const v0e = series.get("V0E");
+  const iB = v0e ? upperBound(v0e.t, t) - 1 : -1;
+  let tb = iB >= 0 ? v0e.t[iB] : null;          // last ballistic sample at or before t
+  // The firmware stops printing these once a new launch is confirmed: if the burn channel kept
   // printing after the last ballistic sample, that prediction belongs to the previous hop.
-  const lastT = n => { const s = series.get(n); const i = s ? upperBound(s.t, t) - 1 : -1; return i >= 0 ? s.t[i] : null; };
-  const tb = lastT("V0E"), tp = out.pos ? lastT("PosE") : null;
-  const stale = tb != null && tp != null && tp - tb > Math.max(0.06, 2.5 * (catalog ? catalog.rate : 20) / 1000);
-  if (!stale && b.V0E != null && b.V0N != null && b.V0U != null && b.FlightTime != null) {
+  // Exception: while the hopper is at rest (e.g. a rejected launch candidate from the
+  // touchdown shock, or older firmware), keep showing the last hop until a new burn starts.
+  const fresh = tb != null && t - tb <= maxAge &&
+    !(out.pos && pe.t[iPos] - tb > Math.max(0.06, 2.5 * (catalog ? catalog.rate : 20) / 1000));
+  if (!fresh && !(tb != null && atRest)) tb = null;
+  const b = tb == null ? {} : Object.fromEntries(names.map(n => [n, latestAt(n, tb, maxAge)]));
+
+  // Burn path: anchored at the cutoff of the shown hop (start of its ballistic run), so a
+  // later position reset does not erase it; otherwise the burn in progress up to t.
+  if (hasPos) {
+    let iEnd = iPos;
+    if (tb != null) {
+      let k = iB;
+      while (k > 0 && v0e.v[k - 1] === v0e.v[iB] && v0e.t[k] - v0e.t[k - 1] <= maxAge) k--;
+      const i = upperBound(pe.t, v0e.t[k]) - 1;
+      iEnd = i >= 0 && v0e.t[k] - pe.t[i] <= maxAge ? i : -1;
+    } else if (!out.pos) iEnd = -1;
+    if (iEnd >= 0) out.burn = burnPath(iEnd);
+  }
+
+  if (tb != null && b.V0E != null && b.V0N != null && b.V0U != null && b.FlightTime != null) {
     out.b = b;
     const v0 = out.v0 = [b.V0E, b.V0N, b.V0U];
     const T = b.FlightTime;
@@ -763,7 +782,18 @@ function trajectoryAt(t) {
     for (let k = 0; k <= 80; k++) out.arc.push(at(Tend * k / 80));
     if (v0[2] > 0 && v0[2] / TRAJ_G < Tend) out.apex = at(v0[2] / TRAJ_G);
     if (T > 0) out.land = [...at(T).slice(0, 2), 0];
-    if (b.PredE != null && b.PredN != null && b.PredU != null) out.pred = [b.PredE, b.PredN, b.PredU];
+    if (b.PredE != null && b.PredN != null && b.PredU != null) {
+      out.pred = [b.PredE, b.PredN, b.PredU];
+      // Stop at the predicted landing point rather than falling through the ground
+      // (the firmware keeps extrapolating until it detects the real touchdown).
+      if (out.land && (out.pred[2] < 0 || Math.hypot(out.pred[0] - out.land[0], out.pred[1] - out.land[1], out.pred[2]) < 0.01)) {
+        out.pred = [...out.land];
+        out.landed = true;
+      }
+    } else if (out.land) {
+      out.pred = [...out.land];   // ballistic channel on but no PredE/N/U: assume landed
+      out.landed = true;
+    }
   }
   return out;
 }
@@ -781,8 +811,7 @@ function drawTrajectory(V, W, H, t, when) {
   // phase, as far as the telemetry tells
   let phase = "no data";
   if (tr.pred) {
-    const landed = tr.land && Math.hypot(tr.pred[0] - tr.land[0], tr.pred[1] - tr.land[1]) < 0.01 && Math.abs(tr.pred[2]) < 0.01;
-    phase = landed ? "landed" : "ballistic";
+    phase = tr.landed ? "landed" : "ballistic";
   } else if (tr.pos) {
     phase = Math.hypot(...tr.pos) > 1e-6 ? "burn" : "on ground";
   }

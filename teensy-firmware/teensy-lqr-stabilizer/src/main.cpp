@@ -113,7 +113,9 @@ void setAttitudeControlEnabled(bool enabled);
  * given by the drag-free ballistic arc
  *   p_pred(t) = p_c + v0 * t - [0, 0, g/2] * t^2,   t = time since cutoff
  * which is evaluated every IMU sample until landing (streamed on the
- * 'ballistic' channel) and held afterwards until the next launch.
+ * 'ballistic' channel; t is capped at the predicted flight time, so it stops
+ * at the predicted landing point) and held afterwards until the next
+ * confirmed launch.
  * v0 is also reported as speed, elevation above horizontal and compass
  * heading (0 = north, 90 = east).
  */
@@ -189,11 +191,13 @@ void eulerStepTrajectory(float dt) {
   }
 }
 
-// Launch detected: start from rest at the origin.
+// Launch candidate: start from rest at the origin. The previous hop's
+// ballistic result (launchVelocityValid) stays valid until the launch is
+// confirmed, so a touchdown shock that only looks like a launch for a few
+// samples does not wipe it.
 void beginTrajectory(float dt) {
   trajectoryIntegrating = true;
   ballisticActive = false;
-  launchVelocityValid = false;
   for (size_t i = 0; i < 3; ++i) {
     velocity_world[i] = 0.0f;
     position_world[i] = 0.0f;
@@ -211,7 +215,10 @@ void finishTrajectorySample(uint32_t sampleUs) {
 }
 
 void updatePredictedPosition(uint32_t sampleUs) {
-  const float t = (uint32_t)(sampleUs - cutoffSampleUs) * 1e-6f;
+  float t = (uint32_t)(sampleUs - cutoffSampleUs) * 1e-6f;
+  // Stop at the predicted landing point instead of continuing below ground
+  // when the real touchdown is detected later than predicted.
+  if (ballisticFlightTimeS > 0.0f && t > ballisticFlightTimeS) t = ballisticFlightTimeS;
   for (size_t i = 0; i < 3; ++i) {
     predicted_position[i] = cutoff_position[i] + launch_velocity[i] * t;
   }
@@ -410,6 +417,7 @@ void updateFlightState(uint32_t now) {
                    LAUNCH_DEBOUNCE_MS) {
           flightState = FlightState::WAITING_FOR_PROPULSION_CUTOFF;
           launchCandidateActive = false;
+          launchVelocityValid = false;   // new hop confirmed: drop the previous result
         }
       } else {
         // Candidate rejected (or never started): back to rest.

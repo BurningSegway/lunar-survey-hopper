@@ -494,11 +494,19 @@ class DemoHop:
             tt = min(dt, self.ballistic["FlightTime"])
             self.pred = [self.pc[i] + self.v0[i] * tt for i in range(3)]
             self.pred[2] -= 0.5 * self.G * tt * tt
-            if dt >= self.ballistic["FlightTime"]:
-                self.phase, self.since = "rest", t
+            # the real touchdown is detected a little after the predicted one
+            if dt >= self.ballistic["FlightTime"] + 0.1:
+                self.phase, self.since, dt = "rest", t, 0.0
                 self.hub.add_line("Landing detected; attitude control disabled")
         if self.phase == "rest":
             self.acc = [0.0, 0.0, 0.0]
+            # touchdown shock: a launch candidate that is rejected after 40 ms (the
+            # firmware integrates from 0, then resets to rest; the ballistic result stays)
+            if self.ballistic and 0.1 <= dt < 0.14:
+                self.pos = [0.0, 0.0, 0.5 * 30.0 * (dt - 0.1) ** 2]
+            elif self.ballistic and dt >= 0.14:
+                self.pos = [0.0, 0.0, 0.0]
+            self.vel = [0.0, 0.0, 0.0] if dt >= 0.1 else self.vel
 
     def _cutoff(self, t: float):
         g = self.G

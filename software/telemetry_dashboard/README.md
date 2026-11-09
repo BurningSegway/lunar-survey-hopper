@@ -75,8 +75,9 @@ in the comments at the top of that file.
     rotated by its attitude when `quat` or `euler` is on.
 
   The header shows the phase and v0 (speed, elevation, heading), apex height, range and flight time. Switching to
-  Trajectory turns on `burn` and `ballistic` if they are off. The last hop stays on screen until the next launch;
-  pausing or hovering over a chart replays it.
+  Trajectory turns on `burn` and `ballistic` if they are off. The cube stops at the predicted landing point. The last
+  hop stays on screen after touchdown, even when the landing shock briefly looks like a launch, and is only replaced
+  once a new burn starts. Pausing or hovering over a chart replays it.
 * **Record / Stop recording** writes everything that arrives (all variables plus console lines) to a file on the Pi.
 * **Export CSV** downloads the server's in-memory history as a wide table, like Teleplot's export. This covers all
   variables since the server started or since the last **Clear**, up to 50,000 points per variable
