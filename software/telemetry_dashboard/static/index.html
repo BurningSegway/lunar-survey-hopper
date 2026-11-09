@@ -794,9 +794,29 @@ function trajectoryAt(t) {
       out.pred = [...out.land];   // ballistic channel on but no PredE/N/U: assume landed
       out.landed = true;
     }
+
+    // Propulsion phase of the shown hop: always launch point -> cutoff point, through the
+    // integrated samples when they are available. A path seen once is remembered per hop,
+    // so it survives later position resets, sparse prints or trimmed history.
+    const key = [b.V0E, b.V0N, b.V0U, b.FlightTime].join("|");
+    const endsAtCutoff = out.burn.length > 1 && Math.hypot(...out.burn[out.burn.length - 1].map((v, j) => v - pc[j])) < 0.05;
+    if (endsAtCutoff) {
+      const prev = burnCache.get(key);
+      if (!prev || out.burn.length >= prev.length) {
+        burnCache.set(key, out.burn);
+        if (burnCache.size > 50) burnCache.delete(burnCache.keys().next().value);
+      }
+    }
+    let burn = burnCache.get(key) || [];
+    if (!burn.length || Math.hypot(...burn[0]) > 1e-6) burn = [[0, 0, 0], ...burn];
+    if (Math.hypot(...burn[burn.length - 1].map((v, j) => v - pc[j])) > 1e-3) burn = [...burn, pc];
+    out.burn = burn;
+  } else if (out.burn.length && Math.hypot(...out.burn[0]) > 1e-6) {
+    out.burn.unshift([0, 0, 0]);   // burn in progress: the path starts at the launch point
   }
   return out;
 }
+const burnCache = new Map();   // hop (v0 + flight time) -> burn path, see trajectoryAt()
 
 function niceStep(raw) {
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -1009,6 +1029,7 @@ function applyStatus(st) {
 
 function resetData() {
   for (const s of series.values()) { s.t = []; s.v = []; s.lastT = 0; }
+  burnCache.clear();
   $("logs").innerHTML = "";
 }
 
