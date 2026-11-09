@@ -87,6 +87,11 @@
   .cube-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
   .cube-canvas canvas:active { cursor: grabbing; }
   .cube-info { font: 12px ui-monospace, Consolas, monospace; color: var(--muted); margin-left: 6px; }
+  .seg { display: inline-flex; }
+  .seg button { padding: 1px 9px; font-size: 12px; border-radius: 0; }
+  .seg button:first-child { border-radius: 4px 0 0 4px; }
+  .seg button:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+  .seg button.on { background: var(--accent); color: #111; border-color: var(--accent); }
   #cmd { width: 260px; padding: 1px 6px; background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 4px; font: 12px ui-monospace, Consolas, monospace; }
   @media (max-width: 700px) {
@@ -117,7 +122,7 @@
     </label>
     <button id="record" title="Record all incoming telemetry to a CSV file on the Pi">Record</button>
     <button id="pause" title="Space">Pause</button>
-    <button id="cubeBtn" title="3D attitude view (needs the quat or euler channel)">Cube</button>
+    <button id="cubeBtn" title="3D attitude / trajectory view">Cube</button>
     <button id="addChart">+ Chart</button>
     <button id="clear" title="Clear data on the server and in all open pages">Clear</button>
     <button id="export" title="Download everything the server holds as CSV">Export CSV</button>
@@ -167,7 +172,7 @@ const $ = (id) => document.getElementById(id);
 const LS_KEY = "hopperTelemetryLayout";
 function saveLayout() {
   localStorage.setItem(LS_KEY, JSON.stringify({
-    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value, cube: !!cube, cubeW: cubeWidth,
+    charts: charts.map(c => c.names), window: windowS, cols: $("cols").value, cube: !!cube, cubeW: cubeWidth, cubeMode,
     colors: Object.fromEntries([...series].map(([n, s]) => [n, s.color])),
   }));
 }
@@ -181,6 +186,7 @@ function loadLayout() {
     if (l.cols) $("cols").value = l.cols;
     (l.charts || []).forEach(names => addChart(names));
     if (l.cubeW) cubeWidth = +l.cubeW;
+    if (l.cubeMode === "trajectory") cubeMode = "trajectory";
     if (l.cube) toggleCube(true, false);
   } catch (e) { console.warn(e); }
 }
@@ -431,6 +437,7 @@ const CUBE_VIEW = { az: -55 * Math.PI / 180, elev: 25 * Math.PI / 180 };
 const CUBE_DEFAULT_W = 420;
 let cube = null;
 let cubeWidth = CUBE_DEFAULT_W;
+let cubeMode = "attitude";          // "attitude" | "trajectory"
 
 function applyCubeLayout() {
   const m = document.querySelector("main");
@@ -451,11 +458,20 @@ function toggleCube(show = !cube, userAction = true) {
     return;
   }
   if (cube) return;
-  pane.innerHTML = `<div class="chart-head"><span class="legend-item" style="cursor:default;text-decoration:none">Attitude</span>` +
+  pane.innerHTML = `<div class="chart-head"><span class="seg">` +
+    `<button data-mode="attitude" title="Attitude of the hopper (quat or euler channel)">Attitude</button>` +
+    `<button data-mode="trajectory" title="Burn path and predicted ballistic arc (burn and ballistic channels)">Trajectory</button></span>` +
     `<span class="cube-info"></span><button class="close" title="Close">×</button></div>` +
     `<div class="cube-canvas"><canvas title="Drag to rotate the view, double-click to reset"></canvas></div>`;
-  cube = { canvas: pane.querySelector("canvas"), info: pane.querySelector(".cube-info"), ...CUBE_VIEW, drag: null };
+  cube = { canvas: pane.querySelector("canvas"), info: pane.querySelector(".cube-info"), ...CUBE_VIEW, drag: null, mode: cubeMode };
   pane.querySelector(".close").onclick = () => toggleCube(false);
+  const segs = pane.querySelectorAll(".seg button");
+  const showMode = () => segs.forEach(b => b.classList.toggle("on", b.dataset.mode === cube.mode));
+  segs.forEach(b => b.onclick = () => {
+    cube.mode = cubeMode = b.dataset.mode;
+    showMode(); ensureViewChannels(); saveLayout();
+  });
+  showMode();
   const cv = cube.canvas;
   cv.addEventListener("pointerdown", e => { cube.drag = [e.clientX, e.clientY, cube.az, cube.elev]; cv.setPointerCapture(e.pointerId); });
   cv.addEventListener("pointermove", e => {
@@ -468,7 +484,7 @@ function toggleCube(show = !cube, userAction = true) {
   cv.addEventListener("dblclick", () => Object.assign(cube, CUBE_VIEW));
   $("cubeBtn").classList.add("active");
   applyCubeLayout();
-  if (userAction) { ensureAttitudeChannel(); saveLayout(); }
+  if (userAction) { ensureViewChannels(); saveLayout(); }
 }
 
 // Splitter between the charts and the cube pane
@@ -495,6 +511,17 @@ function ensureAttitudeChannel() {
   if ((q && q.on) || (e && e.on)) return;
   const pick = q || e;
   if (pick) setChannel(pick.n, true);
+}
+
+// The trajectory view also needs the trajectory estimate channels
+// (the attitude one too: it orients the hopper drawn on the path).
+function ensureViewChannels() {
+  ensureAttitudeChannel();
+  if (!catalog || !cube || cube.mode !== "trajectory") return;
+  for (const n of ["burn", "ballistic"]) {
+    const c = catalog.ch.find(x => x.n === n);
+    if (c && !c.on) setChannel(n, true);
+  }
 }
 
 // Sample of a series closest to time t (null if none within 0.5 s).
@@ -540,6 +567,79 @@ const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const norm = a => { const n = Math.hypot(...a); return a.map(v => v / n); };
 
+// Orbit camera around the scene origin (Z up) with projection + drawing helpers.
+function makeView(g, W, H, az, elev, D = 7) {
+  const cam = [D * Math.cos(elev) * Math.cos(az), D * Math.cos(elev) * Math.sin(az), D * Math.sin(elev)];
+  const fwd = norm(cam.map(v => -v)), right = norm(cross(fwd, [0, 0, 1])), up = cross(right, fwd);
+  const F = 1.3 * Math.min(W, H);
+  const P = p => { const d = [p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]], z = Math.max(0.05, dot(d, fwd));
+                   return [W / 2 + F * dot(d, right) / z, H / 2 - F * dot(d, up) / z]; };
+  const line = (a, b, color, width = 1, dash = []) => {
+    const [x0, y0] = P(a), [x1, y1] = P(b);
+    g.strokeStyle = color; g.lineWidth = width; g.setLineDash(dash);
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); g.setLineDash([]);
+  };
+  const path = (pts, color, width = 1, dash = []) => {
+    if (pts.length < 2) return;
+    g.strokeStyle = color; g.lineWidth = width; g.setLineDash(dash); g.lineJoin = "round";
+    g.beginPath();
+    pts.forEach((p, i) => { const [x, y] = P(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke(); g.setLineDash([]);
+  };
+  const label = (p, text, color, bold = false, align = "center", dx = 0, dy = 0) => {
+    const [x, y] = P(p);
+    g.fillStyle = color; g.font = `${bold ? "600 " : ""}12px system-ui, sans-serif`;
+    g.textAlign = align; g.textBaseline = "middle"; g.fillText(text, x + dx, y + dy);
+  };
+  const dotAt = (p, color, r = 4) => {
+    const [x, y] = P(p);
+    g.fillStyle = color; g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fill();
+  };
+  return { g, cam, P, line, path, label, dotAt };
+}
+
+const AX = [["#e06c75", "X·E"], ["#6cc070", "Y·N"], ["#5aa9e6", "Z·U"]];
+
+// The hopper body: a cube of half-size h at scene point c, rotated by R (body -> inertial).
+function drawBody(V, R, c, h, { labels = true, axisWidth = 3 } = {}) {
+  const { g, cam, P, line, label } = V;
+  const toW = v => { const w = mulMV(R, v); return [w[0] + c[0], w[1] + c[1], w[2] + c[2]]; };
+  const faces = [];
+  for (let i = 0; i < 3; i++) for (const sgn of [1, -1]) {
+    const n = [0, 0, 0]; n[i] = sgn;
+    const a = (i + 1) % 3, b = (i + 2) % 3;
+    const corners = [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([u, v]) => {
+      const p = [0, 0, 0]; p[i] = sgn * h; p[a] = u * h; p[b] = v * h; return toW(p);
+    });
+    const nw = mulMV(R, n), center = toW(n.map(v => v * h));
+    const visible = dot(nw, cam.map((cc, k) => cc - center[k])) > 0;
+    faces.push({ i, sgn, corners, nw, center, visible });
+  }
+  const BASE = [[224, 108, 117], [108, 192, 112], [90, 169, 230]];
+  const light = norm([0.3, -0.5, 1]);
+  const bodyAxis = i => {
+    const from = [0, 0, 0]; from[i] = h;
+    const to = [0, 0, 0]; to[i] = h * 2.07;
+    line(toW(from), toW(to), AX[i][0], axisWidth);
+    if (labels) { const lab = [0, 0, 0]; lab[i] = h * 2.33; label(toW(lab), "xyz"[i], AX[i][0], true); }
+  };
+  // +axes whose face points away are drawn first so the cube hides them
+  for (const f of faces) if (f.sgn > 0 && !f.visible) bodyAxis(f.i);
+  for (const f of faces) {
+    if (!f.visible) continue;
+    const shade = 0.45 + 0.55 * Math.max(0, dot(f.nw, light));
+    const k = (f.sgn > 0 ? 1 : 0.55) * shade;
+    const [r, gg, b] = BASE[f.i].map(cc => Math.round(cc * k));
+    g.fillStyle = `rgba(${r},${gg},${b},0.88)`;
+    g.strokeStyle = "#d8dee9"; g.lineWidth = labels ? 1.2 : 0.8;
+    g.beginPath();
+    f.corners.forEach((cc, j) => { const [x, y] = P(cc); j ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.closePath(); g.fill(); g.stroke();
+    if (labels) label(f.center, `${f.sgn > 0 ? "+" : "−"}${"XYZ"[f.i]}`, "rgba(255,255,255,0.8)", true);
+  }
+  for (const f of faces) if (f.sgn > 0 && f.visible) bodyAxis(f.i);
+}
+
 function drawCube(tView) {
   const cv = cube.canvas, dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
@@ -551,34 +651,24 @@ function drawCube(tView) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
 
-  // hovering a chart scrubs the cube to that moment
+  // hovering a chart scrubs the view to that moment
   const hovered = charts.find(c => c.hoverT != null);
   const t = hovered ? hovered.hoverT : tView;
-  const att = attitudeAt(t);
+  const when = hovered ? `${fmt(t - viewEnd())}s` : paused ? "paused" : "";
+  const V = makeView(g, W, H, cube.az, cube.elev);
+  if (cube.mode === "trajectory") drawTrajectory(V, W, H, t, when);
+  else drawAttitude(V, W, H, t, when);
+}
 
-  // camera orbiting the origin, inertial Z up
-  const D = 7, cam = [D * Math.cos(cube.elev) * Math.cos(cube.az), D * Math.cos(cube.elev) * Math.sin(cube.az), D * Math.sin(cube.elev)];
-  const fwd = norm(cam.map(v => -v)), right = norm(cross(fwd, [0, 0, 1])), up = cross(right, fwd);
-  const F = 1.3 * Math.min(W, H);
-  const P = p => { const d = [p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]], z = dot(d, fwd);
-                   return [W / 2 + F * dot(d, right) / z, H / 2 - F * dot(d, up) / z]; };
-  const line = (a, b, color, width = 1, dash = []) => {
-    const [x0, y0] = P(a), [x1, y1] = P(b);
-    g.strokeStyle = color; g.lineWidth = width; g.setLineDash(dash);
-    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); g.setLineDash([]);
-  };
-  const label = (p, text, color, bold = false) => {
-    const [x, y] = P(p);
-    g.fillStyle = color; g.font = `${bold ? "600 " : ""}12px system-ui, sans-serif`;
-    g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(text, x, y);
-  };
+function drawAttitude(V, W, H, t, when) {
+  const { g, line, label } = V;
+  const att = attitudeAt(t);
 
   // ground grid (inertial XY plane, below the cube) + inertial axes
   const gz = -1.5;
   for (let v = -2; v <= 2.001; v += 0.5) {
     line([v, -2, gz], [v, 2, gz], "#252a32"); line([-2, v, gz], [2, v, gz], "#252a32");
   }
-  const AX = [["#e06c75", "X·E"], ["#6cc070", "Y·N"], ["#5aa9e6", "Z·U"]];
   for (let i = 0; i < 3; i++) {
     const tip = [0, 0, 0]; tip[i] = 2.1;
     const lab = [0, 0, 0]; lab[i] = 2.35;
@@ -590,51 +680,193 @@ function drawCube(tView) {
     cube.info.textContent = "no attitude data: turn on the quat or euler channel";
     return;
   }
-  const R = quatToMatrix(att.q);
   const [roll, pitch, yaw] = quatToEulerDeg(att.q);
-  cube.info.textContent = `R ${roll.toFixed(1)}°  P ${pitch.toFixed(1)}°  Y ${yaw.toFixed(1)}°  (${att.src}` +
-    `${hovered ? `, ${fmt(t - viewEnd())}s` : paused ? ", paused" : ""})`;
-
-  // cube faces: body axis i, sign sgn; visible if its outward normal faces the camera
-  const h = 0.75, toW = v => mulMV(R, v);
-  const faces = [];
-  for (let i = 0; i < 3; i++) for (const sgn of [1, -1]) {
-    const n = [0, 0, 0]; n[i] = sgn;
-    const a = (i + 1) % 3, b = (i + 2) % 3;
-    const corners = [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([u, v]) => {
-      const p = [0, 0, 0]; p[i] = sgn * h; p[a] = u * h; p[b] = v * h; return toW(p);
-    });
-    const nw = toW(n), center = nw.map(v => v * h);
-    const visible = dot(nw, cam.map((c, k) => c - center[k])) > 0;
-    faces.push({ i, sgn, corners, nw, center, visible });
-  }
-  const BASE = [[224, 108, 117], [108, 192, 112], [90, 169, 230]];
-  const light = norm([0.3, -0.5, 1]);
-  const bodyAxis = i => {
-    const from = [0, 0, 0]; from[i] = h;
-    const to = [0, 0, 0]; to[i] = 1.55;
-    const lab = [0, 0, 0]; lab[i] = 1.75;
-    line(toW(from), toW(to), AX[i][0], 3);
-    label(toW(lab), "xyz"[i], AX[i][0], true);
-  };
-  // +axes whose face points away are drawn first so the cube hides them
-  for (const f of faces) if (f.sgn > 0 && !f.visible) bodyAxis(f.i);
-  for (const f of faces) {
-    if (!f.visible) continue;
-    const shade = 0.45 + 0.55 * Math.max(0, dot(f.nw, light));
-    const k = (f.sgn > 0 ? 1 : 0.55) * shade;
-    const [r, gg, b] = BASE[f.i].map(c => Math.round(c * k));
-    g.fillStyle = `rgba(${r},${gg},${b},0.88)`;
-    g.strokeStyle = "#d8dee9"; g.lineWidth = 1.2;
-    g.beginPath();
-    f.corners.forEach((c, j) => { const [x, y] = P(c); j ? g.lineTo(x, y) : g.moveTo(x, y); });
-    g.closePath(); g.fill(); g.stroke();
-    label(f.center, `${f.sgn > 0 ? "+" : "−"}${"XYZ"[f.i]}`, "rgba(255,255,255,0.8)", true);
-  }
-  for (const f of faces) if (f.sgn > 0 && f.visible) bodyAxis(f.i);
+  cube.info.textContent = `R ${roll.toFixed(1)}°  P ${pitch.toFixed(1)}°  Y ${yaw.toFixed(1)}°  (${att.src}${when ? ", " + when : ""})`;
+  drawBody(V, quatToMatrix(att.q), [0, 0, 0], 0.75);
 
   g.font = "11px system-ui, sans-serif"; g.textAlign = "left"; g.textBaseline = "top"; g.fillStyle = "#8590a2";
   g.fillText("dashed: inertial frame (ENU)   solid: body axes", 8, H - 18);
+}
+
+// ----------------------------------------------------------- trajectory ---
+// Built from the firmware's trajectory estimate (teensy-lqr-stabilizer):
+//   burn channel:      PosE/N/U, integrated from the launch point during the burn,
+//                      frozen at the cutoff position p_c until the next launch.
+//   ballistic channel: printed from propulsion cutoff until the next launch:
+//                      v0 (V0E/N/U), FlightTime, LandE/N, ApexTime/Height and the
+//                      live drag-free prediction PredE/N/U.
+// The drag-free arc p(τ) = p_c + v0 τ − [0, 0, g/2] τ² is redrawn here from v0.
+const TRAJ_G = 9.81;   // BALLISTIC_GRAVITY_M_S2 in the firmware
+const TRAJ_COL = { burn: "#f0883e", arc: "#5aa9e6", land: "#e06c75", apex: "#e6b450", hop: "#d8dee9" };
+
+function upperBound(arr, x) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= x) lo = m + 1; else hi = m; }
+  return lo;
+}
+
+// Last sample at or before t, if it is at most maxAge old.
+function latestAt(name, t, maxAge) {
+  const s = series.get(name);
+  if (!s) return null;
+  const i = upperBound(s.t, t) - 1;
+  return i >= 0 && t - s.t[i] <= maxAge ? s.v[i] : null;
+}
+
+function trajectoryAt(t) {
+  const maxAge = Math.max(0.5, 4 * (catalog ? catalog.rate : 20) / 1000);
+  const out = { burn: [], pos: null, arc: [], pc: null, v0: null, apex: null, land: null, pred: null, b: null };
+
+  // Burn path: walk back from t while the position gets closer to the launch point.
+  // That stops at the launch (position reset to 0) or at the previous flight's frozen p_c.
+  const [pe, pn, pu] = ["PosE", "PosN", "PosU"].map(n => series.get(n));
+  if (pe && pn && pu && pe.t.length && pn.t.length && pu.t.length) {
+    const i = upperBound(pe.t, t) - 1;
+    if (i >= 0 && t - pe.t[i] <= maxAge) {
+      const at = k => [pe.v[k], valueAt(pn, pe.t[k]), valueAt(pu, pe.t[k])];
+      let cur = at(i);
+      out.pos = cur;
+      const pts = [cur];
+      for (let k = i - 1; k >= 0 && i - k < 6000; k--) {
+        if (pe.t[k + 1] - pe.t[k] > 1) break;
+        const p = at(k);
+        if (Math.hypot(...p) > Math.hypot(...cur) + 1e-3) break;
+        if (p.some((v, j) => v !== cur[j])) pts.push(p);
+        cur = p;
+        if (Math.hypot(...p) < 1e-6) break;
+      }
+      out.burn = pts.reverse();
+    }
+  }
+
+  // Ballistic prediction
+  const names = ["V0E", "V0N", "V0U", "FlightTime", "LandE", "LandN", "ApexTime", "ApexHeight",
+                 "V0Speed", "V0Elevation", "V0Heading", "Range", "PredE", "PredN", "PredU"];
+  const b = Object.fromEntries(names.map(n => [n, latestAt(n, t, maxAge)]));
+  // The firmware stops printing these at the next launch: if the burn channel kept
+  // printing after the last ballistic sample, that prediction belongs to the previous hop.
+  const lastT = n => { const s = series.get(n); const i = s ? upperBound(s.t, t) - 1 : -1; return i >= 0 ? s.t[i] : null; };
+  const tb = lastT("V0E"), tp = out.pos ? lastT("PosE") : null;
+  const stale = tb != null && tp != null && tp - tb > Math.max(0.06, 2.5 * (catalog ? catalog.rate : 20) / 1000);
+  if (!stale && b.V0E != null && b.V0N != null && b.V0U != null && b.FlightTime != null) {
+    out.b = b;
+    const v0 = out.v0 = [b.V0E, b.V0N, b.V0U];
+    const T = b.FlightTime;
+    if (T > 0 && b.LandE != null && b.LandN != null) {
+      // invert LandE/N = p_c + v0 T and 0 = h0 + vU T − g/2 T²
+      out.pc = [b.LandE - v0[0] * T, b.LandN - v0[1] * T, 0.5 * TRAJ_G * T * T - v0[2] * T];
+    } else {
+      out.pc = out.pos ? [...out.pos] : [0, 0, 0];
+    }
+    const pc = out.pc, at = s => [pc[0] + v0[0] * s, pc[1] + v0[1] * s, pc[2] + v0[2] * s - 0.5 * TRAJ_G * s * s];
+    const Tend = T > 0 ? T : 2 * Math.max(0, v0[2]) / TRAJ_G;
+    for (let k = 0; k <= 80; k++) out.arc.push(at(Tend * k / 80));
+    if (v0[2] > 0 && v0[2] / TRAJ_G < Tend) out.apex = at(v0[2] / TRAJ_G);
+    if (T > 0) out.land = [...at(T).slice(0, 2), 0];
+    if (b.PredE != null && b.PredN != null && b.PredU != null) out.pred = [b.PredE, b.PredN, b.PredU];
+  }
+  return out;
+}
+
+function niceStep(raw) {
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  return [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+}
+
+function drawTrajectory(V, W, H, t, when) {
+  const { g, line, path, label, dotAt } = V;
+  const tr = trajectoryAt(t);
+  const current = tr.pred || tr.pos;
+
+  // phase, as far as the telemetry tells
+  let phase = "no data";
+  if (tr.pred) {
+    const landed = tr.land && Math.hypot(tr.pred[0] - tr.land[0], tr.pred[1] - tr.land[1]) < 0.01 && Math.abs(tr.pred[2]) < 0.01;
+    phase = landed ? "landed" : "ballistic";
+  } else if (tr.pos) {
+    phase = Math.hypot(...tr.pos) > 1e-6 ? "burn" : "on ground";
+  }
+
+  // fit everything into a ~4 unit scene box centred on the origin
+  const pts = [[0, 0, 0], ...tr.burn, ...tr.arc];
+  if (tr.land) pts.push(tr.land);
+  if (current) pts.push(current);
+  const lo = [0, 1, 2].map(i => Math.min(...pts.map(p => p[i])));
+  const hi = [0, 1, 2].map(i => Math.max(...pts.map(p => p[i])));
+  const span = Math.max(1, ...[0, 1, 2].map(i => hi[i] - lo[i]));
+  const k = 4 / span, ctr = [0, 1, 2].map(i => (lo[i] + hi[i]) / 2);
+  const S = p => [(p[0] - ctr[0]) * k, (p[1] - ctr[1]) * k, (p[2] - ctr[2]) * k];
+  const ground = p => [p[0], p[1], 0];
+
+  // ground grid at launch height (U = 0), in metres
+  const step = niceStep(span / 5);
+  const gx0 = Math.floor((ctr[0] - span * 0.6) / step) * step, gx1 = Math.ceil((ctr[0] + span * 0.6) / step) * step;
+  const gy0 = Math.floor((ctr[1] - span * 0.6) / step) * step, gy1 = Math.ceil((ctr[1] + span * 0.6) / step) * step;
+  for (let x = gx0; x <= gx1 + 1e-9; x += step) line(S([x, gy0, 0]), S([x, gy1, 0]), "#252a32");
+  for (let y = gy0; y <= gy1 + 1e-9; y += step) line(S([gx0, y, 0]), S([gx1, y, 0]), "#252a32");
+  // ENU axes at the launch point
+  const axLen = span * 0.25;
+  for (let i = 0; i < 3; i++) {
+    const tip = [0, 0, 0]; tip[i] = axLen;
+    const lab = [0, 0, 0]; lab[i] = axLen * 1.15;
+    line(S([0, 0, 0]), S(tip), AX[i][0] + "99", 1.5, [5, 4]);
+    label(S(lab), "ENU"[i], AX[i][0] + "cc");
+  }
+  dotAt(S([0, 0, 0]), "#8590a2", 3);
+  label(S([0, 0, 0]), "launch", "#8590a2", false, "left", 8, 10);
+
+  if (!tr.pos && !tr.b) {
+    cube.info.textContent = "no trajectory data: turn on the burn and ballistic channels";
+    return;
+  }
+
+  // shadows on the ground, then the 3D paths
+  path(tr.burn.map(p => S(ground(p))), TRAJ_COL.burn + "40", 1.5);
+  path(tr.arc.map(p => S(ground(p))), TRAJ_COL.arc + "40", 1.5);
+  path(tr.arc.map(S), TRAJ_COL.arc, 2, [6, 4]);
+  path(tr.burn.map(S), TRAJ_COL.burn, 3);
+
+  if (tr.pc && tr.b) {
+    dotAt(S(tr.pc), TRAJ_COL.burn, 4);
+    label(S(tr.pc), "cutoff", TRAJ_COL.burn, false, "right", -8, 0);
+  }
+  if (tr.apex) {
+    line(S(tr.apex), S(ground(tr.apex)), TRAJ_COL.apex + "80", 1, [2, 3]);
+    dotAt(S(tr.apex), TRAJ_COL.apex, 4);
+    label(S(tr.apex), `apex ${tr.apex[2].toFixed(2)} m`, TRAJ_COL.apex, false, "left", 8, -8);
+  }
+  if (tr.land) {
+    const [x, y] = V.P(S(tr.land)), r = 6;
+    g.strokeStyle = TRAJ_COL.land; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(x - r, y - r); g.lineTo(x + r, y + r); g.moveTo(x + r, y - r); g.lineTo(x - r, y + r); g.stroke();
+    label(S(tr.land), `landing ${Math.hypot(tr.land[0], tr.land[1]).toFixed(2)} m`, TRAJ_COL.land, false, "left", 10, 16);
+  }
+
+  // the hopper at its current (integrated / predicted) position, rotated by its attitude
+  if (current) {
+    if (current[2] > 1e-3) line(S(current), S(ground(current)), "#8590a2", 1, [2, 3]);
+    const att = attitudeAt(t);
+    if (att) drawBody(V, quatToMatrix(att.q), S(current), 0.12, { labels: false, axisWidth: 2 });
+    else dotAt(S(current), TRAJ_COL.hop, 5);
+  }
+
+  const b = tr.b;
+  let info = phase;
+  if (b) {
+    const speed = b.V0Speed != null ? b.V0Speed : Math.hypot(...tr.v0);
+    info += `  v0 ${speed.toFixed(2)} m/s`;
+    if (b.V0Elevation != null) info += `  elev ${b.V0Elevation.toFixed(1)}°`;
+    if (b.V0Heading != null) info += `  hdg ${b.V0Heading.toFixed(0)}°`;
+    if (b.ApexHeight != null) info += `  apex ${b.ApexHeight.toFixed(2)} m`;
+    if (b.Range != null) info += `  range ${b.Range.toFixed(2)} m`;
+    info += `  T ${b.FlightTime.toFixed(2)} s`;
+  } else if (tr.pos) {
+    info += `  pos ${tr.pos.map(v => v.toFixed(2)).join(" ")} m`;
+  }
+  cube.info.textContent = info + (when ? `  (${when})` : "");
+
+  g.font = "11px system-ui, sans-serif"; g.textAlign = "left"; g.textBaseline = "top"; g.fillStyle = "#8590a2";
+  g.fillText(`solid: burn (integrated)   dashed: predicted arc   grid ${fmt(step)} m   origin: launch point`, 8, H - 18);
 }
 
 // --------------------------------------------------------------- render ---

@@ -459,6 +459,67 @@ class SerialLink:
                 time.sleep(1.0)
 
 
+class DemoHop:
+    """Hop cycle like the firmware's trajectory estimate: rest -> burn (integrated) ->
+    drag-free ballistic arc predicted from the cutoff state -> landing -> rest."""
+
+    G, REST_S, BURN_S, BURN_ACCEL = 9.81, 3.0, 0.35, 14.0
+
+    def __init__(self, hub: "Hub"):
+        self.hub = hub
+        self.phase, self.since = "rest", 0.0
+        self.acc, self.vel, self.pos, self.pred = [0.0] * 3, [0.0] * 3, [0.0] * 3, [0.0] * 3
+        self.dir = [0.0, 0.0, 1.0]
+        self.ballistic: dict | None = None   # printed from cutoff until the next launch
+        self.v0, self.pc = [0.0] * 3, [0.0] * 3
+
+    def step(self, t: float):
+        dt = t - self.since
+        if self.phase == "rest" and dt >= self.REST_S:
+            tilt, hdg = math.radians(random.uniform(5, 20)), random.uniform(0, 2 * math.pi)
+            self.dir = [math.sin(tilt) * math.sin(hdg), math.sin(tilt) * math.cos(hdg), math.cos(tilt)]
+            self.phase, self.since, dt = "burn", t, 0.0
+            self.ballistic = None
+        if self.phase == "burn":
+            if dt >= self.BURN_S:
+                self._cutoff(t)
+                dt = 0.0
+            else:
+                self.acc = [self.BURN_ACCEL * d for d in self.dir]
+                self.vel = [a * dt for a in self.acc]
+                self.pos = [0.5 * a * dt * dt for a in self.acc]
+                return
+        if self.phase == "ballistic":
+            self.acc = [0.0, 0.0, -self.G]
+            tt = min(dt, self.ballistic["FlightTime"])
+            self.pred = [self.pc[i] + self.v0[i] * tt for i in range(3)]
+            self.pred[2] -= 0.5 * self.G * tt * tt
+            if dt >= self.ballistic["FlightTime"]:
+                self.phase, self.since = "rest", t
+                self.hub.add_line("Landing detected; attitude control disabled")
+        if self.phase == "rest":
+            self.acc = [0.0, 0.0, 0.0]
+
+    def _cutoff(self, t: float):
+        g = self.G
+        self.v0 = [self.BURN_ACCEL * d * self.BURN_S for d in self.dir]
+        self.pc = [0.5 * self.BURN_ACCEL * d * self.BURN_S ** 2 for d in self.dir]
+        self.vel, self.pos, self.pred = list(self.v0), list(self.pc), list(self.pc)
+        ve, vn, vu = self.v0
+        vh = math.hypot(ve, vn)
+        T = (vu + math.sqrt(vu * vu + 2 * g * self.pc[2])) / g
+        land = [self.pc[0] + ve * T, self.pc[1] + vn * T]
+        self.ballistic = {
+            "V0E": ve, "V0N": vn, "V0U": vu, "V0Speed": math.hypot(vh, vu),
+            "V0Elevation": math.degrees(math.atan2(vu, vh)),
+            "V0Heading": math.degrees(math.atan2(ve, vn)) % 360,
+            "ApexTime": max(vu, 0) / g, "ApexHeight": self.pc[2] + max(vu, 0) ** 2 / (2 * g),
+            "FlightTime": T, "Range": math.hypot(*land), "LandE": land[0], "LandN": land[1],
+        }
+        self.phase, self.since = "ballistic", t
+        self.hub.add_line("Propulsion ended; attitude control enabled")
+
+
 class DemoLink:
     """Emulates the LQR firmware (including telemetry.h commands) at 50 Hz."""
 
@@ -469,6 +530,9 @@ class DemoLink:
         ["flight", "AccelerationMagnitude Airborne", True],
         ["euler", "Roll Pitch Yaw", False],
         ["quat", "q-w q-x q-y q-z", False],
+        ["burn", "AccLinE AccLinN AccLinU VelE VelN VelU PosE PosN PosU", False],
+        ["ballistic", "V0E V0N V0U V0Speed V0Elevation V0Heading ApexTime ApexHeight FlightTime Range "
+                      "LandE LandN PredE PredN PredU", False],
     ]
 
     def __init__(self, hub: Hub, control: ChannelControl):
@@ -519,16 +583,15 @@ class DemoLink:
         hub.add_line("ODrives running!")
         t0 = time.time()
         airborne = 0
+        hop = DemoHop(hub)
         while True:
             while not self.cmds.empty():
                 self.handle(self.cmds.get())
             t = time.time() - t0
             on = {n: e for n, _, e in self.CHANNELS}
             angles = [0.2 * math.sin(2 * math.pi * 0.4 * t + ph) for ph in (0.0, 1.3, 2.1)]
-            if random.random() < 0.004:
-                airborne ^= 1
-                hub.add_line("Propulsion ended; attitude control enabled" if airborne
-                             else "Landing detected; attitude control disabled")
+            hop.step(t)
+            airborne = int(hop.phase == "ballistic")
             if on["imu_age"]:
                 hub.add_line(f">QuatAgeMs:{random.randint(0, 3)}")
                 hub.add_line(f">GyroAgeMs:{random.randint(0, 3)}")
@@ -556,6 +619,16 @@ class DemoLink:
                      cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
                 for name, v in zip(("q-w", "q-x", "q-y", "q-z"), q):
                     hub.add_line(f">{name}:{v:.5f}")
+            if on["burn"]:
+                for name, v in zip(("AccLinE", "AccLinN", "AccLinU"), hop.acc):
+                    hub.add_line(f">{name}:{v + random.gauss(0, 0.05):.2f}")
+                for name, v in zip(("VelE", "VelN", "VelU", "PosE", "PosN", "PosU"), hop.vel + hop.pos):
+                    hub.add_line(f">{name}:{v:.3f}")
+            if on["ballistic"] and hop.ballistic:
+                for name, v in hop.ballistic.items():
+                    hub.add_line(f">{name}:{v:.3f}")
+                for name, v in zip(("PredE", "PredN", "PredU"), hop.pred):
+                    hub.add_line(f">{name}:{v:.3f}")
             time.sleep(self.rate_ms / 1000)
 
 

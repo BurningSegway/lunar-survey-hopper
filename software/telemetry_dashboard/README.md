@@ -43,7 +43,7 @@ dashboard first.
 | `--history 300` | 300 s | history sent to newly opened pages |
 | `--record` | off | start recording right away (otherwise use the Record button) |
 | `--record-dir DIR` | `./recordings` | where CSV recordings are written |
-| `--demo` | off | fake LQR-like data, for trying the UI without hardware |
+| `--demo` | off | fake LQR-like data plus a repeating hop (burn + ballistic channels), for trying the UI without hardware |
 
 ### Start on boot
 
@@ -66,6 +66,17 @@ in the comments at the top of that file.
   If neither is on, opening the cube switches `quat` on. The cube opens in its own pane to the right of the charts.
   Drag the divider to resize the pane, and double-click the divider to reset its width. Drag inside the cube view to orbit, and double-click to reset the view.
   When paused, the cube shows the paused moment. Hovering over any chart shows the attitude at that point in time.
+* The cube pane has an **Attitude / Trajectory** switch. **Trajectory** shows the firmware's trajectory estimate in
+  ENU metres with the launch point as origin (the view auto-scales, and the grid spacing is shown at the bottom):
+  * solid orange: the **burn** path, integrated on the Teensy (`burn` channel, PosE/N/U), ending at the cutoff point;
+  * dashed blue: the predicted drag-free **ballistic arc** p_c + v0·τ − ½gτ², redrawn from v0, FlightTime and
+    LandE/N (`ballistic` channel), with its apex, the predicted landing point (×) and ground shadows;
+  * the hopper as a small cube at its current position (PredE/N/U in flight, PosE/N/U during the burn),
+    rotated by its attitude when `quat` or `euler` is on.
+
+  The header shows the phase and v0 (speed, elevation, heading), apex height, range and flight time. Switching to
+  Trajectory turns on `burn` and `ballistic` if they are off. The last hop stays on screen until the next launch;
+  pausing or hovering over a chart replays it.
 * **Record / Stop recording** writes everything that arrives (all variables plus console lines) to a file on the Pi.
 * **Export CSV** downloads the server's in-memory history as a wide table, like Teleplot's export. This covers all
   variables since the server started or since the last **Clear**, up to 50,000 points per variable
