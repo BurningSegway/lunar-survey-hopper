@@ -54,23 +54,29 @@ def print_occluded(frame, subject, latency_ms=None):
 # Vicon DataStream SDK
 # --------------------------------------------------------------------------- #
 def run_vicon(server: str, subject: str | None, segment: str | None, rate: float):
+    print("Vicon: loading the DataStream SDK (vicon_dssdk)", flush=True)
     try:
         from vicon_dssdk import ViconDataStream
-    except ImportError:
-        sys.exit("vicon_dssdk not found: install the Vicon DataStream SDK Python package "
-                 "(pip install <DataStream SDK>/Python), or use --fake to test without Vicon")
+    except ImportError as e:
+        sys.exit(f"vicon_dssdk could not be imported ({e}): install the Vicon DataStream SDK Python "
+                 "package (pip install <DataStream SDK>/Python), or use --fake to test without Vicon")
+    print("Vicon: SDK loaded", flush=True)
 
     min_dt = 1.0 / rate if rate > 0 else 0.0
     while True:  # (re)connect loop
+        print("Vicon: creating client", flush=True)
         client = ViconDataStream.Client()
         print(f"Vicon: connecting to {server}", flush=True)
+        attempts = 0
         while True:
             try:
                 client.Connect(server)
                 if client.IsConnected():
                     break
-            except ViconDataStream.DataStreamException:
-                pass
+            except ViconDataStream.DataStreamException as e:
+                attempts += 1
+                if attempts % 5 == 1:
+                    print(f"Vicon: cannot connect to {server} ({e}), retrying...", flush=True)
             time.sleep(1.0)
         client.EnableSegmentData()
         try:  # lowest latency: the server pushes every frame
@@ -183,6 +189,8 @@ def _own_console_window() -> bool:
 
 
 if __name__ == "__main__":
+    import faulthandler
+    faulthandler.enable()   # print where it died if the Vicon SDK's DLL crashes the process
     try:
         main()
     except SystemExit as e:
