@@ -160,6 +160,7 @@ def main():
     ap.add_argument("--fake", action="store_true", help="print a fake hop instead of reading Vicon")
     args = ap.parse_args()
 
+    print(f"vicon_print: Python {sys.version.split()[0]} ({sys.executable})", flush=True)
     try:
         if args.fake:
             run_fake(args.rate or 100.0)
@@ -169,5 +170,30 @@ def main():
         print("\nVicon: stopped")
 
 
+def _own_console_window() -> bool:
+    """True when this process got its own console window (e.g. double-clicked on
+    Windows), which closes as soon as the script exits and hides any error."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(e.code if isinstance(e.code, str) else f"exited with code {e.code}", file=sys.stderr)
+        if _own_console_window():
+            input("\nPress Enter to close...")
+        raise SystemExit(0 if e.code in (None, 0) else 1)
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        if _own_console_window():
+            input("\nPress Enter to close...")
+        raise SystemExit(1)
