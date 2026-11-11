@@ -12,6 +12,9 @@ Vicon --DataStream SDK--> vicon_to_dashboard.py --UDP 47269--> Pi: telemetry_ser
 
 1. Install the Vicon DataStream SDK. Its Python package is in the SDK's `Python` folder:
    `pip install "<DataStream SDK>/Python"` (this provides `vicon_dssdk`).
+   **Use 64-bit Python 3.12 (or similar), not 3.15:** under Python 3.15 the SDK crashes the process with
+   "Windows fatal exception: access violation". With several versions installed, use
+   `py -3.12 -m pip install ...` and `py -3.12 vicon_to_dashboard.py ...`.
 2. In Vicon Tracker/Nexus, create an object (subject) for the hopper. **Set the object's local axes to match the
    IMU's body axes**, at least the x axis, so the dashboard can derive the heading offset from the attitude
    (see below), and so the orientation can be compared with the IMU later.
@@ -30,6 +33,10 @@ python vicon_to_dashboard.py --dashboard raspberrypi.local --subject hopper
 | `--segment NAME` | root segment | |
 | `--max-rate HZ` | every frame | limit the send rate |
 | `--fake` | off | send a fake hop instead of reading Vicon (no SDK needed) |
+
+To just check the Vicon stream without the dashboard, `vicon_print.py` prints the pose in the terminal
+(position, quaternion, roll/pitch/yaw, latency); it takes `--vicon`, `--subject`, `--segment`, `--rate HZ`
+(default 10 lines/s, 0 = every frame) and `--fake`.
 
 The script reconnects automatically if the Vicon server restarts. Status messages (connected, subject picked,
 occluded / tracked again) appear in the dashboard console as `[udp <ip>] Vicon: ...`.
