@@ -156,6 +156,14 @@ above the ground (starting in it, the firm foot ejects the robot).
   kept); it was for the old terrain. Also, despite the name, the moon map's
   input is the OBJ in `MoonSurface.zip`, not a USD stage. Keep or drop the
   step, but don't describe it as part of the moon pipeline.
+- Lidar cut-off range: change `LIVOX_MID360.max_range` from 40 m to 100 m
+  (user's request, not done yet). 40 m is the datasheet's typical range at
+  10 % reflectivity (about regolith's); 100 m is where the sensor cuts off.
+  Update the `lidar.py` docstring and the README lidar table/text (40 m,
+  ~line 403-406), and measure the casting cost before/after: the casters'
+  cost grows with ray length (march steps), though the 100 x 100 m terrain
+  ends rays sooner anyway. Range noise stays the two datasheet cases (2 cm,
+  4 cm within 1 m; user's choice, no further range dependence).
 - `jumper_sim/depth_camera.py` (RealSense D435) is still tracked although
   the camera was removed and nothing imports it: delete it.
 - Hardware prep: measure bearing friction; real cube mass (3.3 kg is a
