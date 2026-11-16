@@ -136,6 +136,28 @@ above the ground (starting in it, the firm foot ejects the robot).
   landing reference already predicts it along the IMU tracker's arc.
 - Lidar self-occlusion (legs, foot) is not modelled.
 - Sensor realism: IMU noise/bias/latency, attitude estimator, control rate.
+- Wheel mass placeholder (user's request to note it): each wheel's
+  `<inertial mass="0.2">` in the MJCF is made up (the inertias are the
+  report's J_w,i, the disc geom is only visual); replace it with the real
+  wheel mass or remove it so it is not mistaken for a design value. The fit
+  script takes the rest from the base, so total mass and J_c are unaffected.
+- Terrain: drop the visual mesh (user's choice, not done yet). Contact, the
+  lidar casters and target placement all use the heightfield
+  (`terrain_collision`, 401x401, 25 cm cells); `terrain_visual`
+  (`terrain.obj`, full 326k-triangle mesh, contype/conaffinity 0) is only
+  drawn, so the viewer shows finer terrain than is simulated, and both drawn
+  together z-fight (patchy grey/green). Show the heightfield instead (it is
+  in geom group 2: make it visible/coloured by default). Touches the MJCF,
+  `convert_usd.py` (stop writing the OBJ), `app.py` and the tests' asset
+  checks (they require `terrain.obj`), the `terrain_visual` test, the
+  README Setup/Terrain sections.
+- `convert_usd.py` cleanup: the loose-rock removal (`_ground_face_mask`) is
+  a no-op for the moon map (one connected surface, 326,424 faces, all
+  kept); it was for the old terrain. Also, despite the name, the moon map's
+  input is the OBJ in `MoonSurface.zip`, not a USD stage. Keep or drop the
+  step, but don't describe it as part of the moon pipeline.
+- `jumper_sim/depth_camera.py` (RealSense D435) is still tracked although
+  the camera was removed and nothing imports it: delete it.
 - Hardware prep: measure bearing friction; real cube mass (3.3 kg is a
   placeholder) and where the springs sit (their inertia is not in J_c); port
   the LQR (torque commands map to ODrive torque mode) + gating,

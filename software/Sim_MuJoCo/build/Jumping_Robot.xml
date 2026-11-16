@@ -72,6 +72,9 @@
       <site name="lidar" pos="0.185 0 -0.1175" euler="0 -67.5 0" size="0.03" rgba="0.1 0.1 0.1 1"/>
 
       <!-- REACTION WHEELS (Housed inside the box on their respective axes) -->
+      <!-- TODO: mass="0.2" is a placeholder, not a design value (replace with
+           the real wheel mass or remove it). The inertias are the report's
+           J_w,i, set by build/fit_robot_model.py; the cylinders are visual only. -->
       <body name="rw_x" pos="0.125 0 0">
         <inertial pos="0 0 0" mass="0.2" diaginertia="0.004422 0.002211 0.002211"/>
         <joint name="rw_x_joint" type="hinge" axis="1 0 0" damping="0.01"/>

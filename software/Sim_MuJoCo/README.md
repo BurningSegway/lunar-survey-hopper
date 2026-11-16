@@ -176,6 +176,15 @@ The values are the final design's, `SENSOR_CUBE`: CAD
 about its CoM), `J_w,i = 0.004422 kg*m^2`, cube 3.3 kg (placeholder), plus
 the jump springs (below).
 
+The MJCF gets these as inertias, not from geometry: `build/fit_robot_model.py`
+sets each wheel's spin inertia to `J_w,i` (and `J_w,i / 2` across it, a thin
+disc) and gives the base the full tensor that makes the whole robot exactly
+`J_c` in the flight pose. **TODO:** the wheels' 0.2 kg each is a placeholder,
+not a design value, and the drawn discs (r = 8 cm) are only visual; replace it
+with the real wheel mass (or remove it) so it does not get read as a
+measurement. The fit takes the rest from the base, so the total mass and
+`J_c` stay as they are either way.
+
 **Controller** (`LqrController` in `jumper_sim/controller.py`), the script's
 9-state LQI. The plant `x_r = [q1 q2 q3 wx wy wz]` is augmented with the
 integrated tracking error `x_I` (`x_I_dot = q_v - r`, the script's eq. 25):
