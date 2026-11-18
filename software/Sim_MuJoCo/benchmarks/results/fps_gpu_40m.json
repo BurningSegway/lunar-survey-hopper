@@ -1,0 +1,47 @@
+{
+ "caster": "GPU (Warp)",
+ "point_fraction": 1.0,
+ "max_range": 40.0,
+ "segments": [
+  {
+   "segment": "ground",
+   "frames": 114,
+   "wall_s": 0.984,
+   "sim_s": 1.004,
+   "fps": 114.8,
+   "fps_p5": 71.1,
+   "worst_frame_ms": 18.3,
+   "real_time_factor": 1.02
+  },
+  {
+   "segment": "airborne",
+   "frames": 491,
+   "wall_s": 7.802,
+   "sim_s": 7.598,
+   "fps": 62.8,
+   "fps_p5": 18.8,
+   "worst_frame_ms": 62.6,
+   "real_time_factor": 0.974
+  },
+  {
+   "segment": "after touchdown",
+   "frames": 232,
+   "wall_s": 4.737,
+   "sim_s": 4.742,
+   "fps": 48.8,
+   "fps_p5": 21.6,
+   "worst_frame_ms": 59.4,
+   "real_time_factor": 1.001
+  },
+  {
+   "segment": "whole run",
+   "frames": 837,
+   "wall_s": 13.568,
+   "sim_s": 13.381,
+   "fps": 61.6,
+   "fps_p5": 19.2,
+   "worst_frame_ms": 62.6,
+   "real_time_factor": 0.986
+  }
+ ]
+}

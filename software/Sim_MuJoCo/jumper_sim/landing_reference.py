@@ -6,7 +6,9 @@ differs):
 1. :class:`GroundMap` collects the jump's lidar points (world frame) in a
    coarse horizontal grid. Everything since the jump started is kept, so
    ground the lidar saw earlier in the hop counts too (its blind cone and
-   the band's edges leave parts unseen at any one moment).
+   the band's edges leave parts unseen at any one moment). Only the cells
+   near the arc's ground track are binned (``map_corridor``); the other
+   points wait until an arc (a bounce's) passes near them.
 2. :meth:`GroundMap.predict_landing` follows the robot's ballistic trajectory
    (the arc latched at lift-off, :mod:`jumper_sim.trajectory`) to where it
    first meets the mapped ground, ``touchdown_clearance`` below the base. The
@@ -45,6 +47,11 @@ class LandingReferenceConfig:
     min_points: int = 12  # ground cells (not points) needed for a fit
     fit_period: float = 0.05  # s between fits
     map_cell: float = 0.5  # m, ground map grid for the landing prediction
+    # Only cells within this of the arc's ground track are binned during the
+    # jump (the rest wait, for a bounce's arc); None bins every point. The
+    # map is read within ~1.5 m of the track, so this is margin (user's
+    # choice: 4 m), not accuracy.
+    map_corridor: float | None = 4.0  # m
     # Base height above the ground when the legs touch down: the trajectory
     # lands where the base comes this close to the mapped ground.
     touchdown_clearance: float = 0.3  # m
@@ -103,33 +110,135 @@ def matrix_to_quaternion(r: np.ndarray) -> tuple[float, float, float, float]:
     return tuple(float(v) for v in q)
 
 
-class GroundMap:
-    """The current jump's lidar points in a horizontal grid of ``cell`` metres."""
+_CELL_RADIX = 1 << 32  # cell key i * _CELL_RADIX + j: unique for |j| < 2**31
+_TILE_CELLS = 16  # waiting points are kept in tiles of 16 x 16 cells
 
-    def __init__(self, cell: float = 0.5) -> None:
+
+class GroundMap:
+    """The current jump's lidar points in a horizontal grid of ``cell`` metres.
+
+    With a ``corridor`` (m), only the cells whose centre is within it of the
+    arc's ground track (:meth:`set_track`) are binned as the points arrive;
+    the others' points wait unbinned and are binned when a later arc (a
+    bounce's) comes near them. Binning is the map's main cost, and the map
+    is only read along the track (the landing prediction's cells and their
+    neighbours, the fit's disc around a spot on it, all within ~1.5 m), so
+    every read is what binning everything would give. A new track's waiting
+    points are binned at the next read (a settling robot latches many short
+    arcs that are never read), only from the tiles (``_TILE_CELLS``) near
+    it: a bounce's first read stays short. Cells are binned whole, and each
+    cell's points stay in arrival order: a cell's pending points all arrived
+    after its binned ones (it is binned in full whenever a read track passes
+    near it), and a tile keeps its points in arrival order. Without a
+    corridor every point is binned.
+    """
+
+    def __init__(self, cell: float = 0.5, corridor: float | None = None) -> None:
         self.cell = cell
+        self.corridor = corridor
         self.clear()
 
     def clear(self) -> None:
-        self._cells: dict[tuple[int, int], list[np.ndarray]] = {}
-        self._heights: dict[tuple[int, int], float] = {}  # cached median z per cell
+        # Cells by key i * _CELL_RADIX + j (grid indices i, j along x, y).
+        self._cells: dict[int, list[np.ndarray]] = {}
+        self._heights: dict[int, float] = {}  # cached median z per cell
+        # Points of cells off the track, unbinned, by tile (key as for cells).
+        self._pending: dict[int, list[np.ndarray]] = {}
+        self._track: tuple[np.ndarray, np.ndarray | None] | None = None
+        self._track_binned = True  # the pending points were binned for this track
         self.count = 0
+
+    @property
+    def pending_count(self) -> int:
+        """Points not binned yet (their cells are off the track so far)."""
+        return sum(len(p) for chunks in self._pending.values() for p in chunks)
+
+    def set_track(self, origin, velocity) -> None:
+        """The arc's ground track: the ray from ``origin`` along the horizontal
+        part of ``velocity`` (just ``origin`` for a vertical arc). The waiting
+        points near it are binned at the next read."""
+        origin = np.asarray(origin, float)[:2].copy()
+        horizontal = np.asarray(velocity, float)[:2]
+        speed = float(np.hypot(*horizontal))
+        self._track = (origin, horizontal / speed if speed > 1e-9 else None)
+        self._track_binned = False
+
+    def _bin_pending(self) -> None:
+        """Bin the waiting points near a new track (before any read)."""
+        if self._track_binned:
+            return
+        self._track_binned = True
+        if not self._pending:
+            return
+        tile = _TILE_CELLS * self.cell
+        codes = np.array(list(self._pending), dtype=np.int64)
+        centres = (np.column_stack([np.floor_divide(codes + _CELL_RADIX // 2, _CELL_RADIX),
+                                    (codes + _CELL_RADIX // 2) % _CELL_RADIX - _CELL_RADIX // 2])
+                   + 0.5) * tile
+        # A tile can hold a near cell if its centre is within the corridor
+        # plus half the tile's diagonal.
+        reach = self.corridor + tile / math.sqrt(2.0)
+        for code in codes[self._distance2(centres) <= reach * reach].tolist():
+            chunks = self._pending.pop(code)
+            self._bin(chunks[0] if len(chunks) == 1 else np.concatenate(chunks))
+
+    def _distance2(self, xy: np.ndarray) -> np.ndarray:
+        """Squared horizontal distance of ``xy`` (n x 2) to the track."""
+        origin, direction = self._track
+        offset = xy - origin
+        if direction is not None:
+            along = np.maximum(offset @ direction, 0.0)
+            offset = offset - along[:, None] * direction
+        return np.einsum("ij,ij->i", offset, offset)
+
+    def _near_track(self, keys: np.ndarray) -> np.ndarray:
+        return self._distance2((keys + 0.5) * self.cell) <= self.corridor**2  # cell centres
+
+    def _wait(self, points: np.ndarray, keys: np.ndarray) -> None:
+        """Keep ``points`` (cells ``keys``) unbinned, by tile, in arrival order."""
+        tiles = np.floor_divide(keys, _TILE_CELLS)
+        codes = tiles[:, 0] * _CELL_RADIX + tiles[:, 1]
+        if (codes == codes[0]).all():
+            self._pending.setdefault(int(codes[0]), []).append(points)
+            return
+        order = np.argsort(codes, kind="stable")
+        codes = codes[order]
+        starts = np.flatnonzero(np.concatenate(([True], codes[1:] != codes[:-1])))
+        ends = np.append(starts[1:], len(codes))
+        for code, start, end in zip(codes[starts].tolist(), starts.tolist(), ends.tolist()):
+            self._pending.setdefault(code, []).append(points[order[start:end]])
 
     def add(self, points: np.ndarray) -> None:
         if not len(points):
             return
+        self.count += len(points)
+        if self.corridor is not None and not (self._track is not None and self._track_binned):
+            # No arc yet, or a new one whose waiting points are not binned
+            # yet: these come after them (keeps each cell in arrival order).
+            self._wait(points, np.floor(points[:, :2] / self.cell).astype(np.int64))
+            return
+        self._bin(points)
+
+    def _bin(self, points: np.ndarray) -> None:
         keys = np.floor(points[:, :2] / self.cell).astype(np.int64)
-        unique, inverse = np.unique(keys, axis=0, return_inverse=True)
-        inverse = inverse.ravel()
-        order = np.argsort(inverse, kind="stable")
-        bounds = np.searchsorted(inverse[order], np.arange(len(unique) + 1))
-        for (i, j), start, end in zip(unique, bounds[:-1], bounds[1:]):
-            key = (int(i), int(j))
+        if self.corridor is not None:
+            near = self._near_track(keys)
+            if not near.all():
+                self._wait(points[~near], keys[~near])
+                points, keys = points[near], keys[near]
+            if not len(points):
+                return
+        # One integer per cell; a stable sort keeps each cell's arrival order.
+        codes = keys[:, 0] * _CELL_RADIX + keys[:, 1]
+        order = np.argsort(codes, kind="stable")
+        codes = codes[order]
+        starts = np.flatnonzero(np.concatenate(([True], codes[1:] != codes[:-1])))
+        ends = np.append(starts[1:], len(codes))
+        for key, start, end in zip(codes[starts].tolist(), starts.tolist(), ends.tolist()):
             self._cells.setdefault(key, []).append(points[order[start:end]])
             self._heights.pop(key, None)
-        self.count += len(points)
 
-    def _cell_points(self, key: tuple[int, int]) -> np.ndarray | None:
+    def _cell_points(self, key: int) -> np.ndarray | None:
         chunks = self._cells.get(key)
         if chunks is None:
             return None
@@ -137,7 +246,7 @@ class GroundMap:
             chunks[:] = [np.concatenate(chunks)]
         return chunks[0]
 
-    def _cell_height(self, key: tuple[int, int]) -> float:
+    def _cell_height(self, key: int) -> float:
         if key not in self._heights:
             points = self._cell_points(key)
             self._heights[key] = math.nan if points is None else float(np.median(points[:, 2]))
@@ -146,11 +255,13 @@ class GroundMap:
     def height(self, x: float, y: float) -> float:
         """Median ground height in the cell at (x, y), else the mean over its
         seen neighbours; NaN if none of them has points."""
+        self._bin_pending()
         i, j = math.floor(x / self.cell), math.floor(y / self.cell)
-        own = self._cell_height((i, j))
+        own = self._cell_height(i * _CELL_RADIX + j)
         if math.isfinite(own):
             return own
-        around = [self._cell_height((i + di, j + dj)) for di in (-1, 0, 1) for dj in (-1, 0, 1)]
+        around = [self._cell_height((i + di) * _CELL_RADIX + j + dj)
+                  for di in (-1, 0, 1) for dj in (-1, 0, 1)]
         around = [h for h in around if math.isfinite(h)]
         return float(np.mean(around)) if around else math.nan
 
@@ -159,6 +270,7 @@ class GroundMap:
         """(x, y) and time [s] where the base's ballistic trajectory first
         comes within ``clearance`` of the mapped ground; None if it does not
         within ``horizon`` (that ground not seen)."""
+        self._bin_pending()
         position = np.asarray(position, float)
         velocity = np.asarray(velocity, float)
         for t in np.arange(step, horizon, step):
@@ -172,9 +284,10 @@ class GroundMap:
     def points_near(self, centre, radius: float, max_points: int) -> np.ndarray:
         """Up to ``max_points`` (an even subsample) of the points within
         ``radius`` (horizontally) of ``centre``."""
+        self._bin_pending()
         reach = math.ceil(radius / self.cell)
         i0, j0 = math.floor(centre[0] / self.cell), math.floor(centre[1] / self.cell)
-        chunks = [self._cell_points((i, j)) for i in range(i0 - reach, i0 + reach + 1)
+        chunks = [self._cell_points(i * _CELL_RADIX + j) for i in range(i0 - reach, i0 + reach + 1)
                   for j in range(j0 - reach, j0 + reach + 1)]
         chunks = [c for c in chunks if c is not None]
         if not chunks:

@@ -17,16 +17,13 @@ from jumper_sim.simulation import JumperSimulation, ReactionWheelTuning
 from jumper_sim.telemetry import TelemetryPayload
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
-TERRAIN_ASSETS = (
-    MODEL_PATH.parent / "terrain.obj",
-    MODEL_PATH.parent / "terrain_height.bin",
-)
+TERRAIN_ASSETS = (MODEL_PATH.parent / "terrain_height.bin",)
 
 
 @unittest.skipUnless(
     MODEL_PATH.is_file() and all(path.is_file() for path in TERRAIN_ASSETS),
-    "Generate build/terrain.obj and terrain_height.bin from "
-    "build/convert_usd.py before running app tests.",
+    "Generate build/terrain_height.bin with build/convert_terrain.py "
+    "before running app tests.",
 )
 class ViewerApplicationTests(unittest.TestCase):
     def test_gravity_cannot_be_selected_at_launch(self) -> None:

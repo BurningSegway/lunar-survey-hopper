@@ -53,6 +53,9 @@ JUMP_WINDUP_FORCE = -1.25 * JUMP_SPRING_COUNT * JUMP_SPRING.max_force
 # without terrain contact, so rocking on the legs or a skid reads as one
 # contact phase. Real bounces in Moon gravity last >= ~0.1 s.
 FLIGHT_DEBOUNCE = 0.06
+# Predicted paths shorter than this are not plotted (not a flight).
+MIN_ARC_TIME = FLIGHT_DEBOUNCE
+PATH_PERIOD = 0.02  # s between samples of the plotted paths
 # The LQR follows the reference's rotation up to this rate [rad/s] (target
 # tracking turns slower); beyond it, e.g. while the reference slews 180 deg/s
 # to catch up at lift-off, the rest counts as error: chasing such a slew at
@@ -148,7 +151,8 @@ class LidarLandingReference:
 
     def __init__(self, point_sigma: float,
                  config: LandingReferenceConfig = LandingReferenceConfig()) -> None:
-        self.map = GroundMap(config.map_cell)
+        self.map = GroundMap(config.map_cell, config.map_corridor)
+        self._arc_time: float | None = None  # cutoff time of the map's track
         self.plane = LandingPlane(config)
         self.config = config
         self._point_sigma = point_sigma
@@ -158,8 +162,16 @@ class LidarLandingReference:
     def reset(self, time: float) -> None:
         self.plane.reset()
         self.map.clear()
+        self._arc_time = None
         self._next_fit = time
         self.visual = None
+
+    def set_arc(self, cutoff_time: float, position, velocity) -> None:
+        """The tracker's current arc (from its cutoff): the map bins the
+        points along its ground track. A new arc (a bounce's) is passed on."""
+        if cutoff_time != self._arc_time:
+            self._arc_time = cutoff_time
+            self.map.set_track(position, velocity)
 
     def add_points(self, points: np.ndarray) -> None:
         self.map.add(points)
@@ -278,6 +290,10 @@ class JumperSimulation:
         # The hop's ballistic arc from the IMU (latched at propulsion cutoff):
         # the landing spot is predicted along it.
         self.trajectory = TrajectoryTracker()
+        # The true base path along the current arc, for the point cloud plot.
+        self._actual_path: list[np.ndarray] = []
+        self._actual_cutoff: float | None = None
+        self._actual_next = 0.0
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
             self.flight_reference = FlightReference(
@@ -554,14 +570,19 @@ class JumperSimulation:
             # With gating the wheel mode follows the contact phase instead.
             self._update_wheel_rest_state()
         phase = self._update_flight_phase()
+        self._sample_actual_path()
+        if self.landing_reference is not None and self.trajectory.ballistic:
+            tracker = self.trajectory
+            self.landing_reference.set_arc(tracker.cutoff_time, tracker.cutoff_position,
+                                           tracker.launch_velocity)
         if not self.in_contact:
             self._lidar_step()
         if self.landing_reference is not None:
             # Without the hop reference: fit the ground whenever airborne.
             # With it: only on the way down (the jump's points so far include
             # the ascent's), until the moment of impact.
-            # Only along a hop's arc (none after touchdown, so bounces hold
-            # the plane).
+            # Only along an arc: a hop's, or a bounce's (latched as it
+            # leaves the ground).
             fit = not self.in_contact and self.trajectory.ballistic and (
                 phase in (FlightPhase.DESCENT, FlightPhase.LANDING)
                 or self.flight_reference is None
@@ -593,6 +614,10 @@ class JumperSimulation:
         """Contact starts on the first touching step; flight needs a quiet spell."""
         if touching:
             self._time_without_contact = 0.0
+            # The arc ends; the tracker runs again for a bounce (restarted on
+            # every touching step, so it latches as the robot leaves).
+            self._record_arc()
+            self.trajectory.touchdown(float(self.data.time))
             if not self.in_contact:
                 self.in_contact = True
                 self.contact_phases += 1
@@ -601,7 +626,6 @@ class JumperSimulation:
                 if self._awaiting_touchdown:
                     self._awaiting_touchdown = False
                     self._record_touchdown()
-                self.trajectory.end()  # touchdown
             return
         self._time_without_contact += float(self.model.opt.timestep)
         if self.in_contact and self._time_without_contact >= FLIGHT_DEBOUNCE:
@@ -678,6 +702,39 @@ class JumperSimulation:
                 f"[AIM] Target {distance:.1f} m away: leaning {math.degrees(lean):.1f} deg "
                 f"towards it{note}."
             )
+
+    def _sample_actual_path(self) -> None:
+        """Sample the true base position along the current arc (from its
+        latch) for the plot next to the prediction."""
+        tracker = self.trajectory
+        if self.target_scan is None or not tracker.ballistic:
+            return
+        time = float(self.data.time)
+        if self._actual_cutoff != tracker.cutoff_time:  # a new arc
+            self._actual_cutoff = tracker.cutoff_time
+            self._actual_path = []
+            self._actual_next = time
+        if time >= self._actual_next - 1e-9:  # on the prediction's 20 ms grid
+            body = self.model.jnt_bodyid[self.ids.root_joint]
+            self._actual_path.append(self.data.xpos[body].copy())
+            self._actual_next += PATH_PERIOD
+
+    def _record_arc(self) -> None:
+        """Store a predicted path that just ended, for the point cloud plot.
+        Arcs shorter than a flight (latched while still sliding or rocking on
+        the ground) are left out."""
+        tracker = self.trajectory
+        time = float(self.data.time)
+        if (self.target_scan is None or not tracker.ballistic
+                or time - tracker.cutoff_time < MIN_ARC_TIME):
+            return
+        body = self.model.jnt_bodyid[self.ids.root_joint]
+        actual = (self._actual_path if self._actual_cutoff == tracker.cutoff_time else [])
+        actual = [*actual, self.data.xpos[body].copy()]  # up to the touchdown
+        try:
+            self.target_scan.add_arc(tracker.path(time, PATH_PERIOD), actual)
+        except OSError as error:
+            self.flight_events.append(f"[SCAN] Could not write the predicted path: {error}")
 
     def _record_touchdown(self) -> None:
         """Store where the jump landed: the ground under the robot."""

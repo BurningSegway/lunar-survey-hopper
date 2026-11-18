@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from jumper_sim.pointcloud import (
-    PREVIEW_POINTS, PointCloudRecorder, read_ply, read_touchdowns, touchdown_path, write_ply,
+    PREVIEW_POINTS, PointCloudRecorder, arcs_path, path_errors, read_arcs, read_ply, read_touchdowns, touchdown_path, write_ply,
 )
 
 
@@ -73,6 +73,39 @@ class PointCloudTests(unittest.TestCase):
         np.testing.assert_allclose(touchdowns[1][1], (7.0, 8.0, 9.0))
         PointCloudRecorder(self.path).start_run()  # next program run
         self.assertEqual(read_touchdowns(self.path), [])
+
+    def test_path_errors_at_the_apex_and_at_touchdown(self) -> None:
+        t = np.linspace(0.0, 2.0, 21)
+        predicted = np.column_stack([t, 0 * t, 2 * t - t * t])  # apex at t = 1
+        actual = predicted + (0.0, 0.0, 0.01)
+        actual[-1] += (0.03, 0.04, -0.01)
+        errors = path_errors(predicted, actual)
+        self.assertEqual([where for where, _, _ in errors], ["apex", "touchdown"])
+        np.testing.assert_allclose(errors[0][1], actual[10])
+        self.assertAlmostEqual(errors[0][2], 0.01)
+        self.assertAlmostEqual(errors[1][2], 0.05)
+        # Latched on the way down: no apex; too short: nothing.
+        self.assertEqual([w for w, _, _ in path_errors(predicted[12:], actual[12:])], ["touchdown"])
+        self.assertEqual(path_errors(predicted[:1], actual[:1]), [])
+
+    def test_predicted_paths_are_written_next_to_the_cloud(self) -> None:
+        recorder = PointCloudRecorder(self.path)
+        recorder.start_run()
+        self.assertEqual(read_arcs(self.path), [])
+        recorder.add_arc([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0]])  # before any jump: ignored
+        recorder.start_jump()
+        recorder.add_arc([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [2.0, 0.0, 0.0]],
+                         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.9]])  # with the actual path
+        recorder.add_arc([[2.0, 0.0, 0.0], [2.5, 0.0, 0.2]])  # a bounce, no actual path
+        self.assertEqual(arcs_path(self.path).name, "scan.arcs.json")
+        arcs = read_arcs(self.path)
+        self.assertEqual([jump for jump, _, _ in arcs], [1, 1])
+        np.testing.assert_allclose(arcs[0][1][2], (2.0, 0.0, 0.0))
+        np.testing.assert_allclose(arcs[0][2][1], (1.0, 0.0, 0.9))
+        self.assertEqual(arcs[1][1].shape, (2, 3))
+        self.assertEqual(arcs[1][2].shape, (0, 3))
+        PointCloudRecorder(self.path).start_run()
+        self.assertEqual(read_arcs(self.path), [])
 
     def test_start_run_overwrites_earlier_cloud(self) -> None:
         first = PointCloudRecorder(self.path)

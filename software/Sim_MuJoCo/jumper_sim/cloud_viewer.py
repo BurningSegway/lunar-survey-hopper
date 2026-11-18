@@ -2,9 +2,17 @@
 
 Watches the PLY file written by :class:`jumper_sim.pointcloud.PointCloudRecorder`
 and redraws whenever it changes, i.e. at every touchdown. Points are
-coloured by jump; points within 0.3 m of the target are white and larger,
+coloured by jump on a blue-to-green spectrum (jump 1 blue, the latest jump
+green, so the colours shift as jumps are added); points within 0.3 m of the
+target are white and larger,
 so the target is easy to find; touchdown spots (from the ``.touchdowns.json``
-file next to the cloud) are labelled green spheres. The track target (if
+file next to the cloud) are labelled green spheres, and the trajectory
+tracker's predicted paths (the jump's arc and each bounce's, from the
+``.arcs.json`` file) are lines on an orange-to-red spectrum the same way
+(jump 1 orange, the latest red), so they stand out from the points, each
+with the robot's actual path over the same time as a magenta line and
+labels with the distance between the two at the apex and at touchdown. The
+track target (if
 given) is a small red sphere and a
 world axis frame marks the origin (x red, y green, z blue, 0.5 m). The camera
 view you set with the mouse is kept across updates; it is only fitted to the
@@ -30,7 +38,7 @@ import time
 
 import numpy as np
 
-from .pointcloud import read_ply, read_touchdowns, touchdown_path
+from .pointcloud import arcs_path, path_errors, read_arcs, read_ply, read_touchdowns, touchdown_path
 
 POLL_PERIOD = 0.5  # s between file checks
 POINT_SIZE = 3.0  # px
@@ -42,18 +50,23 @@ HIGHLIGHT_POINT_SIZE = 6.0  # px
 HIGHLIGHT_COLOUR = (1.0, 1.0, 1.0)
 TOUCHDOWN_RADIUS = 0.08  # m
 TOUCHDOWN_COLOUR = (0.2, 1.0, 0.3)
+ARC_LINE_WIDTH = 2.0  # px, predicted and actual paths
+ACTUAL_COLOUR = (0.95, 0.30, 0.95)  # magenta: the true path, apart from both spectra
+ERROR_LABEL_OFFSET = 0.15  # m above the actual path
+
+
+def error_text(distance: float) -> str:
+    """Label for a prediction error: cm below 1 m."""
+    return f"{100 * distance:.1f} cm" if distance < 1.0 else f"{distance:.2f} m"
 VIEW_FRONT = (-0.55, -0.45, 0.70)  # initial view: oblique, from above
 VIEW_FOV = 60.0  # deg
 VIEW_DISTANCE = 1.5  # initial camera distance, in cloud bounding-box diagonals
 BACKGROUND = (0.08, 0.09, 0.11)
 
-# Colour per jump (cycled): a tab10-like palette that stays distinct on a
-# dark background.
-JUMP_COLOURS = np.array([
-    (0.12, 0.47, 0.71), (1.00, 0.50, 0.05), (0.17, 0.63, 0.17), (0.84, 0.15, 0.16),
-    (0.58, 0.40, 0.74), (0.55, 0.34, 0.29), (0.89, 0.47, 0.76), (0.50, 0.50, 0.50),
-    (0.74, 0.74, 0.13), (0.09, 0.75, 0.81),
-])
+# Colour per jump: a spectrum from the first jump to the latest one, for the
+# points and (distinct from them) for the predicted paths.
+POINT_SPECTRUM = ((0.15, 0.40, 1.00), (0.15, 0.90, 0.30))  # blue -> green
+ARC_SPECTRUM = ((1.00, 0.60, 0.05), (0.95, 0.10, 0.10))  # orange -> red
 
 
 def load_cloud(path: Path) -> np.ndarray | None:
@@ -64,8 +77,14 @@ def load_cloud(path: Path) -> np.ndarray | None:
         return None
 
 
-def jump_colours(jumps: np.ndarray) -> np.ndarray:
-    return JUMP_COLOURS[(np.asarray(jumps, int) - 1) % len(JUMP_COLOURS)]
+def jump_colours(jumps, last_jump: int, spectrum=POINT_SPECTRUM) -> np.ndarray:
+    """Colour per jump number: ``spectrum[0]`` at jump 1, ``spectrum[1]`` at
+    ``last_jump`` (a single jump gets the start colour)."""
+    jumps = np.asarray(jumps, float)
+    span = max(1, int(last_jump) - 1)
+    fraction = np.clip((jumps - 1.0) / span, 0.0, 1.0)[..., None]
+    start, end = (np.asarray(c, float) for c in spectrum)
+    return start + fraction * (end - start)
 
 
 class CloudFile:
@@ -79,22 +98,41 @@ class CloudFile:
         self.target = None if target is None else np.asarray(target, float)
         self._signature = None
         self._touchdown_signature = None
+        self._arcs_signature = None
         self.points = np.empty((0, 3))
         self.colours = np.empty((0, 3))
         self.highlight = np.empty(0, bool)  # within HIGHLIGHT_RADIUS of the target
         self.touchdowns: list[tuple[int, np.ndarray]] = []
+        self.arcs: list[tuple[int, np.ndarray, np.ndarray]] = []  # (jump, predicted, actual)
+        self.arc_colours = np.empty((0, 3))  # one per arc
         self.jumps = 0
+        self._point_jumps = np.empty(0, int)
 
     def poll(self) -> bool:
-        """Reload if the files changed; returns True if the cloud or the touchdowns changed."""
+        """Reload if the files changed; returns True if the cloud, the
+        touchdowns or the predicted paths changed."""
         touchdowns_changed = self._poll_touchdowns()
+        arcs_changed = self._poll_arcs()
+        changed = self._poll_cloud() or touchdowns_changed or arcs_changed
+        if changed:
+            self._colour()
+        return changed
+
+    def _colour(self) -> None:
+        """Both spectra run from jump 1 to the latest jump in either file."""
+        last = max([1, *self._point_jumps.max(initial=1).reshape(1).tolist(),
+                    *(j for j, _, _ in self.arcs)])
+        self.colours = jump_colours(self._point_jumps, last).reshape(-1, 3)
+        self.arc_colours = jump_colours([j for j, _, _ in self.arcs], last, ARC_SPECTRUM).reshape(-1, 3)
+
+    def _poll_cloud(self) -> bool:
         try:
             stat = self.path.stat()
             signature = (stat.st_mtime_ns, stat.st_size)
         except OSError:
             signature = None
         if signature == self._signature:
-            return touchdowns_changed
+            return False
         cloud = load_cloud(self.path) if signature is not None else None
         if signature is not None and cloud is None:
             return False  # unreadable right now; try again on the next poll
@@ -102,9 +140,10 @@ class CloudFile:
         if cloud is None or not len(cloud):
             self.points, self.colours, self.jumps = np.empty((0, 3)), np.empty((0, 3)), 0
             self.highlight = np.empty(0, bool)
+            self._point_jumps = np.empty(0, int)
         else:
             self.points = np.column_stack([cloud["x"], cloud["y"], cloud["z"]]).astype(float)
-            self.colours = jump_colours(cloud["jump"])
+            self._point_jumps = np.asarray(cloud["jump"], int)
             self.highlight = (
                 np.zeros(len(self.points), bool) if self.target is None
                 else np.sum((self.points - self.target) ** 2, axis=1) <= HIGHLIGHT_RADIUS**2
@@ -122,6 +161,18 @@ class CloudFile:
             return False
         self._touchdown_signature = signature
         self.touchdowns = read_touchdowns(self.path) if signature is not None else []
+        return True
+
+    def _poll_arcs(self) -> bool:
+        try:
+            stat = arcs_path(self.path).stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            signature = None
+        if signature == self._arcs_signature:
+            return False
+        self._arcs_signature = signature
+        self.arcs = read_arcs(self.path) if signature is not None else []
         return True
 
 
@@ -183,7 +234,8 @@ def run_window(path: Path, target: Sequence[float] | None = None) -> int:
         widget.setup_camera(VIEW_FOV, bounds, centre)
         widget.look_at(centre, centre + front * diagonal * VIEW_DISTANCE, (0.0, 0.0, 1.0))
 
-    def show_cloud(points, colours, highlight, touchdowns, title: str, fit: bool) -> None:
+    def show_cloud(points, colours, highlight, touchdowns, arcs, arc_colours, title: str,
+                   fit: bool) -> None:
         for name in shown:
             scene.remove_geometry(name)
         shown.clear()
@@ -211,6 +263,28 @@ def run_window(path: Path, target: Sequence[float] | None = None) -> int:
             scene.add_geometry(name, marker, material(1.0, "defaultLit"))
             shown.add(name)
             labels.append(widget.add_3d_label(position + (0.0, 0.0, 3 * TOUCHDOWN_RADIUS), name))
+        def add_line(name: str, path: np.ndarray, colour) -> None:
+            if len(path) < 2:
+                return
+            line = o3d.geometry.LineSet()
+            line.points = o3d.utility.Vector3dVector(path)
+            line.lines = o3d.utility.Vector2iVector(
+                np.column_stack([np.arange(len(path) - 1), np.arange(1, len(path))]))
+            line.paint_uniform_color(colour)
+            record = rendering.MaterialRecord()
+            record.shader = "unlitLine"
+            record.line_width = ARC_LINE_WIDTH
+            scene.add_geometry(name, line, record)
+            shown.add(name)
+
+        for index, ((_, predicted, actual), colour) in enumerate(zip(arcs, arc_colours)):
+            add_line(f"arc {index}", predicted, colour)
+            add_line(f"actual {index}", actual, ACTUAL_COLOUR)
+            for _, position, distance in path_errors(predicted, actual):
+                label = widget.add_3d_label(position + (0.0, 0.0, ERROR_LABEL_OFFSET),
+                                            error_text(distance))
+                label.color = gui.Color(*ACTUAL_COLOUR)
+                labels.append(label)
         displayed[0] = points
         if fit:
             fit_view()
@@ -248,7 +322,8 @@ def run_window(path: Path, target: Sequence[float] | None = None) -> int:
                     fitted = False  # a new run emptied the file
                 # Snapshot: the next poll replaces these while drawing waits.
                 snapshot = (source.points, source.colours, source.highlight,
-                            list(source.touchdowns), _title(source), fit)
+                            list(source.touchdowns), list(source.arcs), source.arc_colours,
+                            _title(source), fit)
                 app.post_to_main_thread(window, lambda snapshot=snapshot: show_cloud(*snapshot))
             time.sleep(POLL_PERIOD)
 

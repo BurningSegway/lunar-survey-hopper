@@ -10,15 +10,16 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~139 tests, ~35-45 s, all must pass
+.venv/bin/python -m unittest discover -s tests           # ~147 tests, ~80 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
+.venv/bin/python -m benchmarks.framerate_benchmark --label NAME  # viewer loop fps over a hop (no window)
 pip --python .venv/bin/python install -r requirements.txt  # venv has no pip of its own
 ```
 
 Headless rendering, if ever needed: `MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa`.
-Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin`
+Model tests need the generated `build/terrain_height.bin`
 (see README "Setup"); they are skipped without them.
 
 ## Hard constraints
@@ -63,22 +64,25 @@ Model tests need the generated `build/terrain.obj` and `build/terrain_height.bin
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing plane's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
 | `flight_reference.py` | Hop reference: on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading: the yaw reference (lift-off heading) throughout (face-travel went with the AS-DT1; `--spin` was removed for now, user's choice). Slew limit 180 deg/s |
 | `ray_casting.py` | Exact fast heightfield ray caster (matches `mj_multiRay`; skips 8x8-cell blocks the ray passes above their highest vertex, block looked up at the skipped segment's middle: ~5x fewer march steps, 2.4-3x faster; its cost is set by the number of march steps, i.e. ray length, more than by ray count) and a mesh ray caster for objects on it (einsum, not `@`: OpenBLAS threading made it 2-3x slower); site/geom names. The RealSense D435 depth camera that used to live here was removed (lidar only) |
-| `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump), ballistic landing-spot prediction along the tracker's arc (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), `LandingPlane` = the newest fit (ignored if its noise sigma > 3 deg; the Kalman filter was removed, user's choice); keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set and the arc latched from the start state) |
-| `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; latches p, v0 when the specific force drops < 0.5 g after > 1.25 g (cutoff, ~40 ms after release); then a fixed ballistic arc until touchdown (`end`); `latch` for thrown/dropped starts. No arc, no landing fits (so none in bounces) |
+| `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump; only cells within `map_corridor` = 4 m (user's choice, margin: reads are within ~1.5 m) of the arc's ground track are binned, the rest wait unbinned in 8 m tiles and are binned at the first read after a new (bounce) arc, from the tiles near it only (`set_track`, fed by `LidarLandingReference.set_arc`; a settling robot latches many short arcs, binning at each latch froze the loop for 2 s); reads identical to binning all, tested; airborne viewer loop 37 -> 58 fps; integer cell keys `i * _CELL_RADIX + j`), ballistic landing-spot prediction along the tracker's arc (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), `LandingPlane` = the newest fit (ignored if its noise sigma > 3 deg; the Kalman filter was removed, user's choice); keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set and the arc latched from the start state) |
+| `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; latches p, v0 when the specific force drops < 0.5 g after > 1.25 g (cutoff, ~40 ms after release); then a fixed ballistic arc until touchdown; `touchdown` (every contact step) restarts integration from the arc's state there, so each bounce's arc latches on its first step off the ground (user's request); `latch` for thrown/dropped starts; `path` samples an arc. No arc, no landing fits. Arcs >= 60 ms of tracked jumps go to `<name>.arcs.json` with the true base path sampled on the same 20 ms grid (`_record_arc`, `_sample_actual_path`) |
 | `jump_aim.py` | On the ground, lean the body axis towards the track target (3 deg near, 8 deg at >= 30 m), closed loop on IMU tilt via a leg-shortening plane (integrator, only while still, held during release, reset at touchdown, legs capped at 10 cm, off on ground > 20 deg); motors `tilt_fl/fr/bl/br` |
 | (target, tipped) | `simulation.py`: bunny `target_object` placed on the terrain at `--track-target` (offset from `mesh_pos`; parked 100 m down otherwise), seen by `MeshRayCaster` in the terrain caster's `objects` (`JumperSimulation._terrain`); tipped (> 60 deg in GROUND) pulls all legs in, and Space then refuses to jump: R resets (user's choice; the in-air recovery, `recovery.py`, was removed). Righting on the ground is NOT possible (tested: wheel push, wheel spin-brake, wheel rock, leg kick incl. 1000 N push) |
-| `pointcloud.py` | Lidar point cloud: every point of each tracked jump, lift-off to touchdown (per-point `range`), binary PLY at `pointclouds/target_scan.ply`, emptied at program start, rewritten at each touchdown (~21 MB per full-rate hop); touchdowns in `<name>.touchdowns.json` |
+| `pointcloud.py` | Lidar point cloud: every point of each tracked jump, lift-off to touchdown (per-point `range`), binary PLY at `pointclouds/target_scan.ply`, emptied at program start, rewritten at each touchdown (~21 MB per full-rate hop); touchdowns in `<name>.touchdowns.json`, predicted paths (jump + bounces) in `<name>.arcs.json` |
 | `lidar.py` | The only sensor: Livox Mid-360S on site `lidar`: +x side face, flush with the bottom, axis out of the face tilted 22.5 deg down (MJCF `euler="0 -67.5 0"`), so body -z is mid-band (band 38-97 deg off axis; blind cone around the axis); 2 cm range noise, 4 cm within 1 m; no self-occlusion. A bottom mount facing down (blind below, tracked 45 deg off the target) was tried and replaced: vertical drops tipped; Livox's recorded pattern from `mujoco-lidar` (R2 fill without it; it sweeps its elevation band in ~50 ms, so test over >= 50 ms), cast in 10 ms batches while airborne at `point_fraction` (1.0 with a GPU, 0.1 without). The user chose it over the Avia, the RealSense and the Sony AS-DT1 (bottom, 24x24 grid; removed with its `--lidar` option and face-travel heading), which were all removed |
 | `gpu_ray_caster.py` | `WarpRayCaster`: the heightfield caster's triangles + objects on the GPU (NVIDIA Warp BVH), identical hits, ~80x faster (`gpu_available()`; numpy fallback). Warp's first init runs `uname -p` via Popen (tests that mock Popen must filter) |
-| `cloud_viewer.py` | Live Open3D window watching that PLY and `<name>.touchdowns.json` (green labelled spheres; points within 0.3 m of the target white and larger) (own process, started by `app.py`); GUI `SceneWidget`, not the classic Visualizer (one global point size) nor `O3DVisualizer` (no key callbacks in Python) |
+| `cloud_viewer.py` | Live Open3D window watching that PLY, `<name>.touchdowns.json` (green labelled spheres), `<name>.arcs.json` (predicted paths, lines orange -> red by jump, with the true base path over the same time in magenta and labels of their distance at the apex and touchdown, `path_errors` in `pointcloud.py`); points coloured blue -> green by jump (both spectra from jump 1 to the latest, user's choice: paths must stand out from the points); points within 0.3 m of the target white and larger (own process, started by `app.py`); GUI `SceneWidget`, not the classic Visualizer (one global point size) nor `O3DVisualizer` (no key callbacks in Python) |
 | `visualization.py` | Overlays in the MuJoCo viewer: landing plane at the predicted spot, target, scan sample, `h = ...` label (base height above the last ground contact; MuJoCo 3.2.3 has no `set_texts`, so it is an `mjGEOM_LABEL`) |
-| `app.py` | CLI and viewer loop (`--smooth`: Mid-360S at 3 % of its point rate, measured to run without stutter on the CPU): sim paced to the wall clock, viewer synced at 120 Hz; `RobotFollower` centres a free camera on the robot each sync (MuJoCo's tracking camera moves 20 % per *drawn* frame from the viewer's own thread: it lagged and made a fast robot stutter) |
+| `app.py` | CLI and viewer loop (`--smooth`: Mid-360S at 3 % of its point rate, measured to run without stutter on the CPU): sim paced to the wall clock, viewer synced at 60 Hz (user's choice: no need for more); `RobotFollower` centres a free camera on the robot each sync (MuJoCo's tracking camera moves 20 % per *drawn* frame from the viewer's own thread: it lagged and made a fast robot stutter) |
 | `telemetry.py`, `status_indicator.py` | PlotJuggler UDP stream (127.0.0.1:9870; layout in `PlotJuggler_Setup.xml`), rest indicator |
 
 Model: `build/Jumping_Robot.xml`. Lidar site `lidar` under the base;
 terrain = moon crater field from `build/Testing/Temporary/moon-surface`
-(100 x 100 m, cm -> m, Y-up -> Z-up, plain colour, no texture) made by
-`build/convert_usd.py`, centred with the spawn ground at z=0; heightfield in geom group 2 with firm contact
+(100 x 100 m, cm -> m, Y-up -> Z-up) made by `build/convert_terrain.py`
+(renamed from `convert_usd.py`; USD loader, loose-rock removal, OBJ and
+texture output dropped, user's choice; output byte-identical), centred with
+the spawn ground at z=0; one heightfield, no visual mesh (user's choice: the
+viewer draws what is simulated), in geom group 2 (drawn by default) with firm contact
 (`solref 0.005 1.5`, `solimp 0.9 0.95 0.01 0.5 2`, friction 0.7; the old
 sand-like `solref 0.03 2` let legs sink 8-17 cm on landing and get stuck); the jumping
 foot is a firm sphere (`priority 2`, `solref 0.002 1`) overriding the sand;
@@ -134,6 +138,11 @@ above the ground (starting in it, the firm foot ejects the robot).
 - Point-cloud processing (range crop, voxel downsample, registering jumps).
 - Landing-spot prediction (could become the default track target). The
   landing reference already predicts it along the IMU tracker's arc.
+- Bounce prediction (user's idea, for later): the landing plane fitted at
+  the predicted spot, with the arc's incoming velocity, could give a rough
+  estimate of the bounce's trajectory before touchdown (e.g. to bin the
+  ground map's corridor for it early). Now a bounce's arc is only known
+  once the tracker latches it on leaving the ground.
 - Lidar self-occlusion (legs, foot) is not modelled.
 - Sensor realism: IMU noise/bias/latency, attitude estimator, control rate.
 - Wheel mass placeholder (user's request to note it): each wheel's
@@ -141,21 +150,6 @@ above the ground (starting in it, the firm foot ejects the robot).
   report's J_w,i, the disc geom is only visual); replace it with the real
   wheel mass or remove it so it is not mistaken for a design value. The fit
   script takes the rest from the base, so total mass and J_c are unaffected.
-- Terrain: drop the visual mesh (user's choice, not done yet). Contact, the
-  lidar casters and target placement all use the heightfield
-  (`terrain_collision`, 401x401, 25 cm cells); `terrain_visual`
-  (`terrain.obj`, full 326k-triangle mesh, contype/conaffinity 0) is only
-  drawn, so the viewer shows finer terrain than is simulated, and both drawn
-  together z-fight (patchy grey/green). Show the heightfield instead (it is
-  in geom group 2: make it visible/coloured by default). Touches the MJCF,
-  `convert_usd.py` (stop writing the OBJ), `app.py` and the tests' asset
-  checks (they require `terrain.obj`), the `terrain_visual` test, the
-  README Setup/Terrain sections.
-- `convert_usd.py` cleanup: the loose-rock removal (`_ground_face_mask`) is
-  a no-op for the moon map (one connected surface, 326,424 faces, all
-  kept); it was for the old terrain. Also, despite the name, the moon map's
-  input is the OBJ in `MoonSurface.zip`, not a USD stage. Keep or drop the
-  step, but don't describe it as part of the moon pipeline.
 - Lidar cut-off range: change `LIVOX_MID360.max_range` from 40 m to 100 m
   (user's request, not done yet). 40 m is the datasheet's typical range at
   10 % reflectivity (about regolith's); 100 m is where the sensor cuts off.
@@ -164,8 +158,6 @@ above the ground (starting in it, the firm foot ejects the robot).
   cost grows with ray length (march steps), though the 100 x 100 m terrain
   ends rays sooner anyway. Range noise stays the two datasheet cases (2 cm,
   4 cm within 1 m; user's choice, no further range dependence).
-- `jumper_sim/depth_camera.py` (RealSense D435) is still tracked although
-  the camera was removed and nothing imports it: delete it.
 - Hardware prep: measure bearing friction; real cube mass (3.3 kg is a
   placeholder) and where the springs sit (their inertia is not in J_c); port
   the LQR (torque commands map to ODrive torque mode) + gating,

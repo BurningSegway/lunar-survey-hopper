@@ -74,6 +74,40 @@ class TrajectoryTrackerTests(unittest.TestCase):
         np.testing.assert_allclose(p, (1.0, 0.0, 5.0 - 0.5 * G))
         np.testing.assert_allclose(v, (1.0, 0.0, -G))
 
+    def test_a_bounce_is_tracked_from_the_arc_at_touchdown(self) -> None:
+        tracker = TrajectoryTracker()
+        tracker.latch(0.0, (0.0, 0.0, 5.0), (1.0, 0.0, 0.0), G)
+        tracker.touchdown(1.0)  # contact while integrating changes nothing
+        self.assertTrue(tracker.integrating)
+        np.testing.assert_allclose(tracker.position, (1.0, 0.0, 5.0 - 0.5 * G))
+        np.testing.assert_allclose(tracker.velocity, (1.0, 0.0, -G))
+        tracker.touchdown(1.0 + DT)
+        # The impact reverses the vertical velocity in 0.1 s (> 1.25 g) ...
+        push = np.array([0.0, 0.0, 2.0 * G / 0.1])
+        time = 1.0
+        for _ in range(100):
+            time += DT
+            tracker.update(time, push - GRAVITY, LEVEL, GRAVITY, DT)
+        self.assertFalse(tracker.ballistic)
+        # ... and the first sample off the ground latches the bounce's arc.
+        tracker.update(time + DT, np.zeros(3), LEVEL, GRAVITY, DT)
+        self.assertTrue(tracker.ballistic)
+        np.testing.assert_allclose(tracker.launch_velocity, (1.0, 0.0, G), atol=0.05)
+
+    def test_path_samples_the_arc_up_to_its_end(self) -> None:
+        tracker = TrajectoryTracker()
+        tracker.latch(1.0, (0.0, 0.0, 0.0), (1.0, 0.0, G), G)
+        path = tracker.path(3.0, period=0.1)
+        self.assertEqual(len(path), 21)
+        np.testing.assert_allclose(path[0], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(path[-1], tracker.state(3.0)[0])
+        np.testing.assert_allclose(path[10], (1.0, 0.0, 0.5 * G), atol=1e-12)  # apex
+
+    def test_contact_without_an_arc_starts_nothing(self) -> None:
+        tracker = TrajectoryTracker()
+        tracker.touchdown(1.0)
+        self.assertFalse(tracker.ballistic or tracker.integrating)
+
 
 if __name__ == "__main__":
     unittest.main()

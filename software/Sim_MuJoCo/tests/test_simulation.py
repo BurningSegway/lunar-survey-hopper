@@ -34,7 +34,7 @@ from jumper_sim.cube_model import (
 )
 from jumper_sim.ray_casting import TERRAIN_GEOM_GROUP, HeightfieldRayCaster
 from jumper_sim.flight_phase import FlightPhase
-from jumper_sim.pointcloud import PointCloudRecorder, read_ply, read_touchdowns
+from jumper_sim.pointcloud import PointCloudRecorder, read_arcs, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
 from jumper_sim.lidar import LIVOX_MID360
 from jumper_sim.visualization import draw_flight_target, draw_height_label, draw_landing_plane
@@ -60,16 +60,13 @@ MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 # A cube face (half size 0.15 m) 1 cm above the spawn ground: dropped from
 # higher up, the controller rights the robot before it lands.
 ON_ITS_SIDE_HEIGHT = 0.16
-TERRAIN_ASSETS = (
-    MODEL_PATH.parent / "terrain.obj",
-    MODEL_PATH.parent / "terrain_height.bin",
-)
+TERRAIN_ASSETS = (MODEL_PATH.parent / "terrain_height.bin",)
 
 
 @unittest.skipUnless(
     MODEL_PATH.is_file() and all(path.is_file() for path in TERRAIN_ASSETS),
-    "Generate build/terrain.obj and terrain_height.bin from "
-    "build/convert_usd.py before running model tests.",
+    "Generate build/terrain_height.bin with build/convert_terrain.py "
+    "before running model tests.",
 )
 class SimulationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -537,7 +534,7 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))
 
-    def test_jump_latches_the_imu_arc_at_cutoff_and_touchdown_ends_it(self) -> None:
+    def test_jump_latches_the_imu_arc_at_cutoff_and_again_for_the_bounce(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
         body = self.model.jnt_bodyid[simulation.ids.root_joint]
         while self.data.time < 2.0:
@@ -560,6 +557,18 @@ class SimulationTests(unittest.TestCase):
                 worst = max(worst, float(np.linalg.norm(position - self.data.xpos[body])))
         self.assertTrue(simulation.in_contact)  # ended at touchdown
         self.assertLess(worst, 0.05)  # the fixed arc stays on the hop (measured 0.013 m)
+        # It runs again for the bounce: latched as the robot leaves the ground.
+        while not tracker.ballistic and self.data.time < 5.0:
+            simulation.step()
+        self.assertTrue(tracker.ballistic)
+        np.testing.assert_allclose(tracker.launch_velocity, self.data.qvel[:3], atol=0.05)
+        worst = 0.0
+        while tracker.ballistic and self.data.time < 5.0:
+            simulation.step()
+            if tracker.ballistic:
+                position, _ = tracker.state(float(self.data.time))
+                worst = max(worst, float(np.linalg.norm(position - self.data.xpos[body])))
+        self.assertLess(worst, 0.05)  # (measured 0.015 m)
 
     def test_scan_keeps_every_lidar_point_of_each_jump(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -594,6 +603,22 @@ class SimulationTests(unittest.TestCase):
             _, position = touchdowns[-1]
             self.assertAlmostEqual(position[2], simulation._ground_height(*position[:2]), places=6)
             self.assertTrue(any("touched down at" in e for e in simulation.flight_events))
+            # The predicted paths: each jump's arc, ending at its touchdown, and
+            # its bounces' (the Earth hop bounces once, ~0.2 s).
+            arcs = read_arcs(recorder.path)
+            self.assertEqual(sorted({jump for jump, _, _ in arcs}), [1, 2])
+            for jump in (1, 2):
+                paths = [(predicted, actual) for j, predicted, actual in arcs if j == jump]
+                self.assertGreaterEqual(len(paths), 2)
+                hop, actual = paths[0]
+                self.assertGreater(hop[:, 2].max() - hop[0, 2], 1.0)  # up to the apex
+                landing = dict(touchdowns)[jump]
+                self.assertLess(np.linalg.norm(hop[-1, :2] - landing[:2]), 0.1)
+                # The actual path over the same time, sampled alike: on the arc.
+                self.assertGreater(len(actual), 0.9 * len(hop))
+                count = min(len(hop), len(actual)) - 1
+                self.assertLess(float(np.linalg.norm(hop[:count] - actual[:count], axis=1).max()), 0.05)
+                np.testing.assert_allclose(actual[-1, :2], hop[-1, :2], atol=0.05)
 
     def test_target_scan_needs_the_hop_reference(self) -> None:
         recorder = PointCloudRecorder(Path(tempfile.gettempdir()) / "unused.ply")
@@ -639,19 +664,12 @@ class SimulationTests(unittest.TestCase):
         self.simulation.handle_key("backspace")
         self.assertEqual(self.model.opt.gravity[2], -EARTH_GRAVITY)
 
-    def test_model_has_no_separate_plane_collision_geom(self) -> None:
-        plane_type = mujoco.mjtGeom.mjGEOM_PLANE
-        self.assertNotIn(plane_type, self.model.geom_type)
-        visual_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_visual"
-        )
-        self.assertGreaterEqual(visual_id, 0)
-        self.assertEqual(
-            self.model.geom_type[visual_id], mujoco.mjtGeom.mjGEOM_MESH
-        )
-        self.assertEqual(self.model.geom_contype[visual_id], 0)
-        self.assertEqual(self.model.geom_conaffinity[visual_id], 0)
-
+    def test_terrain_is_one_heightfield_that_collides_and_is_drawn(self) -> None:
+        # No plane and no separate visual mesh: the viewer draws the ground
+        # that contact and the lidar use.
+        self.assertNotIn(mujoco.mjtGeom.mjGEOM_PLANE, self.model.geom_type)
+        self.assertEqual(self.model.nhfield, 1)
+        self.assertEqual(self.model.nmesh, 1)  # the scan target only
         collision_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_collision"
         )
@@ -661,6 +679,9 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertGreater(self.model.geom_contype[collision_id], 0)
         self.assertGreater(self.model.geom_conaffinity[collision_id], 0)
+        group = int(self.model.geom_group[collision_id])
+        self.assertEqual(mujoco.MjvOption().geomgroup[group], 1)  # drawn by default
+        self.assertEqual(self.model.geom_rgba[collision_id][3], 1.0)
 
     def test_reaction_wheels_are_inside_box_and_cannot_contact_ground(self) -> None:
         for name, expected_pos in (
@@ -682,41 +703,6 @@ class SimulationTests(unittest.TestCase):
             self.assertGreaterEqual(geom_id, 0)
             self.assertEqual(self.model.geom_contype[geom_id], 0)
             self.assertEqual(self.model.geom_conaffinity[geom_id], 0)
-
-    def test_heightfield_collision_matches_visual_terrain(self) -> None:
-        mujoco.mj_forward(self.model, self.data)
-        visual_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_visual"
-        )
-        collision_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_collision"
-        )
-        self.model.geom_group[:] = 2
-        self.model.geom_group[visual_id] = 0
-        self.model.geom_group[collision_id] = 1
-        visual_group = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
-        collision_group = np.array([0, 1, 0, 0, 0, 0], dtype=np.uint8)
-
-        for x, y in ((-20.0, -20.0), (0.0, 0.0), (15.0, 15.0), (-45.0, 40.0), (42.0, -44.0)):
-            ray_origin = np.array([x, y, 20.0])
-            ray_direction = np.array([0.0, 0.0, -1.0])
-            heights = []
-            for geom_group in (visual_group, collision_group):
-                hit_geom = np.zeros(1, dtype=np.int32)
-                distance = mujoco.mj_ray(
-                    self.model,
-                    self.data,
-                    ray_origin,
-                    ray_direction,
-                    geom_group,
-                    1,
-                    -1,
-                    hit_geom,
-                )
-                self.assertGreaterEqual(distance, 0.0)
-                heights.append(ray_origin[2] - distance)
-
-            self.assertAlmostEqual(heights[0], heights[1], delta=0.25)
 
     def test_jump_control_updates_actuators(self) -> None:
         self.simulation.handle_key("space")

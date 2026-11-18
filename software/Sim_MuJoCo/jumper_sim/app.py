@@ -27,7 +27,7 @@ from .visualization import (
 
 # The viewer draws in its own thread at the display rate; hand it new state
 # more often than that so every drawn frame is fresh.
-SYNC_PERIOD = 1.0 / 120.0  # s of wall time between viewer syncs
+SYNC_PERIOD = 1.0 / 60.0  # s of wall time between viewer syncs (60 fps is enough)
 # Most sim time one sync may catch up on; if a slow stretch puts the sim
 # further behind the wall clock, it runs slower than real time instead.
 MAX_CATCH_UP = 0.05  # s
@@ -117,19 +117,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     model_path = args.model.expanduser().resolve()
     if not model_path.is_file():
         raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
-    terrain_paths = (
-        model_path.parent / "terrain.obj",
-        model_path.parent / "terrain_height.bin",
-    )
-    missing_terrain_paths = [
-        path for path in terrain_paths if not path.is_file()
-    ]
-    if model_path == MODEL_PATH.resolve() and missing_terrain_paths:
+    heightfield_path = model_path.parent / "terrain_height.bin"
+    if model_path == MODEL_PATH.resolve() and not heightfield_path.is_file():
         raise FileNotFoundError(
-            f"Terrain assets not found: {', '.join(map(str, missing_terrain_paths))}. "
-            f"Extract {terrain_paths[0].with_name('moon-surface.zip')} into "
+            f"Terrain heightfield not found: {heightfield_path}. "
+            f"Extract {heightfield_path.with_name('moon-surface.zip')} into "
             f"build/Testing/Temporary/moon-surface and run "
-            f"'{Path('.venv/bin/python')} build/convert_usd.py'."
+            f"'{Path('.venv/bin/python')} build/convert_terrain.py'."
         )
 
     model = mujoco.MjModel.from_xml_path(str(model_path))

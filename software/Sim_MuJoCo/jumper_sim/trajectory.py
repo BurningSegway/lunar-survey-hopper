@@ -16,8 +16,14 @@ fixed ballistic arc
 
     p(t) = p_c + v0 t - [0, 0, g/2] t^2,   t = time since cutoff.
 
-It ends at touchdown. There is no reason to expect the trajectory to change
-in flight, so nothing updates it. Pure numpy; in the simulator the IMU is the
+Touchdown ends it, and the tracker runs again for the bounce: on every
+sample the robot touches the ground, integration restarts from the arc's
+position and velocity there (so an arc latched by a dip below the cutoff
+while still sliding or rocking on the ground is thrown away again), and the
+bounce's arc is latched on the first sample off the ground (the impact
+counts as the push-off). If the robot stays down, nothing latches (it reads
+~1 g) and settling on the ground resets it. There is no reason to expect a
+trajectory to change in flight, so nothing updates an arc once latched. Pure numpy; in the simulator the IMU is the
 body's velocity change per step (see JumperSimulation._update_flight_phase).
 """
 
@@ -54,11 +60,13 @@ class TrajectoryTracker:
         self.launch_velocity = np.zeros(3)
         self.gravity = 0.0
 
-    def begin(self, position) -> None:
-        """Jump command: integrate from rest at ``position``."""
+    def begin(self, position, velocity=(0.0, 0.0, 0.0)) -> None:
+        """Jump command: integrate from rest at ``position`` (or from
+        ``velocity``, for a bounce)."""
         self.reset()
         self.integrating = True
         self.position = np.asarray(position, float).copy()
+        self.velocity = np.asarray(velocity, float).copy()
 
     def update(self, time: float, specific_force_body, body_quaternion,
                gravity_vector, dt: float) -> None:
@@ -88,8 +96,27 @@ class TrajectoryTracker:
         self.gravity = gravity
 
     def end(self) -> None:
-        """Touchdown."""
+        """No more arc (e.g. touchdown with no bounce to follow)."""
         self.reset()
+
+    def touchdown(self, time: float) -> None:
+        """A sample in ground contact (call on every one): the arc ends and
+        the tracker runs again for the bounce from the arc's state at
+        ``time``. While integrating (the push-off, or a bounce's contact) it
+        changes nothing; without an arc there is no state to start from."""
+        if not self.ballistic:
+            return
+        position, velocity = self.state(time)
+        self.begin(position, velocity)
+        self._launched = True  # the impact is the bounce's push-off
+
+    def path(self, end_time: float, period: float = 0.02) -> np.ndarray:
+        """Positions on the arc from the cutoff to ``end_time`` (N x 3)."""
+        duration = max(0.0, end_time - self.cutoff_time)
+        times = np.append(np.arange(0.0, duration, period), duration)
+        down = np.array([0.0, 0.0, 0.5 * self.gravity])
+        return (self.cutoff_position + np.outer(times, self.launch_velocity)
+                - np.outer(times * times, down))
 
     def state(self, time: float) -> tuple[np.ndarray, np.ndarray]:
         """(position, velocity) on the arc at ``time`` (only while ballistic)."""

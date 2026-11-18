@@ -115,6 +115,68 @@ class GroundMapTests(unittest.TestCase):
         self.assertTrue(math.isnan(self.map.height(5.0, 0.0)))
 
 
+class GroundMapCorridorTests(unittest.TestCase):
+    """Binning only near the arc's ground track reads the same as binning all."""
+
+    @staticmethod
+    def batches(rng, count):
+        for _ in range(count):  # rough ground over 40 x 40 m, as lidar batches
+            xy = rng.uniform(-20.0, 20.0, size=(1500, 2))
+            z = 0.3 * np.sin(xy[:, 0]) * np.cos(0.7 * xy[:, 1]) + rng.normal(0.0, 0.05, len(xy))
+            yield np.column_stack([xy, z])
+
+    def assert_same_along(self, full, corridor, position, velocity, gravity=1.62):
+        position, velocity = np.asarray(position, float), np.asarray(velocity, float)
+        for t0 in (0.0, 0.5, 1.5):  # the fit's states along the arc
+            p = position + velocity * t0 - np.array([0.0, 0.0, 0.5 * gravity * t0 * t0])
+            v = velocity - np.array([0.0, 0.0, gravity * t0])
+            expected = full.predict_landing(p, v, gravity, 0.3)
+            got = corridor.predict_landing(p, v, gravity, 0.3)
+            self.assertIsNotNone(expected)
+            np.testing.assert_array_equal(got[0], expected[0])
+            self.assertEqual(got[1], expected[1])
+            np.testing.assert_array_equal(corridor.points_near(expected[0], 0.5, 1000),
+                                          full.points_near(expected[0], 0.5, 1000))
+        for s in np.linspace(0.0, 15.0, 31):  # heights along the track and 1.4 m off it
+            x, y = position[:2] + velocity[:2] / np.hypot(*velocity[:2]) * s
+            for dx, dy in ((0.0, 0.0), (1.0, 1.0), (-1.0, 1.0), (1.4, 0.0), (0.0, -1.4)):
+                expected = full.height(x + dx, y + dy)
+                if math.isnan(expected):
+                    self.assertTrue(math.isnan(corridor.height(x + dx, y + dy)))
+                else:
+                    self.assertEqual(corridor.height(x + dx, y + dy), expected)
+
+    def test_reads_along_the_jump_and_the_bounce_match_binning_all(self) -> None:
+        rng = np.random.default_rng(3)
+        full, corridor = GroundMap(0.5), GroundMap(0.5, corridor=4.0)
+
+        def add(count):
+            for points in self.batches(rng, count):
+                full.add(points)
+                corridor.add(points)
+
+        add(3)  # before the arc latches: nothing binned yet
+        self.assertEqual(corridor.pending_count, corridor.count)
+        jump = ((-10.0, -5.0, 4.0), (1.5, 0.5, 2.0))
+        corridor.set_track(jump[0], jump[1])
+        add(20)
+        self.assert_same_along(full, corridor, *jump)
+        self.assertGreater(corridor.pending_count, 0.5 * corridor.count)  # most far away
+        bounce = ((5.0, 0.0, 1.5), (-0.4, 1.2, 1.0))  # another direction: older points too
+        corridor.set_track(bounce[0], bounce[1])
+        add(10)
+        self.assert_same_along(full, corridor, *bounce)
+        self.assertEqual(corridor.count, full.count)
+
+    def test_vertical_arc_bins_around_its_start(self) -> None:
+        corridor = GroundMap(0.5, corridor=4.0)
+        corridor.set_track((2.0, 3.0, 5.0), (0.0, 0.0, 3.0))
+        corridor.add(np.array([[2.2, 3.1, 0.0], [5.0, 3.0, 0.0], [9.0, 3.0, 0.0]]))
+        self.assertEqual(corridor.pending_count, 3)  # binned at the first read
+        self.assertEqual(corridor.height(2.2, 3.1), 0.0)
+        self.assertEqual(corridor.pending_count, 1)  # only the one 7 m away waits
+
+
 class LandingPlaneTests(unittest.TestCase):
     def estimate(self, normal, sigma_deg, timestamp=0.1):
         n = np.asarray(normal, dtype=float)
