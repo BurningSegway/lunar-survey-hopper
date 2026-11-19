@@ -129,9 +129,46 @@ above the ground (starting in it, the firm foot ejects the robot).
 
 ## Open items
 
-- Phases still use simulator ground contact (impact, lift-off, attitude
-  gating). On the robot: IMU impact/free fall (or leg compression sensors,
-  if the hardware has them); LANDING has no behaviour of its own yet.
+- Replace simulator contact with IMU sensing (user's request, not done
+  yet). Phases, attitude gating and the trajectory tracker's restarts still
+  use `in_contact`; on the robot there is no contact sensor. Use the IMU
+  (and the lidar) instead, keeping sim contact only as ground truth in tests
+  (compare detection times with real contact start/end):
+  - Lift-off -> control on: free fall, i.e. the tracker's propulsion cutoff
+    (specific force < 0.5 g after > 1.25 g, ~40 ms after release) plus a few
+    cm of clearance (~10 ms at ~5.5 m/s), not a height like 0.5 m. What
+    fills the wheels is control while touching the ground (it pushes against
+    something it can't turn); once airborne, total angular momentum is
+    conserved, so waiting longer saves no wheel momentum and only lets the
+    attitude error grow. ASCENT can keep its 0.5 m marker. Bounces: the same
+    rule (impact spike, then ~0). This is what the report's TAKEOFF phase
+    describes (control off while still on the ground, wheel headroom kept
+    for when it has cleared it); today TAKEOFF only holds the lift-off
+    attitude and the 60 ms contact debounce (`FLIGHT_DEBOUNCE`) gates.
+  - Landing -> control off: the prediction only arms (landing plane's
+    near-touchdown rule: < 1 m below or < 0.3 s away; the lidar's distance
+    to the plane beats the arc's height, which is fixed at cutoff and
+    drifts), the IMU impact spike switches the flight controller off.
+    Switching off on the prediction alone would lose the final alignment
+    with the plane.
+  - Stationary -> GROUND: the existing stillness rule (|f| - g < 0.5 m/s^2,
+    rate < 0.2 rad/s for 0.5 s) without the contact condition.
+  Measure each change (take-off wheel speeds, tracking, landing benchmark).
+- Tip catch at landing (user's idea, ON HOLD: don't implement yet). After
+  impact, if the robot is about to topple over a leg edge, spend the wheels'
+  full momentum to stop it. Its own law (an inverted pendulum about the
+  edge, not the free-body flight LQR): brake the tipping rate at full motor
+  torque. Trigger on energy: tips if rotational energy about the edge >
+  energy to lift the CoM over the edge; catch only if the wheels' remaining
+  momentum covers the difference, else accept the fall. Inputs: IMU tilt and
+  rate, landing plane normal. Rough numbers: inertia about an edge ~0.52
+  kg*m^2 (leg tips +-0.195 m, 0.26 m below the CoM), so ~0.45 N*m*s per
+  wheel absorbs ~0.9 rad/s; static tip angle ~37 deg on flat ground (minus
+  the slope downhill); on the Moon with 10 deg to the edge it tips above
+  ~0.35 rad/s. Only before the CoM passes the edge (righting from the
+  ground does not work, tested), and only with the wheels near rest at
+  touchdown (take-off spin stays stored in them; > ~4 rad/s leaves none).
+  Fixes the open item below (tipping after touchdown on steep spots).
 
 - Robot tips over after touchdown on steep spots (contact benchmark), incl.
   the spawn hop's landing; attitude control is gated off in contact.
@@ -144,7 +181,55 @@ above the ground (starting in it, the firm foot ejects the robot).
   ground map's corridor for it early). Now a bounce's arc is only known
   once the tracker latches it on leaving the ground.
 - Lidar self-occlusion (legs, foot) is not modelled.
-- Sensor realism: IMU noise/bias/latency, attitude estimator, control rate.
+- IMU noise (user's request, not done yet): simulate the robot's Xsens
+  MTi-610 (leaflet 2025-02-07, typical values). Accelerometer: +-10 g range,
+  60 ug/sqrt(Hz) noise, bias stability 10 ug (x, y) / 15 ug (z), 500 Hz
+  bandwidth. Gyro: +-2000 deg/s, 0.007 deg/s/sqrt(Hz), bias stability
+  8 deg/h, 520 Hz bandwidth, g-sensitivity 0.1 deg/s/g. Output up to 2 kHz
+  (400 Hz with its strapdown integration). At 1 kHz that is ~0.013 m/s^2
+  and ~0.16 deg/s per sample (density x sqrt(500 Hz)): far below the Moon's
+  1.62 m/s^2 standing vs ~0 in free fall, so IMU phase detection is not
+  noise-limited; the biases barely matter over a hop. Magnetometer and
+  barometer are useless on the Moon (no field to speak of, no air).
+  **Clip at +-10 g**: measured in the sim (Moon hop, finite-difference
+  IMU, 2026-11-19), the spring push peaks at ~210 g and is > 10 g for
+  27 ms, the landing ~208 g and > 10 g for 48 ms (the firm contact makes
+  sharp spikes; even the springs' 1718 N on ~4.2 kg is ~42 g). So the
+  tracker's integration of the push from the IMU (its v0) would clip on the
+  robot: measure the v0/arc error with clipping, and if needed get v0
+  another way (spring model, or the first lidar fits of the ground). The
+  impact spike itself still detects fine when clipped. Also still open:
+  latency and an attitude estimator (the sim uses the true attitude).
+- Control rate: 100 Hz (user's decision, not done yet). The control law is
+  designed for it and the robot runs it at 100 Hz, but the sim computes a
+  new wheel torque every 1 ms physics step (1 kHz): `JumperSimulation.step`
+  calls `compute_torque` with `model.opt.timestep`. Change it to update the
+  attitude controller (and its attitude/rate/wheel-speed reads) every 10
+  physics steps and hold the torque in between (zero-order hold, as the
+  ODrive's torque setpoint does); keep physics at 1 ms. Everything that
+  takes `model.opt.timestep` as the controller's period must take the
+  control period instead: the LQI/PID integrators, `reference_rate`'s
+  finite difference, `WheelRestController` (its deceleration step), and
+  `limit_wheel_command`'s speed-headroom check (it assumes the command lasts
+  1 ms; held for 10 ms a wheel can pass the speed limit). Check whether the
+  user's script designs the gain in continuous time (now: CARE, `lqr`) or
+  discretised at 0.01 s (`c2d`/`dlqr`); match it, and the gain test with it.
+  Decide separately (with the user) the rate of the IMU-side parts
+  (trajectory tracker, phase detection: the MTi-610 gives 400 Hz-2 kHz).
+  Measure 100 Hz vs 1 kHz on all three benchmarks. Note `RW_PID.cpp`'s
+  `pumpEvents` delays each loop 10 ms on the MCP2515, so the robot cannot
+  run faster than ~100 Hz with it.
+- Wheels in the sim vs the robot (for the port): the wheels are propagated
+  by MuJoCo only (hinge joints driven by ideal torque motors, viscous
+  bearing friction = joint damping 0.01 N*m*s/rad, gyroscopic coupling from
+  the multibody dynamics); the controller never integrates a wheel model, it
+  only reads the true wheel speeds (`qvel`) for the speed limit, the
+  friction feedforward (LQR), the wheel-rest/bleed controller and the
+  optional gain scheduling (the LQI's state has no wheel speeds). On the
+  robot those speeds come from the ODrives' encoder estimates over CAN
+  (filtered, delayed, at the CAN rate), and the torque is not ideal (torque
+  constant, back-EMF limiting torque near top speed, Coulomb friction and
+  cogging the sim's viscous damping does not have).
 - Wheel mass placeholder (user's request to note it): each wheel's
   `<inertial mass="0.2">` in the MJCF is made up (the inertias are the
   report's J_w,i, the disc geom is only visual); replace it with the real
