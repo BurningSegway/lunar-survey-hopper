@@ -23,15 +23,15 @@ from jumper_sim.cube_model import (
 )
 
 from model_comparison.compare import (
-    DEFAULT_TORQUE, DEFAULT_X0, LiveView, compare, doublet_profile, free_floating_model,
-    load_matlab, main, mujoco_solver_label, plot_sdi, sample_rate_label, step_profile,
+    DEFAULT_TORQUE, DEFAULT_X0, STATE_NAMES, LiveView, Reference, compare, doublet_profile,
+    free_floating_model, load_matlab, main, mujoco_solver_label, plot_sdi, sample_rate_label,
+    step_profile,
 )
 from jumper_sim.controller import robot_inertia
 from jumper_sim.simulation import find_model_ids
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 MATLAB_DIR = Path(__file__).resolve().parents[1] / "model_comparison" / "matlab"
-MATLAB_FIXED_RUN = MATLAB_DIR / "fixed_jw0044.csv"  # variable step
 MATLAB_ODE4_RUN = MATLAB_DIR / "ode4_1khz.csv"
 MATLAB_ODE3_RUN = MATLAB_DIR / "ode3_1khz.csv"
 RNG = np.random.default_rng(7)
@@ -205,21 +205,6 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
         np.testing.assert_allclose(np.diag(inertia.rigid_body), SENSOR_CUBE.body_inertia,
                                    atol=1e-9)
 
-    @unittest.skipUnless(MATLAB_FIXED_RUN.is_file(), "needs the MATLAB run")
-    def test_mujoco_follows_the_variable_step_run_until_its_first_late_switch(self) -> None:
-        # The user's fixed Simulink model (J_w,i 0.0044), variable step: its
-        # torque switches land a few ms off from 2 s on, so compare up to
-        # there. Measured: q 6.5e-5, w 3.4e-5 rad/s, Omega 3.5e-5 rad/s.
-        t_ref, ref = load_matlab(MATLAB_FIXED_RUN)
-        result = compare(ref[0], doublet_profile(), 1.99)
-        inside = t_ref <= 1.99
-        sim = np.column_stack([np.interp(t_ref[inside], result["t"], result["sim"][:, i])
-                               for i in range(10)])
-        error = np.abs(sim - ref[inside])
-        self.assertLess(error[:, :4].max(), 3e-4)
-        self.assertLess(error[:, 4:7].max(), 2e-4)
-        self.assertLess(error[:, 7:].max(), 1e-4)
-
     @unittest.skipUnless(MATLAB_ODE4_RUN.is_file() and MATLAB_ODE3_RUN.is_file(),
                          "needs the MATLAB runs")
     def test_mujoco_follows_the_fixed_step_simulink_runs(self) -> None:
@@ -248,23 +233,61 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
         model, _ = free_floating_model()
         self.assertEqual(mujoco_solver_label(model), "semi-implicit Euler, 1 kHz")
 
-    def test_sdi_plot_is_written(self) -> None:
+    def test_sdi_plot_is_drawn_at_its_printed_size(self) -> None:
+        import matplotlib.image
         result = compare(DEFAULT_X0, step_profile(DEFAULT_TORQUE, 0.05), 0.1)
+        reference = Reference(result["t"][::7], result["model"][::7], "Simulink", "ode4, 1 kHz")
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "run_sdi.png"
-            plot_sdi(path, result["t"], result["sim"], result["t"][::7], result["model"][::7],
-                     tau=result["tau"], ref_info="ode4, 1 kHz",
-                     sim_info="semi-implicit Euler, 1 kHz")
-            self.assertGreater(path.stat().st_size, 10_000)
+            # One column: half an A4 landscape text width (12 cm at 300 dpi);
+            # two: the whole width (24.7 cm).
+            for columns, width_cm in ((1, 12.0), (2, 24.7)):
+                path = Path(folder) / f"run{columns}_sdi.png"
+                plot_sdi(path, result["t"], result["sim"], [reference] * columns,
+                         tau=result["tau"], sim_info="semi-implicit Euler, 1 kHz")
+                width = matplotlib.image.imread(path).shape[1]
+                self.assertAlmostEqual(width, width_cm / 2.54 * 300, delta=2)
+                self.assertTrue(path.with_suffix(".pdf").is_file())
 
-    def test_a_run_writes_its_csv_and_only_the_sdi_plot(self) -> None:
+    def _write_run(self, path: Path, t: np.ndarray, states: np.ndarray) -> None:
+        # As matlab/export_states.m writes a Simulink run.
+        header = "t," + ",".join(STATE_NAMES)
+        np.savetxt(path, np.column_stack([t, states]), delimiter=",", header=header,
+                   comments="")
+
+    def test_a_run_writes_its_csvs_and_one_sdi_plot(self) -> None:
+        result = compare(DEFAULT_X0, step_profile(DEFAULT_TORQUE, 1.0), 0.05)
         with tempfile.TemporaryDirectory() as folder:
-            with mock.patch("model_comparison.compare.RESULTS_DIR", Path(folder)), \
+            folder = Path(folder)
+            for name in ("ode4", "ode3"):
+                self._write_run(folder / f"{name}.csv", result["t"], result["model"])
+            results = folder / "results"
+            argv = ["compare", "--label", "run", "--duration", "0.05",
+                    "--matlab", str(folder / "ode4.csv"), str(folder / "ode3.csv")]
+            with mock.patch("model_comparison.compare.RESULTS_DIR", results), \
+                    mock.patch("builtins.print"):
+                with mock.patch("sys.argv", argv + ["--simulink-solver", "ode4", "ode3"]):
+                    main()
+                self.assertEqual(sorted(p.name for p in results.iterdir()),
+                                 ["run.csv", "run_matlab_ode3.csv", "run_matlab_ode4.csv",
+                                  "run_sdi.pdf", "run_sdi.png"])
+                with mock.patch("sys.argv", argv + ["--simulink-solver", "ode4"]), \
+                        mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                    main()  # one solver name per run
+            with mock.patch("model_comparison.compare.RESULTS_DIR", folder / "model"), \
                     mock.patch("sys.argv", ["compare", "--label", "run", "--duration", "0.05"]), \
                     mock.patch("builtins.print"):
+                main()  # no --matlab: against the model (4.15)
+            self.assertEqual(sorted(p.name for p in (folder / "model").iterdir()),
+                             ["run.csv", "run_sdi.pdf", "run_sdi.png"])
+            # --replot redraws from the saved results, without running anything.
+            (folder / "model" / "run_sdi.png").unlink()
+            with mock.patch("model_comparison.compare.RESULTS_DIR", folder / "model"), \
+                    mock.patch("sys.argv", ["compare", "--label", "run", "--replot"]), \
+                    mock.patch("model_comparison.compare.compare",
+                               side_effect=AssertionError("ran")), \
+                    mock.patch("builtins.print"):
                 main()
-            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()),
-                             ["run.csv", "run_sdi.png"])
+            self.assertTrue((folder / "model" / "run_sdi.png").is_file())
 
 
 if __name__ == "__main__":

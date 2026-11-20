@@ -699,51 +699,68 @@ Everything for the check against the report's nonlinear model (4.15) is in
 python -m model_comparison --label NAME [--x0 q1 q2 q3 q4 wx wy wz Ox Oy Oz]
     [--profile step|doublets] [--torque tx ty tz] [--torque-time T] [--duration D]
     [--input spin|motor] [--model-wheel-inertia J] [--bearing-friction]
-    [--view] [--view-speed S] [--wheel-inertia J] [--matlab CSV]
-    [--simulink-solver NAME]
+    [--view] [--view-speed S] [--wheel-inertia J] [--matlab CSV [CSV ...]]
+    [--simulink-solver NAME [NAME ...]] [--replot]
 ```
 
 `--wheel-inertia J` sets J_w,i in both MuJoCo and (4.15); MuJoCo's J_c stays
 the CAD value (the wheels' change goes to the base). `--model-wheel-inertia`
 sets it in (4.15) only, to see a mismatch.
 
-**Against a MATLAB/Simulink run** (`--matlab CSV`): `matlab/export_states.m`
+**Against MATLAB/Simulink runs** (`--matlab CSV ...`): `matlab/export_states.m`
 writes a MAT-file's state timeseries (`x_val`) to CSV
-(`export_states('run.mat', 'run.csv')` in MATLAB). The run's first sample is
-then `x0` (unless `--x0`), the tool also writes `NAME_matlab.csv` (on
-MATLAB's samples: its states, MuJoCo's and the model's), and the Simulink run
-replaces the model (4.15) as the reference in `NAME_sdi.png`. The panel
-titles give each run's solver and rate: Simulink's rate from its sample
-times ("1 kHz", or "variable step"), its solver from `--simulink-solver` (the
-MAT-file does not record it); MuJoCo's from the model (semi-implicit Euler,
-1 kHz).
+(`export_states('run.mat', 'run.csv')` in MATLAB). The first run's first
+sample is then `x0` (unless `--x0`); MuJoCo runs once, and each Simulink run
+replaces the model (4.15) as a reference, one column each in `NAME_sdi.png`,
+with `NAME_matlab_<csv name>.csv` each (on the run's samples: its states,
+MuJoCo's and the model's). The panel titles give each run's solver and rate:
+Simulink's rate from its sample times ("1 kHz", or "variable step"), its
+solver from `--simulink-solver` (one per run, in order; the MAT-file does not
+record it); MuJoCo's from the model (semi-implicit Euler, 1 kHz). Each row
+of panels shares its y-axis across the columns (the reference's and
+MuJoCo's states one range; the errors one range, its power of ten in the
+title), so the columns compare by eye. The x_1..x_10 legend is drawn once,
+in a column left of the panels, and the torque legend on the first torque
+panel's title line, so the panels keep the full height. The states' y-axes
+read `x_i [-, rad/s]` (x_1..x_4, the quaternion, have no unit; x_5..x_10 are
+rates). `--replot` redraws the figure from the
+saved `results/NAME.csv` (and the `--matlab` runs) without running MuJoCo
+or (4.15), for layout changes.
+
+The figure is drawn for a report, at its printed size with 10-11 pt
+lettering and no figure title (the run's settings, printed by the tool as
+"for the caption", go in the caption): one column 12 x 16 cm, two or more
+the whole text width of an A4 landscape page with 2.5 cm margins, 24.7 x
+14.5 cm (room below for the caption; `\includegraphics[width=\linewidth]`).
+It is written as `NAME_sdi.png` (300 dpi) and `NAME_sdi.pdf` (vector, for
+LaTeX/Overleaf).
 
 The user's Simulink model (`state_feedback_and_nonlinear.slx`, `J_w,i =
 0.0044` since its fix, 20 s of doublets from `x0 = [0.2663 0.101 -0.2754
-0.9182 0.1 -0.2 0.15 0 2 0]`) is in `matlab/` in three runs, compared with
-MuJoCo at the design's `J_w,i` (no `--wheel-inertia`):
+0.9182 0.1 -0.2 0.15 0 2 0]`) is in `matlab/` in two runs at 1 kHz, ode4 and
+ode3, compared with MuJoCo at the design's `J_w,i` (no `--wheel-inertia`) in
+one figure, `results/simulink_1khz_sdi.pdf`:
 
 ```sh
-python -m model_comparison --label simulink_ode4_1khz --profile doublets --duration 20 \
-    --matlab model_comparison/matlab/ode4_1khz.csv --simulink-solver ode4
+python -m model_comparison --label simulink_1khz --profile doublets --duration 20 \
+    --matlab model_comparison/matlab/ode4_1khz.csv model_comparison/matlab/ode3_1khz.csv \
+    --simulink-solver ode4 ode3
 ```
 
-| Simulink run (`--label`) | q | w [rad/s] | Omega [rad/s] |
+| Simulink run | q | w [rad/s] | Omega [rad/s] |
 |---|---|---|---|
-| ode3, 1 kHz (`simulink_ode3_1khz`) | 4.9e-4 | 1.4e-4 | 9.8e-5 |
-| ode4, 1 kHz (`simulink_ode4_1khz`) | 5.0e-4 | 1.4e-4 | 8.1e-4 |
-| variable step (`fixed_jw0044`, `matlab_fixed`) | 0.013 | 0.0035 | 0.022 |
+| ode3, 1 kHz | 4.9e-4 | 1.4e-4 | 9.8e-5 |
+| ode4, 1 kHz | 5.0e-4 | 1.4e-4 | 8.1e-4 |
 
 With ode3 Simulink is the Python (4.15) itself: 2.5e-5 in q (its 3rd-order
 step), 7e-11 rad/s in w and 1e-13 rad/s in Omega; what is left against
 MuJoCo is MuJoCo's own 1 ms semi-implicit Euler step. With ode4 the wheel
 speeds are 7.5e-4 rad/s off while a torque is on: its last stage evaluates
 the torque at the next sample, whose clock reads a hair before a switch time
-(floating point), so the switch lands ~1/6 ms early. With the variable step
-(the model's `VariableStepAuto`, max step 0.4 s) the switches land a few ms
-off (a MATLAB Function block has no zero-crossing detection), and the
-states step apart there; until the first switch at 2 s it agrees to 6.5e-5
-in q, 3.4e-5 rad/s in w and 3.5e-5 rad/s in Omega. MuJoCo normalises x0's
+(floating point), so the switch lands ~1/6 ms early. (A variable-step run,
+the model's `VariableStepAuto`, was 0.013 / 0.0035 / 0.022 apart: its
+switches land a few ms off, since a MATLAB Function block has no
+zero-crossing detection.) MuJoCo normalises x0's
 quaternion (its 4-digit values have norm 1.00003), Simulink does not: the
 2e-5 in q at t = 0.
 
@@ -760,7 +777,7 @@ or `doublets` (the user's MATLAB `tau_profile.m`: a +-0.02 N*m doublet on x
 at 1-3 s, y at 4-6 s and z at 7-9 s, then (0.02, -0.015, 0.01) N*m at
 10-11 s, then zero). Writes
 `model_comparison/results/NAME.csv` (time, input, motor torque, every state
-of both, attitude difference) and one plot, `NAME_sdi.png`, in Simulink Data
+of both, attitude difference) and one figure, `NAME_sdi.png`/`.pdf`, in Simulink Data
 Inspector style: the torque profile on top, then the reference's 10 states
 `x_1`..`x_10` (`[q1 q2 q3 q4 wx wy wz Ox Oy Oz]`) on one axes (the model
 (4.15), or the `--matlab` run), MuJoCo's on the same axes below, and the
