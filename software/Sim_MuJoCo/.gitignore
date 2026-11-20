@@ -10,3 +10,5 @@ build/Testing/
 *.mjb
 # Depth screenshots saved by the MuJoCo viewer
 DepthCapture_*.png
+# Model comparison CSVs (python -m model_comparison regenerates them)
+model_comparison/results/*.csv

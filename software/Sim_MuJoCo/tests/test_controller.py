@@ -126,11 +126,12 @@ class ControllerTests(unittest.TestCase):
             LqrLimits().torques(), j_w * (j_c - j_w) / j_c * 10.0 * 2.0 * math.pi
         )
 
-    def test_lqr_matches_the_matlab_script(self) -> None:
+    @staticmethod
+    def _script_lqr(wheel_inertia: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         # angular_reference_integral.mlx: the input there is the wheel
         # acceleration Omega_dot, B = [0; -J_c^-1 J_w], and its weights.
         j_c = np.diag(SENSOR_CUBE.body_inertia)
-        j_w = SENSOR_CUBE.wheel_inertia * np.eye(3)
+        j_w = wheel_inertia * np.eye(3)
         a6 = np.zeros((6, 6))
         a6[:3, 3:] = 0.5 * np.eye(3)
         b6 = np.vstack([np.zeros((3, 3)), -np.linalg.solve(j_c, j_w)])
@@ -140,14 +141,22 @@ class ControllerTests(unittest.TestCase):
                         + [1 / (5 * deg) ** 2] * 3)
         r = np.eye(3) / (10 * 2 * math.pi) ** 2
         k_script = np.linalg.solve(r, b_aug.T @ solve_continuous_are(a_aug, b_aug, q_aug, r))
+        return k_script, a_aug, b_aug
+
+    def test_lqr_matches_the_matlab_script(self) -> None:
+        k_script, a_aug, b_aug = self._script_lqr(SENSOR_CUBE.wheel_inertia)
         # tau_i = J_eff,i Omega_dot_i, so the torque gain is J_eff,i times it.
-        j_eff = np.diag(j_w) * (np.diag(j_c) - np.diag(j_w)) / np.diag(j_c)
+        j_c = np.array(SENSOR_CUBE.body_inertia)
+        j_w = SENSOR_CUBE.wheel_inertia
+        j_eff = j_w * (j_c - j_w) / j_c
         gain = LqrController(ReactionWheelTuning()).gain
         np.testing.assert_allclose(gain, j_eff[:, None] * k_script, rtol=1e-7, atol=1e-12)
-        # The script's printed gains (its K_bar = -lqr(...)).
-        np.testing.assert_allclose(np.diag(-k_script[:, :3]), [770.52, 770.53, 774.40], atol=0.01)
-        np.testing.assert_allclose(np.diag(-k_script[:, 3:6]), [126.14, 126.15, 128.23], atol=0.01)
-        np.testing.assert_allclose(np.diag(-k_script[:, 6:]), [720.0] * 3, atol=0.01)
+        # The script's printed gains (its K_bar = -lqr(...)), with its CAD
+        # J_w,i 4.422e6 g*mm^2 (the design uses it rounded to 0.0044).
+        printed, _, _ = self._script_lqr(4.422e-3)
+        np.testing.assert_allclose(np.diag(-printed[:, :3]), [770.52, 770.53, 774.40], atol=0.01)
+        np.testing.assert_allclose(np.diag(-printed[:, 3:6]), [126.14, 126.15, 128.23], atol=0.01)
+        np.testing.assert_allclose(np.diag(-printed[:, 6:]), [720.0] * 3, atol=0.01)
         a, b = augment(*linearize(np.zeros(3)))
         self.assertTrue(np.allclose(
             np.sort_complex(np.linalg.eigvals(a - b @ gain)),

@@ -10,11 +10,12 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~153 tests, ~85 s, all must pass
+.venv/bin/python -m unittest discover -s tests           # ~162 tests, ~75 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
 .venv/bin/python -m benchmarks.framerate_benchmark --label NAME  # viewer loop fps over a hop (no window)
+.venv/bin/python -m model_comparison --label NAME           # zero g: MuJoCo vs (4.15) (+ --matlab CSV of a Simulink run), CSV + plots; --view opens a viewer
 pip --python .venv/bin/python install -r requirements.txt  # venv has no pip of its own
 ```
 
@@ -50,15 +51,18 @@ Model tests need the generated `build/terrain_height.bin`
   user's choice after the pure integrator wound up. Linearised at
   Omega_hat = 0 (the report's choice, to save overhead), one fixed gain;
   `schedule_wheel_speeds=True` re-solves it at the measured wheel speeds.
-- Design values (CAD J_c, J_w,i, 3.3 kg cube placeholder, four fjedre.dk
-  13760 jump springs) live in `cube_model.py`; the MJCF is fitted to them by
+- Design values (CAD J_c, J_w,i = 0.0044 (the CAD 0.004422 rounded, as in
+  the user's fixed Simulink model; user's choice, 2026-11-20; the MATLAB
+  scripts still print their gains with 0.004422, the gain test checks
+  both), 3.3 kg cube placeholder, four fjedre.dk 13760 jump springs) live
+  in `cube_model.py`; the MJCF is fitted to them by
   `build/fit_robot_model.py` (rerun it, don't hand-edit those MJCF values).
 
 ## Layout (`jumper_sim/`)
 
 | File | Role |
 |---|---|
-| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot) |
+| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot). `report_dynamics` is (4.15) as written (10 states, its tau = J_w Omega_dot, J_c^-1), `motor_torque` converts; `model_comparison/compare.py` checks MuJoCo against it in zero g (bearing friction off, foot settled into its limit first) |
 | `controller.py` | PID and the report's LQR (ch. 5) as the script's LQI: u = tau = -K_bar [q_err_vec, w - w_ref, x_I] (torque straight to the motors, clipped at the motor limit), `augment`, `tracking_feedforward`, CARE by matrix sign function, Bryson's rule + anti-windup via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
 | `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating (attitude control only in flight, wheel momentum bleed in contact, 60 ms flight debounce); jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing plane's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |

@@ -59,12 +59,14 @@ class SensorCube:
 
 
 # The final cube design, from CAD (inertias given in g*mm^2 -> 1e-9 kg*m^2).
+# J_w,i is the CAD 4.422e6 g*mm^2 rounded to 0.0044 kg*m^2, the value the
+# user's fixed Simulink model uses (user's choice).
 # The mass is a placeholder until the design's is known.
 # build/Jumping_Robot.xml is fitted to these values by build/fit_robot_model.py;
 # rerun it after changing them.
 SENSOR_CUBE = SensorCube(
     body_inertia=(70660000e-9, 70670000e-9, 73330000e-9),
-    wheel_inertia=4.422e6 * 1e-9,
+    wheel_inertia=0.0044,
     mass=3.3,
 )
 
@@ -139,6 +141,37 @@ def wheel_accelerations(
     """Omega_dot = J_w^-1 tau - w_dot: the wheels relative to the body."""
     w_dot = dynamics(x, wheel_speeds, wheel_torques, cube)[4:]
     return wheel_torques / cube.wheel_inertia - w_dot
+
+
+def report_dynamics(
+    state: np.ndarray,
+    spin_torques: np.ndarray,
+    cube: SensorCube = SENSOR_CUBE,
+) -> np.ndarray:
+    """(4.15) as written: the full state ``[q1 q2 q3 q4 wx wy wz Ox Oy Oz]``.
+
+    Its input is ``tau = J_w Omega_dot`` (the torque that spins the wheels up
+    relative to the body), not the motor torque :func:`dynamics` takes. With
+    it the gyrostat equation (4.8) is
+    ``J_c w_dot = -tau - S(w)(J_c w + J_w Omega)`` and ``Omega_dot = J_w^-1 tau``,
+    exactly; :func:`motor_torque` gives the motor torque that realises it.
+    """
+    q, w, wheel_speeds = state[:4], state[4:7], state[7:]
+    momentum = cube.j_c @ w + cube.j_w @ wheel_speeds  # (4.5)
+    q_dot = 0.5 * quaternion_rate_matrix(w) @ q  # (4.3)
+    w_dot = np.linalg.solve(cube.j_c, -spin_torques - cross_matrix(w) @ momentum)
+    wheel_dot = spin_torques / cube.wheel_inertia
+    return np.concatenate([q_dot, w_dot, wheel_dot])
+
+
+def motor_torque(
+    state: np.ndarray,
+    spin_torques: np.ndarray,
+    cube: SensorCube = SENSOR_CUBE,
+) -> np.ndarray:
+    """Motor torque for (4.15)'s input: ``J_w (Omega_dot + w_dot) = tau + J_w w_dot``."""
+    w_dot = report_dynamics(state, spin_torques, cube)[4:7]
+    return spin_torques + cube.j_w @ w_dot
 
 
 def jacobians(
