@@ -26,6 +26,7 @@ from .controller import (
 from .cube_model import JUMP_SPRING, JUMP_SPRING_COUNT
 from .flight_phase import FlightPhase, FlightPhaseDetector, gravity_magnitude
 from .flight_reference import FlightReference, FlightReferenceConfig
+from .ground_contact import GroundContactEstimator
 from .jump_aim import JumpAim
 from .ray_casting import LIDAR_SITE, TERRAIN_GEOM, HeightfieldRayCaster, MeshRayCaster
 from .landing_reference import (
@@ -287,6 +288,11 @@ class JumperSimulation:
         # level/plane coming down).
         self.flight_phase = FlightPhaseDetector()
         self._previous_velocity: np.ndarray | None = None
+        # Ground contact from the IMU alone (the robot has no contact
+        # sensor). Shadow mode for now: tracked next to the simulator's
+        # contact, which still gates.
+        self.ground_contact = GroundContactEstimator()
+        self.estimated_airborne = self.ground_contact.airborne
         # The hop's ballistic arc from the IMU (latched at propulsion cutoff):
         # the landing spot is predicted along it.
         self.trajectory = TrajectoryTracker()
@@ -405,6 +411,8 @@ class JumperSimulation:
         self.contact_phases = 0
         self.flight_phase.reset()
         self._previous_velocity = None
+        self.ground_contact.reset()
+        self.estimated_airborne = self.ground_contact.airborne
         self.trajectory.reset()
         self._jump_command = False
         self._near_at_descent = 0
@@ -806,6 +814,8 @@ class JumperSimulation:
         specific_force = quaternion_to_matrix(quaternion).T @ (acceleration - self.model.opt.gravity)
         self.trajectory.update(float(self.data.time), specific_force, quaternion,
                                self.model.opt.gravity, dt)
+        self.estimated_airborne = self.ground_contact.update(
+            specific_force, gravity_magnitude(self.model.opt.gravity), dt, before)
         touchdown_near = (
             self.landing_reference is not None
             and self.landing_reference.plane.near_touchdown > self._near_at_descent

@@ -10,7 +10,7 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~147 tests, ~80 s, all must pass
+.venv/bin/python -m unittest discover -s tests           # ~153 tests, ~85 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
@@ -65,6 +65,7 @@ Model tests need the generated `build/terrain_height.bin`
 | `flight_reference.py` | Hop reference: on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading: the yaw reference (lift-off heading) throughout (face-travel went with the AS-DT1; `--spin` was removed for now, user's choice). Slew limit 180 deg/s |
 | `ray_casting.py` | Exact fast heightfield ray caster (matches `mj_multiRay`; skips 8x8-cell blocks the ray passes above their highest vertex, block looked up at the skipped segment's middle: ~5x fewer march steps, 2.4-3x faster; its cost is set by the number of march steps, i.e. ray length, more than by ray count) and a mesh ray caster for objects on it (einsum, not `@`: OpenBLAS threading made it 2-3x slower); site/geom names. The RealSense D435 depth camera that used to live here was removed (lidar only) |
 | `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump; only cells within `map_corridor` = 4 m (user's choice, margin: reads are within ~1.5 m) of the arc's ground track are binned, the rest wait unbinned in 8 m tiles and are binned at the first read after a new (bounce) arc, from the tiles near it only (`set_track`, fed by `LidarLandingReference.set_arc`; a settling robot latches many short arcs, binning at each latch froze the loop for 2 s); reads identical to binning all, tested; airborne viewer loop 37 -> 58 fps; integer cell keys `i * _CELL_RADIX + j`), ballistic landing-spot prediction along the tracker's arc (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), `LandingPlane` = the newest fit (ignored if its noise sigma > 3 deg; the Kalman filter was removed, user's choice); keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set and the arc latched from the start state) |
+| `ground_contact.py` | `GroundContactEstimator`: airborne or not from the IMU's specific force alone (in units of local g): airborne at the jump's cutoff (>= 1.25 g, then < 0.5 g, the tracker's thresholds) in TAKEOFF, no delay; an impact (> 1.25 g) ends it in DESCENT/LANDING only (the spring wind-back reads ~1250 g in the ascent); bounces after < 0.5 g for 60 ms unbroken. Shadow mode (see Open items) |
 | `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; latches p, v0 when the specific force drops < 0.5 g after > 1.25 g (cutoff, ~40 ms after release); then a fixed ballistic arc until touchdown; `touchdown` (every contact step) restarts integration from the arc's state there, so each bounce's arc latches on its first step off the ground (user's request); `latch` for thrown/dropped starts; `path` samples an arc. No arc, no landing fits. Arcs >= 60 ms of tracked jumps go to `<name>.arcs.json` with the true base path sampled on the same 20 ms grid (`_record_arc`, `_sample_actual_path`) |
 | `jump_aim.py` | On the ground, lean the body axis towards the track target (3 deg near, 8 deg at >= 30 m), closed loop on IMU tilt via a leg-shortening plane (integrator, only while still, held during release, reset at touchdown, legs capped at 10 cm, off on ground > 20 deg); motors `tilt_fl/fr/bl/br` |
 | (target, tipped) | `simulation.py`: bunny `target_object` placed on the terrain at `--track-target` (offset from `mesh_pos`; parked 100 m down otherwise), seen by `MeshRayCaster` in the terrain caster's `objects` (`JumperSimulation._terrain`); tipped (> 60 deg in GROUND) pulls all legs in, and Space then refuses to jump: R resets (user's choice; the in-air recovery, `recovery.py`, was removed). Righting on the ground is NOT possible (tested: wheel push, wheel spin-brake, wheel rock, leg kick incl. 1000 N push) |
@@ -129,28 +130,75 @@ above the ground (starting in it, the firm foot ejects the robot).
 
 ## Open items
 
-- Replace simulator contact with IMU sensing (user's request, not done
-  yet). Phases, attitude gating and the trajectory tracker's restarts still
-  use `in_contact`; on the robot there is no contact sensor. Use the IMU
-  (and the lidar) instead, keeping sim contact only as ground truth in tests
-  (compare detection times with real contact start/end):
-  - Lift-off -> control on: free fall, i.e. the tracker's propulsion cutoff
-    (specific force < 0.5 g after > 1.25 g, ~40 ms after release) plus a few
-    cm of clearance (~10 ms at ~5.5 m/s), not a height like 0.5 m. What
-    fills the wheels is control while touching the ground (it pushes against
-    something it can't turn); once airborne, total angular momentum is
-    conserved, so waiting longer saves no wheel momentum and only lets the
-    attitude error grow. ASCENT can keep its 0.5 m marker. Bounces: the same
-    rule (impact spike, then ~0). This is what the report's TAKEOFF phase
-    describes (control off while still on the ground, wheel headroom kept
-    for when it has cleared it); today TAKEOFF only holds the lift-off
-    attitude and the 60 ms contact debounce (`FLIGHT_DEBOUNCE`) gates.
+- Replace simulator contact with IMU sensing (user's request, in
+  progress). Step 1 done (2026-11-19): `ground_contact.py`'s
+  `GroundContactEstimator` runs in shadow mode (`estimated_airborne`,
+  updated in `_update_flight_phase` from the phase before the sample;
+  nothing uses it yet). Next: gate the wheels on it (with no bleed through
+  the push), then the phases, the tracker's restarts and the rest of
+  `in_contact`'s uses. Phases, attitude gating and the trajectory tracker's
+  restarts still use `in_contact`; on the robot there is no contact sensor.
+  Use the IMU (and the lidar) instead, keeping sim contact only as ground
+  truth in tests (compare detection times with real contact start/end).
+  Shadow check vs sim contact (12 Moon drops from 3 and 6 m onto the
+  landing benchmark's spots + the spawn hop, Moon and Earth, 2026-11-19):
+  every jump lift-off and nearly every touchdown on the true sample;
+  bounces on 52-61 ms after the true lift-off; airborne while touching:
+  1-6 ms at most touchdowns (force not yet > 1.25 g), up to ~60 ms on soft
+  touches below 1 g after a last small bounce, one switch-on in contact
+  (58 ms, < 0.3 g, drop 6 m spot 0):
+  - Lift-off -> control on, at the tracker's cutoff, with no delay
+    (user's decision, 2026-11-19; replaces the earlier fixed-delay plan).
+    The cutoff is the first IMU sample on which the IMU no longer sees the
+    spring pushing the robot: `TrajectoryTracker.update`, per sample, sets
+    "launched" once the specific-force magnitude |f| reaches 1.25 g (the
+    push has started), and on the first later sample with |f| < 0.5 g
+    latches the arc (its time, p, v0); g is the local gravity, so 0.5 g is
+    0.81 m/s^2 on the Moon and 4.9 m/s^2 on Earth. Why that means "off
+    the ground": an accelerometer reads every force on the robot except
+    gravity, and the only one besides gravity is the ground's push through
+    the foot (and legs). It is ~40-210 g during the push, and drops to ~0
+    when nothing touches the ground any more, i.e. free fall. So the cutoff
+    marks the end of the ground's force, which is also all that could
+    react the wheel torque. It relies on the sim's IMU being unclipped (see
+    the IMU noise item). The same sample is the first trajectory estimate
+    (the arc is latched there), so control starts and the arc exists at
+    the same sample; at 100 Hz control, the first control update after it.
+    Measured (default hop, Moon and Earth, 2026-11-19; sim contact as
+    truth): the cutoff falls 0-2 ms after the true lift-off (39-40 ms
+    after the jump command; the legs leave at 2-3 ms, the foot touches at
+    9 ms), on the jump and on every bounce; today's gating (60 ms debounce)
+    starts control at cutoff + 60 ms. In the sim the IMU is the velocity
+    change over the last 1 ms step, so it lags the contact by up to a step.
+    Kept as is (user's choice): the yaw reference latch and the start of
+    target tracking (`flight_reference.start_flight`) happen when the
+    controller starts, now the cutoff. No wheel momentum bleed through
+    the push (user's choice, for now): wheel torques are zero from the jump
+    command until the controller starts. ASCENT keeps its 0.5 m marker.
+    Bounces re-engage control after |f| < 0.5 g for 60 ms without a break
+    (user's choice (b), 2026-11-19, "for now"): on the ground |f| also dips
+    below 0.5 g while the robot rocks or slides, mostly for < 20 ms (up to
+    74 and 139 ms in light contact, Earth hop and a 6 m drop); measured
+    offline over the drops and hops, 60 ms (today's `FLIGHT_DEBOUNCE`)
+    catches all 23 bounces > 0.1 s, 60/123 ms median/max after the true
+    lift-off, 2 switch-ons in contact; 30 ms: 2 too; 100 ms: 1; 150 ms: 0
+    but one bounce missed. Test with
+    sim contact as truth: contact at control start (foot, legs, body),
+    wheel speeds at control start and at the apex, target pointing on the
+    ascent, the landing benchmark's touchdown attitude, Moon and Earth.
   - Landing -> control off: the prediction only arms (landing plane's
     near-touchdown rule: < 1 m below or < 0.3 s away; the lidar's distance
     to the plane beats the arc's height, which is fixed at cutoff and
     drifts), the IMU impact spike switches the flight controller off.
     Switching off on the prediction alone would lose the final alignment
-    with the plane.
+    with the plane. Impacts count only in DESCENT and LANDING (user's
+    choice, 2026-11-19: no need to handle impacts outside the landing; in
+    DESCENT too so a landing the lidar never armed still ends the flight;
+    |f| > 1.25 g). A spike alone is not
+    a landing: the spring wind-back at 0.4 s reads up to ~1250 g in
+    flight on the Moon (~25 g for most of 400-428 ms; 4-9 g on Earth;
+    measured 2026-11-19, the peak is likely the stiff stroke limit), while
+    an impact reads 8-15 g on its first contact sample.
   - Stationary -> GROUND: the existing stillness rule (|f| - g < 0.5 m/s^2,
     rate < 0.2 rad/s for 0.5 s) without the contact condition.
   Measure each change (take-off wheel speeds, tracking, landing benchmark).
@@ -191,14 +239,17 @@ above the ground (starting in it, the firm foot ejects the robot).
   1.62 m/s^2 standing vs ~0 in free fall, so IMU phase detection is not
   noise-limited; the biases barely matter over a hop. Magnetometer and
   barometer are useless on the Moon (no field to speak of, no air).
-  **Clip at +-10 g**: measured in the sim (Moon hop, finite-difference
-  IMU, 2026-11-19), the spring push peaks at ~210 g and is > 10 g for
-  27 ms, the landing ~208 g and > 10 g for 48 ms (the firm contact makes
-  sharp spikes; even the springs' 1718 N on ~4.2 kg is ~42 g). So the
-  tracker's integration of the push from the IMU (its v0) would clip on the
-  robot: measure the v0/arc error with clipping, and if needed get v0
-  another way (spring model, or the first lidar fits of the ground). The
-  impact spike itself still detects fine when clipped. Also still open:
+  **Not clipped in the sim (user's decision, 2026-11-19)**: the sim's IMU
+  reads any specific force, but the real MTi-610 saturates at +-10 g.
+  Measured in the sim (Moon hop, finite-difference IMU, 2026-11-19), the
+  spring push peaks at ~210 g and is > 10 g for 27 ms, the landing ~208 g
+  and > 10 g for 48 ms (the firm contact makes sharp spikes; even the
+  springs' 1718 N on ~4.2 kg is ~42 g). So on the robot the tracker's
+  integration of the push (its v0, hence the whole arc) would come out too
+  low: before the port, measure the v0/arc error with clipping, and if
+  needed get v0 another way (spring model, or the first lidar fits of the
+  ground). Clipping does not affect the timing: the cutoff (a drop below
+  0.5 g) and the impact spike detect the same when clipped. Also still open:
   latency and an attitude estimator (the sim uses the true attitude).
 - Control rate: 100 Hz (user's decision, not done yet). The control law is
   designed for it and the robot runs it at 100 Hz, but the sim computes a

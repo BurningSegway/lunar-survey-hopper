@@ -534,6 +534,36 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))
 
+    def test_imu_contact_estimate_matches_the_true_lift_off_and_touchdown(self) -> None:
+        # Shadow mode: the IMU estimate against the simulator's contact.
+        simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
+        while self.data.time < 2.0:
+            simulation.step()
+        self.assertFalse(simulation.estimated_airborne)
+        simulation.handle_key("space")
+        lift_off = touchdown = None
+        while touchdown is None and self.data.time < 4.0:
+            touching = simulation.robot_touches_terrain()
+            simulation.step()
+            if lift_off is None and simulation.estimated_airborne:
+                lift_off = float(self.data.time)
+                # On the cutoff sample, no longer touching (true lift-off).
+                self.assertTrue(simulation.trajectory.ballistic)
+                self.assertFalse(touching)
+                self.assertFalse(simulation.robot_touches_terrain())
+                self.assertAlmostEqual(simulation.trajectory.cutoff_time + self.model.opt.timestep,
+                                       lift_off, places=6)
+            elif lift_off is not None:
+                if touching:
+                    # The first touching sample is the impact.
+                    self.assertFalse(simulation.estimated_airborne)
+                    touchdown = float(self.data.time)
+                else:
+                    self.assertTrue(simulation.estimated_airborne)
+        self.assertIsNotNone(lift_off)
+        self.assertIsNotNone(touchdown)
+        self.assertGreater(touchdown - lift_off, 1.0)  # the whole hop (~1.26 s)
+
     def test_jump_latches_the_imu_arc_at_cutoff_and_again_for_the_bounce(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
         body = self.model.jnt_bodyid[simulation.ids.root_joint]
