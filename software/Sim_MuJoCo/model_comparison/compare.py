@@ -6,7 +6,8 @@ and wheel speeds relative to the body, as in the report and the MATLAB
 script), with a wheel torque profile (``--profile``: ``step``, the torque held
 for a while and then zero, or ``doublets``, the user's ``tau_profile.m``). The same start
 and input are integrated through (4.15) (``cube_model.report_dynamics``,
-RK45 at tight tolerances), and every state of both is plotted and saved.
+RK45 at tight tolerances), and every state of both is saved and plotted
+(``<label>_sdi.png``, Simulink Data Inspector style).
 
 (4.15)'s input is ``tau = J_w Omega_dot``. With ``--input spin`` (default)
 MuJoCo's wheel motors get the motor torque that realises it,
@@ -27,7 +28,7 @@ Usage:
         --torque 0.02 -0.01 0.015 --torque-time 1 --duration 5
     python -m model_comparison --label doublets --profile doublets --duration 20 \
         --x0 0.29 0.11 -0.30 1 0.1 -0.2 0.15 0 2 0
-Writes model_comparison/results/<label>.csv and .png
+Writes model_comparison/results/<label>.csv and <label>_sdi.png
 """
 
 from __future__ import annotations
@@ -270,129 +271,8 @@ def write_csv(path, t, tau, motor, sim, model, attitude_diff) -> None:
                             np.concatenate([row[1], row[2], row[3], row[4], [row[5]]])])
 
 
-MODEL_MARKERS = 20  # model (4.15) drawn as markers, ~this many per curve
-
-
-def model_markevery(samples: int, component: int = 0, components: int = 1) -> tuple[int, int]:
-    """Every n-th sample, staggered per component so markers do not stack."""
-    step = max(1, samples // MODEL_MARKERS)
-    return (component * step // components, step)
-
-
-def plot(path, t, tau, motor, sim, model, attitude_diff, title: str) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    units = ["[-]"] * 4 + ["[rad/s]"] * 6
-    fig, axes = plt.subplots(4, 3, figsize=(14, 12), sharex=True)
-    for i, ax in enumerate(axes.flat[:10]):
-        ax.plot(t, sim[:, i], color="C0", linewidth=1.6, label="MuJoCo")
-        ax.plot(t, model[:, i], color="C1", linestyle="none", marker="o", markersize=5,
-                markerfacecolor="none", markeredgewidth=1.2, markevery=model_markevery(len(t)),
-                label="model (4.15)")
-        ax.set_title(STATE_NAMES[i])
-        ax.set_ylabel(units[i])
-        ax.grid(alpha=0.3)
-    ax = axes.flat[10]
-    for j, axis in enumerate("xyz"):
-        ax.plot(t, tau[:, j], color=f"C{j + 2}", linewidth=1.4, label=f"tau_{axis} (4.15)")
-        ax.plot(t, motor[:, j], color=f"C{j + 2}", linewidth=1.0, linestyle=":",
-                label=f"motor_{axis} (MuJoCo)")
-    ax.set_title("wheel torque")
-    ax.set_ylabel("[N*m]")
-    ax.grid(alpha=0.3)
-    low, high = ax.get_ylim()
-    ax.set_ylim(low, high + 0.9 * (high - low))  # room for the legend above the data
-    ax.legend(fontsize=6.5, ncol=2, loc="upper center")
-    ax = axes.flat[11]
-    ax.plot(t, attitude_diff, color="C3", linewidth=1.4)
-    ax.set_title("attitude difference MuJoCo vs model")
-    ax.set_ylabel("[deg]")
-    ax.grid(alpha=0.3)
-    for ax in axes[-1]:
-        ax.set_xlabel("time [s]")
-    axes.flat[0].legend(fontsize=8)
-    fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
 # MATLAB's default line colours (its "lines" colormap).
 MATLAB_COLORS = ("#0072BD", "#D95319", "#EDB120", "#7E2F8E")
-
-
-def marker_indices(t: np.ndarray, component: int = 0, components: int = 1) -> np.ndarray:
-    """~MODEL_MARKERS evenly spaced samples of ``t`` (any spacing), staggered per
-    component so markers do not stack."""
-    step = (t[-1] - t[0]) / MODEL_MARKERS
-    targets = t[0] + step * (np.arange(MODEL_MARKERS + 1) + component / components)
-    targets = targets[targets <= t[-1]]
-    return np.unique(np.abs(t[None, :] - targets[:, None]).argmin(axis=1))
-
-
-def plot_simple(path, t, sim, t_ref, ref, ref_label: str = "Model (4.15)",
-                title: str | None = None) -> None:
-    """MATLAB-figure style: one plot per state group, components overlaid.
-
-    Left: MuJoCo as lines, the reference (the model (4.15), or a MATLAB run on
-    its own time samples) as open circles in the same colour (they agree too
-    closely to tell apart as two lines). Right: MuJoCo - reference, at the
-    reference's samples.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-
-    groups = (
-        ("Quaternion", "q [-]", range(0, 4), ("$q_1$", "$q_2$", "$q_3$", "$q_4$")),
-        ("Body angular velocity", r"$\omega$ [rad/s]", range(4, 7),
-         (r"$\omega_x$", r"$\omega_y$", r"$\omega_z$")),
-        ("Wheel speeds", r"$\Omega$ [rad/s]", range(7, 10),
-         (r"$\Omega_x$", r"$\Omega_y$", r"$\Omega_z$")),
-    )
-    sim_at_ref = np.column_stack([np.interp(t_ref, t, sim[:, i]) for i in range(10)])
-    short = ref_label.split(" ")[0]
-    with plt.rc_context({"font.family": "sans-serif", "font.size": 10,
-                         "axes.linewidth": 0.6, "axes.edgecolor": "#262626",
-                         "grid.color": "#DFDFDF", "grid.linewidth": 0.6}):
-        fig, axes = plt.subplots(3, 2, figsize=(12, 8), sharex=True,
-                                 gridspec_kw={"width_ratios": (3, 2)})
-        for (ax, diff_ax), (name_, ylabel, states, labels) in zip(axes, groups):
-            diff = sim_at_ref[:, list(states)] - ref[:, list(states)]
-            peak = float(np.abs(diff).max())
-            exponent = int(np.floor(np.log10(peak))) if peak > 0 else 0
-            for j, (color, i, label) in enumerate(zip(MATLAB_COLORS, states, labels)):
-                ax.plot(t, sim[:, i], color=color, linewidth=1.5, label=label)
-                marks = marker_indices(t_ref, j, len(states))
-                ax.plot(t_ref[marks], ref[marks, i], color=color, linestyle="none", marker="o",
-                        markersize=6, markerfacecolor="none", markeredgewidth=1.2)
-                diff_ax.plot(t_ref, diff[:, j] / 10.0**exponent, color=color, linewidth=1.5)
-            ax.set_title(name_, fontweight="bold")
-            ax.set_ylabel(ylabel)
-            diff_ax.set_title(f"{name_}: MuJoCo $-$ {short}", fontweight="bold")
-            name, unit = ylabel.split(" ")
-            scale = f" $\\times 10^{{{exponent}}}$" if exponent else ""
-            diff_ax.set_ylabel(f"$\\Delta${name} {unit[:-1]}{scale}]")
-            for a in (ax, diff_ax):
-                a.grid(True)
-                a.set_xlim(t[0], t[-1])
-            handles, names = ax.get_legend_handles_labels()
-            handles += [Line2D([], [], color="k", linewidth=1.5),
-                        Line2D([], [], color="k", linestyle="none", marker="o",
-                               markerfacecolor="none", markeredgewidth=1.2)]
-            names += ["MuJoCo", ref_label]
-            ax.legend(handles, names, loc="center left", bbox_to_anchor=(1.01, 0.5),
-                      frameon=True, edgecolor="#262626", fancybox=False, fontsize=9)
-        for a in axes[-1]:
-            a.set_xlabel("Time [s]")
-        if title:
-            fig.suptitle(title)
-        fig.tight_layout()
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
 
 
 # Simulink Data Inspector's line colours for x_val(1)..x_val(10).
@@ -400,12 +280,39 @@ SDI_COLORS = ("#E8178A", "#A2142F", "#2CA0E8", "#F07F35", "#B33CF0",
               "#64C832", "#F51DB4", "#EB3A1C", "#1FAD6B", "#0072BD")
 
 
-def plot_sdi(path, t, sim, t_ref, ref, ref_label: str = "Simulink",
-             title: str | None = None) -> None:
-    """Simulink Data Inspector style: all 10 states x_val(1..10) on one axes.
+def sample_rate_label(t: np.ndarray) -> str:
+    """A run's step from its sample times: '1 kHz' (fixed) or 'variable step'."""
+    steps = np.diff(t)
+    if np.ptp(steps) > 1e-6 * steps.mean():
+        return "variable step"
+    rate = 1.0 / steps.mean()
+    return f"{rate / 1000:.4g} kHz" if rate >= 1000 else f"{rate:.4g} Hz"
 
-    Top: the Simulink run (its own samples); middle: MuJoCo, same axes;
-    bottom: MuJoCo - Simulink, at the Simulink run's samples.
+
+MUJOCO_INTEGRATORS = {
+    mujoco.mjtIntegrator.mjINT_EULER: "semi-implicit Euler",
+    mujoco.mjtIntegrator.mjINT_RK4: "RK4",
+    mujoco.mjtIntegrator.mjINT_IMPLICIT: "implicit Euler",
+    mujoco.mjtIntegrator.mjINT_IMPLICITFAST: "implicitfast Euler",
+}
+
+
+def mujoco_solver_label(model: mujoco.MjModel) -> str:
+    """MuJoCo's integrator and rate, e.g. 'semi-implicit Euler, 1 kHz'."""
+    name = MUJOCO_INTEGRATORS.get(mujoco.mjtIntegrator(model.opt.integrator),
+                                  str(model.opt.integrator))
+    return f"{name}, {sample_rate_label(np.array([0.0, model.opt.timestep]))}"
+
+
+def plot_sdi(path, t, sim, t_ref, ref, ref_label: str = "Simulink",
+             title: str | None = None, tau: np.ndarray | None = None,
+             ref_info: str = "", sim_info: str = "") -> None:
+    """Simulink Data Inspector style: all 10 states x_1..x_10 on one axes.
+
+    Top (with ``tau``): the wheel torque input on MuJoCo's samples; then the
+    reference run (a Simulink run, or the model (4.15); its own samples);
+    MuJoCo, same axes; MuJoCo - reference, at the reference's samples.
+    ``ref_info``/``sim_info`` (solver, rate) go in the panel titles.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -415,15 +322,29 @@ def plot_sdi(path, t, sim, t_ref, ref, ref_label: str = "Simulink",
     with plt.rc_context({"font.family": "sans-serif", "font.size": 10,
                          "axes.linewidth": 0.6, "axes.edgecolor": "#262626",
                          "grid.color": "#DFDFDF", "grid.linewidth": 0.8}):
-        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True,
-                                 gridspec_kw={"height_ratios": (3, 3, 2)})
-        panels = ((axes[0], t_ref, ref, f"{ref_label} (x_val)"),
-                  (axes[1], t, sim, "MuJoCo simulation"),
+        ratios = ((1.5,) if tau is not None else ()) + (3, 3, 2)
+        fig, axes = plt.subplots(len(ratios), 1, figsize=(12, 12 + 2 * (tau is not None)),
+                                 sharex=True, gridspec_kw={"height_ratios": ratios})
+        if tau is not None:
+            torque_ax, axes = axes[0], axes[1:]
+            for i, (color, axis) in enumerate(zip(MATLAB_COLORS, "xyz")):
+                torque_ax.plot(t, tau[:, i], color=color, linewidth=1.5,
+                               drawstyle="steps-post", label=f"$\\tau_{axis}$")
+            torque_ax.set_title("Torque profile (wheel torque input)", fontweight="bold",
+                                loc="left")
+            torque_ax.set_ylabel(r"$\tau$ [N$\cdot$m]")
+            torque_ax.legend(loc="upper right", ncol=3, frameon=True, edgecolor="#262626",
+                             fancybox=False, fontsize=9)
+            torque_ax.grid(True)
+            torque_ax.set_xlim(0.0, t[-1])
+        suffix = lambda info: f": {info}" if info else ""
+        panels = ((axes[0], t_ref, ref, f"{ref_label}{suffix(ref_info)}"),
+                  (axes[1], t, sim, f"MuJoCo simulation{suffix(sim_info)}"),
                   (axes[2], t_ref, error, f"Error: MuJoCo $-$ {ref_label}"))
         for ax, time, states, name in panels:
             for i, color in enumerate(SDI_COLORS):
                 ax.plot(time, states[:, i], color=color, linewidth=1.5,
-                        label=f"x_val({i + 1})")
+                        label=f"$x_{{{i + 1}}}$")
             ax.set_title(name, fontweight="bold", loc="left")
             ax.grid(True)
             ax.set_xlim(0.0, t[-1])
@@ -435,10 +356,10 @@ def plot_sdi(path, t, sim, t_ref, ref, ref_label: str = "Simulink",
         handles, names = axes[0].get_legend_handles_labels()
         fig.legend(handles, names, loc="upper center", ncol=10, frameon=False,
                    fontsize=9, handlelength=1.2, columnspacing=1.0,
-                   bbox_to_anchor=(0.5, 0.995 if not title else 0.965))
+                   bbox_to_anchor=(0.5, 0.995 if not title else 0.97))
         if title:
             fig.suptitle(title, y=0.995)
-        fig.tight_layout(rect=(0, 0, 1, 0.96 if not title else 0.94))
+        fig.tight_layout(rect=(0, 0, 1, 0.965 if not title else 0.95))
         fig.savefig(path, dpi=120)
         plt.close(fig)
 
@@ -506,14 +427,16 @@ def main() -> None:
     parser.add_argument("--wheel-inertia", type=float, default=None,
                         help="J_w,i in both MuJoCo (J_c kept: the difference goes to the "
                              "base) and (4.15) [kg*m^2] (default the CAD value "
-                             f"{SENSOR_CUBE.wheel_inertia}, which the MJCF is fitted to; "
-                             "the MATLAB model has 0.00225)")
+                             f"{SENSOR_CUBE.wheel_inertia}, which the MJCF is fitted to)")
     parser.add_argument("--model-wheel-inertia", type=float, default=None,
                         help="J_w,i in (4.15) only [kg*m^2], to see a mismatch")
     parser.add_argument("--matlab", type=Path, default=None,
                         help="a MATLAB run's states (CSV from matlab/export_states.m) to "
-                             "compare MuJoCo with: <label>_matlab.csv, <label>_matlab.png "
-                             "and <label>_sdi.png (Data Inspector style)")
+                             "compare MuJoCo with instead of the model (4.15): "
+                             "<label>_matlab.csv, and the run in <label>_sdi.png")
+    parser.add_argument("--simulink-solver", default=None, metavar="NAME",
+                        help="the --matlab run's solver (e.g. ode4), for the plot titles "
+                             "(its rate comes from its sample times)")
     parser.add_argument("--bearing-friction", action="store_true",
                         help="keep MuJoCo's wheel bearing friction (not in (4.15))")
     parser.add_argument("--view", action="store_true",
@@ -550,19 +473,21 @@ def main() -> None:
     title = (f"zero g, {args.profile} torque, input {args.input}, {wheels}"
              f"{', bearing friction' if args.bearing_friction else ''}: x0 = "
              + " ".join(f"{v:g}" for v in args.x0))
-    plot(stem.with_suffix(".png"), *(result[k] for k in keys), title)
-    simple = stem.with_name(f"{args.label}_simple.png")
-    plot_simple(simple, result["t"], result["sim"], result["t"], result["model"])
+    model, data = free_floating_model(wheel_inertia=sim_wheel)
+    sdi = stem.with_name(f"{args.label}_sdi.png")
     if matlab is not None:
         t_ref, ref = matlab
+        ref_label = "Simulink"
+        ref_info = ", ".join(filter(None, (args.simulink_solver, sample_rate_label(t_ref))))
         write_matlab_csv(stem.with_name(f"{args.label}_matlab.csv"), t_ref, ref,
                          result["t"], result["sim"], result["model"])
-        plot_sdi(stem.with_name(f"{args.label}_sdi.png"), result["t"], result["sim"],
-                 t_ref, ref, title=title)
-        plot_simple(stem.with_name(f"{args.label}_matlab.png"), result["t"], result["sim"],
-                    t_ref, ref, ref_label="MATLAB", title=title)
+    else:
+        t_ref, ref = result["t"], result["model"]
+        ref_label = "Model (4.15)"
+        ref_info = f"RK45 (rtol 1e-10), sampled at {sample_rate_label(t_ref)}"
+    plot_sdi(sdi, result["t"], result["sim"], t_ref, ref, ref_label=ref_label, title=title,
+             tau=result["tau"], ref_info=ref_info, sim_info=mujoco_solver_label(model))
 
-    model, data = free_floating_model(wheel_inertia=sim_wheel)
     ids = find_model_ids(model)
     inertia = robot_inertia(model, ids.root_joint, ids.wheel_joints)
     print("MJCF at the flight pose: J diag", np.round(np.diag(inertia.rigid_body), 6),
@@ -585,12 +510,9 @@ def main() -> None:
             e = np.abs(at(states) - ref)
             print(f"max |{name} - MATLAB| (on MATLAB's samples): q {e[:, :4].max():.3g}, "
                   f"w {e[:, 4:7].max():.3g} rad/s, Omega {e[:, 7:].max():.3g} rad/s")
-    print(stem.with_suffix(".png"))
-    print(simple)
     if matlab is not None:
         print(stem.with_name(f"{args.label}_matlab.csv"))
-        print(stem.with_name(f"{args.label}_matlab.png"))
-        print(stem.with_name(f"{args.label}_sdi.png"))
+    print(sdi)
     if view is not None:
         print("Close the viewer window to exit.")
         view.hold()

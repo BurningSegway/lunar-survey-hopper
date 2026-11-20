@@ -24,16 +24,16 @@ from jumper_sim.cube_model import (
 
 from model_comparison.compare import (
     DEFAULT_TORQUE, DEFAULT_X0, LiveView, compare, doublet_profile, free_floating_model,
-    load_matlab, plot_sdi, plot_simple, step_profile,
+    load_matlab, main, mujoco_solver_label, plot_sdi, sample_rate_label, step_profile,
 )
 from jumper_sim.controller import robot_inertia
 from jumper_sim.simulation import find_model_ids
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
 MATLAB_DIR = Path(__file__).resolve().parents[1] / "model_comparison" / "matlab"
-MATLAB_RUN = MATLAB_DIR / "doublets_jw00225.csv"
-MATLAB_CAD_RUN = MATLAB_DIR / "doublets_cad_ode4_1ms.csv"
-MATLAB_FIXED_RUN = MATLAB_DIR / "fixed_jw0044.csv"
+MATLAB_FIXED_RUN = MATLAB_DIR / "fixed_jw0044.csv"  # variable step
+MATLAB_ODE4_RUN = MATLAB_DIR / "ode4_1khz.csv"
+MATLAB_ODE3_RUN = MATLAB_DIR / "ode3_1khz.csv"
 RNG = np.random.default_rng(7)
 
 
@@ -205,49 +205,66 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
         np.testing.assert_allclose(np.diag(inertia.rigid_body), SENSOR_CUBE.body_inertia,
                                    atol=1e-9)
 
-    @unittest.skipUnless(MATLAB_RUN.is_file() and MATLAB_FIXED_RUN.is_file(),
+    @unittest.skipUnless(MATLAB_FIXED_RUN.is_file(), "needs the MATLAB run")
+    def test_mujoco_follows_the_variable_step_run_until_its_first_late_switch(self) -> None:
+        # The user's fixed Simulink model (J_w,i 0.0044), variable step: its
+        # torque switches land a few ms off from 2 s on, so compare up to
+        # there. Measured: q 6.5e-5, w 3.4e-5 rad/s, Omega 3.5e-5 rad/s.
+        t_ref, ref = load_matlab(MATLAB_FIXED_RUN)
+        result = compare(ref[0], doublet_profile(), 1.99)
+        inside = t_ref <= 1.99
+        sim = np.column_stack([np.interp(t_ref[inside], result["t"], result["sim"][:, i])
+                               for i in range(10)])
+        error = np.abs(sim - ref[inside])
+        self.assertLess(error[:, :4].max(), 3e-4)
+        self.assertLess(error[:, 4:7].max(), 2e-4)
+        self.assertLess(error[:, 7:].max(), 1e-4)
+
+    @unittest.skipUnless(MATLAB_ODE4_RUN.is_file() and MATLAB_ODE3_RUN.is_file(),
                          "needs the MATLAB runs")
-    def test_mujoco_follows_the_matlab_runs_until_their_first_late_switch(self) -> None:
-        # The user's Simulink runs (J_w,i 0.00225, then fixed to 0.0044): their
-        # torque switches land a few ms off from 2 s on (variable step), so
-        # compare up to there. Measured: q 7.9e-5 / 6.5e-5, w 7.0e-5 / 3.4e-5
-        # rad/s, Omega 4.5e-5 / 3.5e-5 rad/s.
-        for run, wheel_inertia in ((MATLAB_RUN, 0.00225), (MATLAB_FIXED_RUN, 0.0044)):
+    def test_mujoco_follows_the_fixed_step_simulink_runs(self) -> None:
+        # The user's Simulink model at 1 kHz, 20 s of doublets. Measured
+        # (q, w, Omega): ode4 5.0e-4, 1.4e-4, 8.1e-4 (its last stage sees a
+        # switch ~1/6 ms early); ode3 4.9e-4, 1.4e-4, 9.8e-5.
+        for run, omega_bound in ((MATLAB_ODE4_RUN, 1.5e-3), (MATLAB_ODE3_RUN, 3e-4)):
             with self.subTest(run=run.name):
                 t_ref, ref = load_matlab(run)
-                cube = replace(SENSOR_CUBE, wheel_inertia=wheel_inertia)
-                result = compare(ref[0], doublet_profile(), 1.99, cube,
-                                 sim_wheel_inertia=wheel_inertia)
-                inside = t_ref <= 1.99
-                sim = np.column_stack([np.interp(t_ref[inside], result["t"], result["sim"][:, i])
-                                       for i in range(10)])
-                error = np.abs(sim - ref[inside])
-                self.assertLess(error[:, :4].max(), 3e-4)
-                self.assertLess(error[:, 4:7].max(), 2e-4)
-                self.assertLess(error[:, 7:].max(), 1e-4)
+                result = compare(ref[0], doublet_profile(), 20.0)
+                error = np.abs(result["sim"] - ref)  # same 1 ms grid
+                self.assertLess(error[:, :4].max(), 1e-3)
+                self.assertLess(error[:, 4:7].max(), 3e-4)
+                self.assertLess(error[:, 7:].max(), omega_bound)
+                # ode3 never evaluates past a switch: it is (4.15) itself, to
+                # its 3rd-order step in q (measured 2.5e-5, w 7e-11).
+                if run == MATLAB_ODE3_RUN:
+                    error = np.abs(result["model"] - ref)
+                    self.assertLess(error[:, :4].max(), 1e-4)
+                    self.assertLess(error[:, 4:].max(), 1e-8)
 
-    @unittest.skipUnless(MATLAB_CAD_RUN.is_file(), "needs the MATLAB run")
-    def test_mujoco_follows_the_fixed_step_simulink_run_with_cad_wheels(self) -> None:
-        # The user's Simulink model with the CAD J_w,i (0.004422, not the
-        # design's rounded 0.0044), ode4 at 1 ms, 20 s of doublets.
-        # Measured: q 5.1e-4, w 1.4e-4 rad/s, Omega 8.1e-4 rad/s.
-        t_ref, ref = load_matlab(MATLAB_CAD_RUN)
-        cube = replace(SENSOR_CUBE, wheel_inertia=0.004422)
-        result = compare(ref[0], doublet_profile(), 20.0, cube, sim_wheel_inertia=0.004422)
-        error = np.abs(result["sim"] - ref)  # same 1 ms grid
-        self.assertLess(error[:, :4].max(), 1e-3)
-        self.assertLess(error[:, 4:7].max(), 3e-4)
-        self.assertLess(error[:, 7:].max(), 1.5e-3)
+    def test_rate_and_solver_labels(self) -> None:
+        self.assertEqual(sample_rate_label(np.linspace(0.0, 20.0, 20001)), "1 kHz")
+        self.assertEqual(sample_rate_label(np.array([0.0, 0.01, 0.02])), "100 Hz")
+        self.assertEqual(sample_rate_label(np.array([0.0, 0.001, 0.4])), "variable step")
+        model, _ = free_floating_model()
+        self.assertEqual(mujoco_solver_label(model), "semi-implicit Euler, 1 kHz")
 
-    def test_simple_plot_is_written(self) -> None:
+    def test_sdi_plot_is_written(self) -> None:
         result = compare(DEFAULT_X0, step_profile(DEFAULT_TORQUE, 0.05), 0.1)
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "run_simple.png"
-            plot_simple(path, result["t"], result["sim"], result["t"], result["model"])
-            self.assertGreater(path.stat().st_size, 10_000)
             path = Path(folder) / "run_sdi.png"
-            plot_sdi(path, result["t"], result["sim"], result["t"][::7], result["model"][::7])
+            plot_sdi(path, result["t"], result["sim"], result["t"][::7], result["model"][::7],
+                     tau=result["tau"], ref_info="ode4, 1 kHz",
+                     sim_info="semi-implicit Euler, 1 kHz")
             self.assertGreater(path.stat().st_size, 10_000)
+
+    def test_a_run_writes_its_csv_and_only_the_sdi_plot(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch("model_comparison.compare.RESULTS_DIR", Path(folder)), \
+                    mock.patch("sys.argv", ["compare", "--label", "run", "--duration", "0.05"]), \
+                    mock.patch("builtins.print"):
+                main()
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()),
+                             ["run.csv", "run_sdi.png"])
 
 
 if __name__ == "__main__":

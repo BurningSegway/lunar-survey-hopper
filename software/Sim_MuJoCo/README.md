@@ -182,8 +182,9 @@ rad/s, torque (0.02, -0.01, 0.015) N*m for 1 s, 5 s run: 0.09 deg of
 attitude, 0.0025 rad/s of body rate, 0.00016 rad/s of wheel speed apart at
 most. That is MuJoCo's 1 ms Euler step: at 0.2 ms the attitude ends 0.04 deg
 apart. The same `tau` fed straight to the motors (`--input motor`) ends 9 deg
-apart. The MATLAB script's `J_w,i = 0.00225` (the wheels' transverse
-inertia) instead of the design's 0.0044 ends 17 deg apart. With the MJCF's
+apart. `J_w,i = 0.00225` in (4.15) (the wheels' transverse inertia, which
+the Simulink model had before its fix) instead of the design's 0.0044 ends
+17 deg apart. With the MJCF's
 bearing friction (0.01 N*m*s/rad, which (4.15) lacks; `--bearing-friction`)
 the wheels stop within ~2 s (time constant J_w / b = 0.44 s).
 
@@ -699,6 +700,7 @@ python -m model_comparison --label NAME [--x0 q1 q2 q3 q4 wx wy wz Ox Oy Oz]
     [--profile step|doublets] [--torque tx ty tz] [--torque-time T] [--duration D]
     [--input spin|motor] [--model-wheel-inertia J] [--bearing-friction]
     [--view] [--view-speed S] [--wheel-inertia J] [--matlab CSV]
+    [--simulink-solver NAME]
 ```
 
 `--wheel-inertia J` sets J_w,i in both MuJoCo and (4.15); MuJoCo's J_c stays
@@ -708,70 +710,42 @@ sets it in (4.15) only, to see a mismatch.
 **Against a MATLAB/Simulink run** (`--matlab CSV`): `matlab/export_states.m`
 writes a MAT-file's state timeseries (`x_val`) to CSV
 (`export_states('run.mat', 'run.csv')` in MATLAB). The run's first sample is
-then `x0` (unless `--x0`), and the tool also writes `NAME_matlab.csv` (on
-MATLAB's samples: its states, MuJoCo's and the model's) and
-`NAME_matlab.png` (MuJoCo lines, MATLAB circles, MuJoCo - MATLAB) and
-`NAME_sdi.png` (Simulink Data Inspector style: the run's 10 states
-`x_val(1..10)` on one axes, MuJoCo's on the same axes below, and the error
-MuJoCo - Simulink).
+then `x0` (unless `--x0`), the tool also writes `NAME_matlab.csv` (on
+MATLAB's samples: its states, MuJoCo's and the model's), and the Simulink run
+replaces the model (4.15) as the reference in `NAME_sdi.png`. The panel
+titles give each run's solver and rate: Simulink's rate from its sample
+times ("1 kHz", or "variable step"), its solver from `--simulink-solver` (the
+MAT-file does not record it); MuJoCo's from the model (semi-implicit Euler,
+1 kHz).
 
-The user's run of the doublets (`matlab/doublets_jw00225.mat`/`.csv`, 20 s
-from `x0 = [0.2663 0.101 -0.2754 0.9182 0.1 -0.2 0.15 0 2 0]`) uses
-`J_w,i = 0.00225` (its wheel speeds: a 0.02 N*m second gives 8.9 rad/s, 4.5
-with the design's 0.0044), so it is compared with `--wheel-inertia 0.00225`
-(`--label matlab_doublets`). Until 2 s MuJoCo and MATLAB agree to 8e-5 in q,
-7e-5 rad/s in w and 5e-5 rad/s in Omega (MATLAB's own solver tolerance).
-From then on MATLAB's wheel speeds step away from their exact integral
-`Omega_0 + int(tau) / J_w` at the torque switches at 2, 3, 5, 6, 8, 9 and 11 s
-(by 0.03-0.1 rad/s, i.e. the switches land 2-5 ms late: Simulink's variable
-step does not stop at them, since a MATLAB Function block has no zero-crossing
-detection), and the other states follow: over 20 s 0.016 in q, 0.005 rad/s in
-w and 0.12 rad/s in Omega apart, the same for the Python (4.15) as for MuJoCo.
-With the CAD wheels (`--wheel-inertia 0.004422`, `--label
-matlab_doublets_cad_wheels`) they are 0.38, 0.09
-rad/s and 4.4 rad/s apart. To remove the switch error in Simulink: a
-fixed-step solver at 1 ms (e.g. ode4), or a max step of 1 ms, or the profile
-built from Step blocks (they have zero-crossing detection).
+The user's Simulink model (`state_feedback_and_nonlinear.slx`, `J_w,i =
+0.0044` since its fix, 20 s of doublets from `x0 = [0.2663 0.101 -0.2754
+0.9182 0.1 -0.2 0.15 0 2 0]`) is in `matlab/` in three runs, compared with
+MuJoCo at the design's `J_w,i` (no `--wheel-inertia`):
 
-A later run sent as the correct values (`matlab/correct_jw00225.mat`/`.csv`,
-293 samples, same `x0`) is again `J_w,i = 0.00225` with a variable step
-(Omega_x 8.88 rad/s at 2 s); it differs from the first run only in where the
-steps land (up to 0.1 rad/s in Omega). Against MuJoCo with
-`--wheel-inertia 0.00225` (`--label matlab_correct`): 0.010 in q, 0.003
-rad/s in w, 0.067 rad/s in Omega over 20 s, again all in steps at the torque
-switches (the Python (4.15) the same); with the CAD wheels
-(`--wheel-inertia 0.004422`, `matlab_correct_cad_wheels`) 0.39, 0.095 rad/s and 4.4 rad/s.
+```sh
+python -m model_comparison --label simulink_ode4_1khz --profile doublets --duration 20 \
+    --matlab model_comparison/matlab/ode4_1khz.csv --simulink-solver ode4
+```
 
-The user's fixed model (`matlab/fixed_jw0044.mat`/`.csv`, 286 samples, same
-`x0` and variable step) uses `J_w,i = 0.0044` (the CAD 0.004422 rounded;
-Omega_x rises at 4.545 rad/s^2 under 0.02 N*m), since then the design value
-too (`SENSOR_CUBE`). Against MuJoCo (`--label matlab_fixed`, no
-`--wheel-inertia`): until 2 s 6.5e-5 in q,
-3.4e-5 rad/s in w and 3.5e-5 rad/s in Omega; over 20 s 0.013, 0.0035 rad/s
-and 0.022 rad/s, the rest again steps at the torque switches (the Python
-(4.15) the same). With the CAD 0.004422 (`--wheel-inertia 0.004422`,
-`matlab_fixed_cad_wheels`): 0.014,
-0.0043 rad/s and 0.027 rad/s.
-
-Why 0.00225: the Simulink model (`state_feedback_and_nonlinear.slx`) does not
-read `J_wi_val` from the live script; both of its dynamics MATLAB Function
-blocks hard-code `J_w = 0.00225 * eye(3)` (its solver: `VariableStepAuto`,
-`RelTol 1e-3`, max step auto = 0.4 s). `matlab/run_simulink_doublets.m` runs a
-patched copy (originals untouched) with the CAD `J_w,i` and the normalised
-`x0`, once with the model's own variable step and once with `ode4` at 1 ms:
-`matlab/doublets_cad_variable.csv` and `doublets_cad_ode4_1ms.csv`. Against
-MuJoCo with the same CAD wheels (`--wheel-inertia 0.004422`, `--label
-matlab_cad_ode4_1ms` / `matlab_cad_variable`), over the 20 s:
-
-| Simulink run | q | w [rad/s] | Omega [rad/s] |
+| Simulink run (`--label`) | q | w [rad/s] | Omega [rad/s] |
 |---|---|---|---|
-| ode4, 1 ms | 5.1e-4 | 1.4e-4 | 8.1e-4 |
-| variable step | 0.013 | 0.0027 | 0.027 |
+| ode3, 1 kHz (`simulink_ode3_1khz`) | 4.9e-4 | 1.4e-4 | 9.8e-5 |
+| ode4, 1 kHz (`simulink_ode4_1khz`) | 5.0e-4 | 1.4e-4 | 8.1e-4 |
+| variable step (`fixed_jw0044`, `matlab_fixed`) | 0.013 | 0.0035 | 0.022 |
 
-With the fixed step the Python (4.15) matches Simulink to 4e-5 in q and
-5e-5 rad/s in w; the wheel speeds' 7.5e-4 rad/s, only while a torque is on,
-is Simulink's torque switching ~1/6 ms early (ode4's first stage at the
-switch sample sees the old torque: floating-point clock).
+With ode3 Simulink is the Python (4.15) itself: 2.5e-5 in q (its 3rd-order
+step), 7e-11 rad/s in w and 1e-13 rad/s in Omega; what is left against
+MuJoCo is MuJoCo's own 1 ms semi-implicit Euler step. With ode4 the wheel
+speeds are 7.5e-4 rad/s off while a torque is on: its last stage evaluates
+the torque at the next sample, whose clock reads a hair before a switch time
+(floating point), so the switch lands ~1/6 ms early. With the variable step
+(the model's `VariableStepAuto`, max step 0.4 s) the switches land a few ms
+off (a MATLAB Function block has no zero-crossing detection), and the
+states step apart there; until the first switch at 2 s it agrees to 6.5e-5
+in q, 3.4e-5 rad/s in w and 3.5e-5 rad/s in Omega. MuJoCo normalises x0's
+quaternion (its 4-digit values have norm 1.00003), Simulink does not: the
+2e-5 in q at t = 0.
 
 `--view` opens MuJoCo's viewer on the run as it runs (real time, or `S`
 times that), the camera following the robot, which floats 2 m above the
@@ -786,12 +760,11 @@ or `doublets` (the user's MATLAB `tau_profile.m`: a +-0.02 N*m doublet on x
 at 1-3 s, y at 4-6 s and z at 7-9 s, then (0.02, -0.015, 0.01) N*m at
 10-11 s, then zero). Writes
 `model_comparison/results/NAME.csv` (time, input, motor torque, every state
-of both, attitude difference), `NAME.png` (detailed: every state in its own
-panel, the torques and the attitude difference) and `NAME_simple.png` (in
-the style of a MATLAB figure: quaternion, body rates and wheel speeds, one
-plot each with the components overlaid, next to MuJoCo - model for each).
-MuJoCo is drawn as lines and the model as open circles (~20 per curve): the
-two agree too closely to tell apart as two lines.
+of both, attitude difference) and one plot, `NAME_sdi.png`, in Simulink Data
+Inspector style: the torque profile on top, then the reference's 10 states
+`x_1`..`x_10` (`[q1 q2 q3 q4 wx wy wz Ox Oy Oz]`) on one axes (the model
+(4.15), or the `--matlab` run), MuJoCo's on the same axes below, and the
+error MuJoCo - reference.
 
 The doublets for 20 s from `x0 = [0.29 0.11 -0.30 1 0.1 -0.2 0.15 0 2 0]`
 (`--label doublets`; q normalised to `[0.2663 0.1010 -0.2754 0.9182]`):
