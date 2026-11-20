@@ -11,6 +11,7 @@ import numpy as np
 from jumper_sim.cube_model import (
     EQUILIBRIUM,
     SENSOR_CUBE,
+    WHEEL_MOTOR,
     controllability_matrix,
     cross_matrix,
     dynamics,
@@ -145,6 +146,19 @@ class CubeModelTests(unittest.TestCase):
             a, b = linearize(speeds)
             self.assertEqual(np.linalg.matrix_rank(controllability_matrix(a, b)), 6)
 
+    def test_wheel_motor_limits(self) -> None:
+        # Bench test: full 0.43 N*m up to ~5.1 rev/s, nothing left at 18.3 rev/s.
+        motor = WHEEL_MOTOR
+        self.assertAlmostEqual(motor.knee_speed / (2 * math.pi), 5.13, places=2)
+        rev = 2 * math.pi
+        np.testing.assert_allclose(
+            motor.available_torque([0.6, 0.2, 0.43, 0.43, -0.43, 0.43],
+                                   [0.0, 0.0, 3 * rev, 60.0, 60.0, 19 * rev]),
+            [0.43, 0.2, 0.43, 0.00518 * (18.34 * rev - 60.0), -0.43, 0.0])
+        # Speeding a wheel up the other way round is limited the same.
+        self.assertAlmostEqual(float(motor.available_torque(-0.43, -60.0)),
+                               -0.00518 * (18.34 * rev - 60.0))
+
     def test_cad_values(self) -> None:
         np.testing.assert_allclose(SENSOR_CUBE.body_inertia, (0.07066, 0.07067, 0.07333))
         # The CAD 0.004422 rounded, as in the user's fixed Simulink model.
@@ -226,6 +240,19 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
                     self.assertLess(error[:, :4].max(), 1e-4)
                     self.assertLess(error[:, 4:].max(), 1e-8)
 
+    def test_motor_limits_act_in_mujoco_only(self) -> None:
+        # 0.6 N*m on a resting wheel: MuJoCo's motors deliver 0.43 N*m, then
+        # less as the wheel passes ~5 rev/s; (4.15) stays ideal.
+        x0 = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        limited = compare(x0, step_profile((0.6, 0.0, 0.0), 1.0), 0.8, motor=WHEEL_MOTOR)
+        ideal = compare(x0, step_profile((0.6, 0.0, 0.0), 1.0), 0.8)
+        self.assertAlmostEqual(np.abs(limited["motor"][:, 0]).max(), 0.43, places=6)
+        # tau + J_w w_dot: the body's reaction takes ~0.04 N*m off the 0.6.
+        self.assertGreater(np.abs(ideal["motor"][:, 0]).max(), 0.55)
+        self.assertLess(limited["motor"][-1, 0], 0.43)
+        self.assertLess(limited["sim"][-1, 7], 0.8 * ideal["sim"][-1, 7])
+        np.testing.assert_allclose(ideal["sim"][-1, 7], ideal["model"][-1, 7], rtol=1e-3)
+
     def test_rate_and_solver_labels(self) -> None:
         self.assertEqual(sample_rate_label(np.linspace(0.0, 20.0, 20001)), "1 kHz")
         self.assertEqual(sample_rate_label(np.array([0.0, 0.01, 0.02])), "100 Hz")
@@ -279,6 +306,13 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
                 main()  # no --matlab: against the model (4.15)
             self.assertEqual(sorted(p.name for p in (folder / "model").iterdir()),
                              ["run.csv", "run_sdi.pdf", "run_sdi.png"])
+            # A dot in the label is not a file extension.
+            with mock.patch("model_comparison.compare.RESULTS_DIR", folder / "dot"), \
+                    mock.patch("sys.argv", ["compare", "--label", "a_0.5", "--duration", "0.02"]), \
+                    mock.patch("builtins.print"):
+                main()
+            self.assertEqual(sorted(p.name for p in (folder / "dot").iterdir()),
+                             ["a_0.5.csv", "a_0.5_sdi.pdf", "a_0.5_sdi.png"])
             # --replot redraws from the saved results, without running anything.
             (folder / "model" / "run_sdi.png").unlink()
             with mock.patch("model_comparison.compare.RESULTS_DIR", folder / "model"), \
@@ -288,6 +322,25 @@ class ZeroGravityModelComparisonTests(unittest.TestCase):
                     mock.patch("builtins.print"):
                 main()
             self.assertTrue((folder / "model" / "run_sdi.png").is_file())
+
+    def test_the_comparison_uses_ideal_motors_unless_asked(self) -> None:
+        argv = ["compare", "--label", "run", "--duration", "0.02"]
+        with tempfile.TemporaryDirectory() as folder:
+            motors = []
+            for extra in ([], ["--motor-limits"], ["--motor-limits", "--torque-limit", "0.2"]):
+                with mock.patch("model_comparison.compare.RESULTS_DIR", Path(folder)), \
+                        mock.patch("sys.argv", argv + extra), \
+                        mock.patch("model_comparison.compare.compare",
+                                   wraps=compare) as run, \
+                        mock.patch("builtins.print"):
+                    main()
+                motors.append(run.call_args.args[-1])
+            self.assertIsNone(motors[0])
+            self.assertEqual(motors[1], WHEEL_MOTOR)
+            self.assertEqual(motors[2].torque_limit, 0.2)
+            with mock.patch("sys.argv", argv + ["--torque-limit", "0.2"]), \
+                    mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                main()  # a torque limit needs --motor-limits
 
 
 if __name__ == "__main__":

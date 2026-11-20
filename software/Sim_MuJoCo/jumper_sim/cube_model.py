@@ -22,6 +22,7 @@ written out with the scalar last.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -69,6 +70,51 @@ SENSOR_CUBE = SensorCube(
     wheel_inertia=0.0044,
     mass=3.3,
 )
+
+
+@dataclass(frozen=True)
+class WheelMotor:
+    """A reaction wheel's motor as the ODrive drives it in torque mode.
+
+    No lag: on the bench the current reached its setpoint within one log
+    sample (< ~20 ms; the closed loop's time scale is ~0.3 s). The torque is
+    clipped at ``torque_limit``; while it speeds the wheel up (torque and
+    wheel speed of one sign) it is also capped by a line falling with the
+    wheel speed, ``speed_slope * (zero_torque_speed - |Omega|)`` (back-EMF or
+    the ODrive's velocity limit), so full torque only up to
+    ``knee_speed``. Braking keeps the full limit. Torques are the ODrive's
+    commanded ones (its torque_constant).
+    """
+
+    torque_limit: float  # [N*m]
+    speed_slope: float  # [N*m*s/rad]
+    zero_torque_speed: float  # wheel speed of no torque left [rad/s]
+
+    @property
+    def knee_speed(self) -> float:
+        """Wheel speed up to which the full ``torque_limit`` is available [rad/s]."""
+        return max(0.0, self.zero_torque_speed - self.torque_limit / self.speed_slope)
+
+    def available_torque(self, command, wheel_speed) -> np.ndarray:
+        """The torque the motor delivers for ``command`` at ``wheel_speed`` (per wheel)."""
+        command = np.asarray(command, dtype=float)
+        wheel_speed = np.asarray(wheel_speed, dtype=float)
+        speeding_up = command * wheel_speed > 0.0
+        line = self.speed_slope * np.maximum(self.zero_torque_speed - np.abs(wheel_speed), 0.0)
+        cap = np.where(speeding_up, np.minimum(self.torque_limit, line), self.torque_limit)
+        return np.clip(command, -cap, cap)
+
+
+# Placeholders from a first bench test (2026-11-20, one wheel, robot held,
+# ODrive torque mode, Kt 0.13 N*m/A as configured, 0.43 and 0.043 N*m steps;
+# README "Wheel motors" has all it showed), the same for all three wheels
+# until the robot's test setup measures each. No lag seen (< ~20 ms, the
+# log's resolution). Above ~5.1 rev/s the 0.43 N*m step's current fell
+# linearly with speed, to none at 18.3 rev/s (top speed 16.4 rev/s against
+# the 0.03-0.07 N*m friction, not modelled). The torque limit is the test's
+# command, not a measured limit.
+WHEEL_MOTOR = WheelMotor(torque_limit=0.43, speed_slope=0.00518,
+                         zero_torque_speed=18.34 * 2.0 * math.pi)
 
 
 @dataclass(frozen=True)

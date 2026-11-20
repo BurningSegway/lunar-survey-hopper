@@ -700,12 +700,45 @@ python -m model_comparison --label NAME [--x0 q1 q2 q3 q4 wx wy wz Ox Oy Oz]
     [--profile step|doublets] [--torque tx ty tz] [--torque-time T] [--duration D]
     [--input spin|motor] [--model-wheel-inertia J] [--bearing-friction]
     [--view] [--view-speed S] [--wheel-inertia J] [--matlab CSV [CSV ...]]
-    [--simulink-solver NAME [NAME ...]] [--replot]
+    [--simulink-solver NAME [NAME ...]] [--replot] [--amplitude A]
+    [--motor-limits] [--torque-limit T]
 ```
 
 `--wheel-inertia J` sets J_w,i in both MuJoCo and (4.15); MuJoCo's J_c stays
 the CAD value (the wheels' change goes to the base). `--model-wheel-inertia`
-sets it in (4.15) only, to see a mismatch.
+sets it in (4.15) only, to see a mismatch. `--amplitude A` scales the
+doublets (default 0.02 N*m, `tau_profile.m`'s).
+
+**Wheel motors.** MuJoCo's wheel motors are ideal by default, as in (4.15)
+and Simulink: the comparison is of the models, not of the actuators.
+`--motor-limits` gives them `cube_model.WHEEL_MOTOR`, the same for all three
+wheels, whose values are placeholders from a first bench test until the test
+setup on the robot gives the real ones: the motor torque (what realises
+(4.15)'s tau) is clipped at the torque limit (`--torque-limit`, which needs
+`--motor-limits`), and while it speeds a wheel up it is also capped by the
+line falling with the wheel speed (below); braking keeps the full limit. No
+lag, no friction.
+
+What the bench test showed (2026-11-20, `odrive_gui_log.csv` and
+`odrive_gui_log_2 commands.csv`: one wheel, robot held, ODrive torque mode
+with its torque constant set to 0.13 N*m/A, steps of 0.43 and 0.043 N*m,
+logged every 20-45 ms):
+
+| | Measured | In `WHEEL_MOTOR` |
+|---|---|---|
+| Lag (command to current) | none seen: the current is at its setpoint on the first log sample after the step, so < ~20 ms (the log's resolution), against the closed loop's ~0.3 s | none |
+| Torque limit | 0.43 N*m (3.3 A) commanded and delivered at low speed; not a measured limit, the test's command | 0.43 N*m |
+| Torque vs speed (speeding up) | full up to ~5.1 rev/s, then falling linearly with speed: 0.00518 N*m*s/rad x (115.2 rad/s - \|Omega\|), i.e. 0.43 N*m at 5.13 rev/s, none at 18.34 rev/s (back-EMF or the ODrive's velocity limit) | the same line |
+| Top speed | 16.35-16.5 rev/s at 0.43 N*m, where the falling torque (~0.5 A, 0.065 N*m) only balances the friction; without friction the line's end is 18.34 rev/s | (18.34 rev/s) |
+| Spin-up at 0.43 N*m | 0 -> 16.35 rev/s in 2.29 s, 63.2 % at 0.65 s; this "time constant" is the torque falling with speed, not a lag | follows from the line |
+| Friction | 0.03-0.07 N*m (coasting deceleration 1.3-2.4 rev/s^2, ~0.5 A held at top speed) | not modelled (user's choice) |
+| Wheel inertia | Kt/J = 57.6 rad/s^2/A, i.e. J_w 0.0023 kg*m^2 at the configured Kt | J_w,i 0.0044 kg*m^2 kept (user's choice: the wheels differ) |
+| Braking | not tested | full torque limit |
+
+Still to measure on the robot: the real torque (current) limit, the
+torque-speed line under load, any lag at the robot's ~100 Hz command rate
+(and on CAN), friction per wheel and the actual Kt (the 57.6 rad/s^2/A
+holds only for the ratio).
 
 **Against MATLAB/Simulink runs** (`--matlab CSV ...`): `matlab/export_states.m`
 writes a MAT-file's state timeseries (`x_val`) to CSV
@@ -763,6 +796,14 @@ switches land a few ms off, since a MATLAB Function block has no
 zero-crossing detection.) MuJoCo normalises x0's
 quaternion (its 4-digit values have norm 1.00003), Simulink does not: the
 2e-5 in q at t = 0.
+
+This comparison runs with ideal motors. With `--motor-limits` it comes out
+identical to the last digit: the doublets ask at most 0.019 N*m of the motors and spin the
+wheels to 1.04 rev/s, far below the limit and the 5.13 rev/s where the
+torque starts falling. With `--amplitude 0.3` (wheels up to ~11 rev/s)
+they act: the torque falls short by up to 0.044 N*m near the peaks and the
+attitude ends up to 21.5 deg off the same run with ideal motors; at 0.2 N*m
+(7.6 rev/s) they never act. They are to be tested on the robot.
 
 `--view` opens MuJoCo's viewer on the run as it runs (real time, or `S`
 times that), the camera following the robot, which floats 2 m above the

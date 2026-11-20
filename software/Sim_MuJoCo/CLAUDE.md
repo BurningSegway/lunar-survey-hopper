@@ -10,7 +10,7 @@ read it for options, controls and measured results.
 
 ```sh
 .venv/bin/python -m jumper_sim --controller lqr          # viewer (default controller is pid)
-.venv/bin/python -m unittest discover -s tests           # ~162 tests, ~75 s, all must pass
+.venv/bin/python -m unittest discover -s tests           # ~165 tests, ~90 s, all must pass
 .venv/bin/python -m benchmarks.lqr_benchmark --label NAME      # free flight
 .venv/bin/python -m benchmarks.landing_benchmark --label NAME  # hops thrown onto slopes
 .venv/bin/python -m benchmarks.contact_benchmark --label NAME  # bounces + a hop
@@ -62,7 +62,7 @@ Model tests need the generated `build/terrain_height.bin`
 
 | File | Role |
 |---|---|
-| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot). `report_dynamics` is (4.15) as written (10 states, its tau = J_w Omega_dot, J_c^-1), `motor_torque` converts; `model_comparison/compare.py` checks MuJoCo against it in zero g (bearing friction off, foot settled into its limit first) |
+| `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot). `WheelMotor`/`WHEEL_MOTOR`: the bench-measured wheel motor (torque limit 0.43 N*m placeholder, torque falling with speed above 5.13 rev/s to 0 at 18.34 rev/s while speeding up, no lag), used only by the zero-g comparison's `--motor-limits` (its default is ideal motors, user's choice: the report figures compare the models without actuator dynamics). `report_dynamics` is (4.15) as written (10 states, its tau = J_w Omega_dot, J_c^-1), `motor_torque` converts; `model_comparison/compare.py` checks MuJoCo against it in zero g (bearing friction off, foot settled into its limit first) |
 | `controller.py` | PID and the report's LQR (ch. 5) as the script's LQI: u = tau = -K_bar [q_err_vec, w - w_ref, x_I] (torque straight to the motors, clipped at the motor limit), `augment`, `tracking_feedforward`, CARE by matrix sign function, Bryson's rule + anti-windup via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
 | `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating (attitude control only in flight, wheel momentum bleed in contact, 60 ms flight debounce); jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing plane's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
@@ -284,7 +284,20 @@ above the ground (starting in it, the firm foot ejects the robot).
   robot those speeds come from the ODrives' encoder estimates over CAN
   (filtered, delayed, at the CAN rate), and the torque is not ideal (torque
   constant, back-EMF limiting torque near top speed, Coulomb friction and
-  cogging the sim's viscous damping does not have).
+  cogging the sim's viscous damping does not have). Bench test
+  (2026-11-20, `cube_model.WHEEL_MOTOR`, placeholders until the user's test
+  setup on the robot, the same for all three wheels (user's choice); the
+  findings table is in README "Wheel motors"): no measurable lag (current
+  at its setpoint within one ~20 ms log sample; user: lag is what matters
+  most, so none modelled); torque falls linearly above 5.13 rev/s to 0 at
+  18.34 rev/s while speeding the wheel up (top speed 16.4 rev/s against
+  friction); 0.43 N*m is the test's command, not a measured limit; friction
+  0.03-0.07 N*m (not modelled, user's choice); Kt/J measured 57.6
+  rad/s^2/A, i.e. J_w 0.0023 at the ODrive's Kt 0.13 N*m/A, but the user
+  keeps 0.0044 in the sim (the wheels differ). The 0.3 N*m doublet demo
+  plot was dropped (user: test it on the robot). Only the zero-g
+  comparison's `--motor-limits` uses it (default ideal, user's choice); the full sim still has the made-up 20 rev/s / 1.95 N*m
+  limits (`ReactionWheelTuning`) and the MJCF's +-20 N*m.
 - Wheel mass placeholder (user's request to note it): each wheel's
   `<inertial mass="0.2">` in the MJCF is made up (the inertias are the
   report's J_w,i, the disc geom is only visual); replace it with the real

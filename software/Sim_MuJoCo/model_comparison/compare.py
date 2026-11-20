@@ -16,7 +16,9 @@ step); with ``--input motor`` they get ``tau`` itself, which shows what
 reading (4.15)'s tau as the motor torque would cost.
 
 The wheel bearing friction (MJCF damping) is not in (4.15), so it is turned
-off unless ``--bearing-friction``. The jump foot is held wound and the legs
+off unless ``--bearing-friction``. MuJoCo's wheel motors are ideal (as in
+(4.15) and Simulink) unless ``--motor-limits`` gives them the bench-tested
+motor's limits (``cube_model.WHEEL_MOTOR``). The jump foot is held wound and the legs
 rest on their springs, as in flight.
 
 ``--view`` shows the MuJoCo run in a viewer window as it runs (real time).
@@ -40,6 +42,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 import time
 from typing import NamedTuple
@@ -49,7 +52,9 @@ import numpy as np
 from scipy.integrate import solve_ivp
 
 from jumper_sim.controller import robot_inertia
-from jumper_sim.cube_model import SENSOR_CUBE, SensorCube, motor_torque, report_dynamics
+from jumper_sim.cube_model import (
+    SENSOR_CUBE, WHEEL_MOTOR, SensorCube, WheelMotor, motor_torque, report_dynamics,
+)
 from jumper_sim.simulation import JUMP_WINDUP_FORCE, find_model_ids
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "build" / "Jumping_Robot.xml"
@@ -210,7 +215,10 @@ def doublet_profile(amplitude: float = 0.02) -> TorqueProfile:
 
 def run_mujoco(x0: np.ndarray, profile: TorqueProfile, duration: float,
                cube: SensorCube, spin_input: bool, bearing_friction: bool,
-               view: LiveView | None = None, wheel_inertia: float | None = None) -> dict:
+               view: LiveView | None = None, wheel_inertia: float | None = None,
+               motor: WheelMotor | None = None) -> dict:
+    """MuJoCo from ``x0``. ``motor``: the wheel motors' torque limits (the
+    torque each motor delivers at its wheel's speed); None: ideal motors."""
     model, data = free_floating_model(bearing_friction, wheel_inertia)
     ids = find_model_ids(model)
     set_state(model, data, x0)
@@ -219,20 +227,22 @@ def run_mujoco(x0: np.ndarray, profile: TorqueProfile, duration: float,
     steps = int(round(duration / model.opt.timestep))
     t = np.arange(steps + 1) * model.opt.timestep
     states = np.zeros((steps + 1, 10))
-    motor = np.zeros((steps + 1, 3))
+    applied = np.zeros((steps + 1, 3))
     for k in range(steps + 1):
         state = read_state(model, data)
         tau = profile(t[k])
-        motor[k] = motor_torque(state, tau, cube) if spin_input else tau
+        command = motor_torque(state, tau, cube) if spin_input else tau
+        applied[k] = (command if motor is None
+                      else motor.available_torque(command, state[7:]))
         states[k] = state
         if k == steps:
             break
-        for actuator, value in zip(ids.wheel_actuators, motor[k]):
+        for actuator, value in zip(ids.wheel_actuators, applied[k]):
             data.ctrl[actuator] = value
         mujoco.mj_step(model, data)
         if view is not None:
             view.show(data.time)
-    return {"t": t, "states": states, "motor": motor}
+    return {"t": t, "states": states, "motor": applied}
 
 
 def run_model(x0: np.ndarray, profile: TorqueProfile, t: np.ndarray,
@@ -408,8 +418,9 @@ def plot_sdi(path, t, sim, references: list[Reference], tau: np.ndarray | None =
         if tau is not None:
             torque_ax = grid[0, 0]
             torque_ax.set_ylabel(r"$\tau$ [N$\cdot$m]")
-            torque_ax.set_ylim(-0.03, 0.03)
-            torque_ax.set_yticks((-0.02, 0.0, 0.02))
+            peak = float(np.abs(tau).max()) or 1.0
+            torque_ax.set_ylim(-1.5 * peak, 1.5 * peak)
+            torque_ax.set_yticks((-peak, 0.0, peak))
             # The torque legend on the panel's title line (right of the title),
             # so it takes no room of its own.
             torque_ax.legend(loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=3,
@@ -448,15 +459,18 @@ def write_matlab_csv(path, t_ref, ref, t, sim, model) -> None:
 
 def compare(x0, profile: TorqueProfile, duration, cube=SENSOR_CUBE, spin_input=True,
             bearing_friction=False, view: LiveView | None = None,
-            sim_wheel_inertia: float | None = None) -> dict:
+            sim_wheel_inertia: float | None = None,
+            motor: WheelMotor | None = None) -> dict:
     """Both runs from ``x0``; its quaternion is normalised (MuJoCo needs a unit one).
 
     ``sim_wheel_inertia`` sets MuJoCo's J_w,i (J_c kept); the MJCF's otherwise.
+    ``motor`` limits MuJoCo's wheel motor torques (e.g. ``WHEEL_MOTOR``;
+    None, the default: ideal); (4.15) has no limits.
     """
     x0 = np.asarray(x0, dtype=float).copy()
     x0[:4] /= np.linalg.norm(x0[:4])
     sim = run_mujoco(x0, profile, duration, cube, spin_input, bearing_friction, view,
-                     sim_wheel_inertia)
+                     sim_wheel_inertia, motor)
     t = sim["t"]
     model = run_model(x0, profile, t, cube)
     tau = np.array([profile(tk) for tk in t])
@@ -477,6 +491,8 @@ def main() -> None:
                              "doublets: tau_profile.m, an x, y and z doublet of "
                              "+-0.02 N*m at 1, 4, 7 s, a multi-axis pulse at 10-11 s, "
                              "then zero")
+    parser.add_argument("--amplitude", type=float, default=0.02,
+                        help="the doublets' torque a [N*m] (default 0.02, tau_profile.m's)")
     parser.add_argument("--torque", type=float, nargs=3, default=DEFAULT_TORQUE,
                         metavar=("tx", "ty", "tz"),
                         help=f"(4.15)'s wheel torque [N*m] (default {DEFAULT_TORQUE})")
@@ -500,6 +516,13 @@ def main() -> None:
     parser.add_argument("--simulink-solver", nargs="+", default=None, metavar="NAME",
                         help="the --matlab runs' solvers (e.g. ode4 ode3), in their order, "
                              "for the panel titles (the rate comes from the sample times)")
+    parser.add_argument("--motor-limits", action="store_true",
+                        help="give MuJoCo's wheel motors the bench-tested limits "
+                             "(cube_model.WHEEL_MOTOR: torque limit, falling with wheel speed "
+                             "while speeding the wheel up; default: ideal motors, as (4.15))")
+    parser.add_argument("--torque-limit", type=float, default=None,
+                        help=f"with --motor-limits, their torque limit [N*m] (default "
+                             f"{WHEEL_MOTOR.torque_limit})")
     parser.add_argument("--bearing-friction", action="store_true",
                         help="keep MuJoCo's wheel bearing friction (not in (4.15))")
     parser.add_argument("--replot", action="store_true",
@@ -528,7 +551,11 @@ def main() -> None:
         if not np.allclose(states[0], args.x0):
             print(f"warning: {path} starts from another x0: {states[0]}")
     view = LiveView(args.view_speed) if args.view else None
-    profile = (doublet_profile() if args.profile == "doublets"
+    if args.torque_limit is not None and not args.motor_limits:
+        parser.error("--torque-limit needs --motor-limits")
+    motor = replace(WHEEL_MOTOR, torque_limit=args.torque_limit or WHEEL_MOTOR.torque_limit) \
+        if args.motor_limits else None
+    profile = (doublet_profile(args.amplitude) if args.profile == "doublets"
                else step_profile(args.torque, args.torque_time))
     norm = float(np.linalg.norm(args.x0[:4]))
     if abs(norm - 1.0) > 1e-6:
@@ -537,18 +564,25 @@ def main() -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
     stem = RESULTS_DIR / args.label
     if args.replot:
-        result = load_result(stem.with_suffix(".csv"))
+        result = load_result(stem.with_name(f"{args.label}.csv"))
     else:
         result = compare(args.x0, profile, args.duration, cube,
-                         args.input == "spin", args.bearing_friction, view, sim_wheel)
+                         args.input == "spin", args.bearing_friction, view, sim_wheel, motor)
         keys = ("t", "tau", "motor", "sim", "model", "attitude_diff")
-        write_csv(stem.with_suffix(".csv"), *(result[k] for k in keys))
+        write_csv(stem.with_name(f"{args.label}.csv"), *(result[k] for k in keys))
     sim_shown = sim_wheel or SENSOR_CUBE.wheel_inertia
     wheels = (f"J_w,i {model_wheel:g}" if sim_shown == model_wheel
               else f"J_w,i MuJoCo {sim_shown:g}, model {model_wheel:g}")
-    caption = (f"zero g, {args.profile} torque, input {args.input}, {wheels}"
-             f"{', bearing friction' if args.bearing_friction else ''}: x0 = "
-             + " ".join(f"{v:g}" for v in args.x0))
+    motors = ("ideal wheel motors" if motor is None else
+              f"wheel motors limited to {motor.torque_limit:g} N*m, falling above "
+              f"{motor.knee_speed / (2 * math.pi):.2f} rev/s to 0 at "
+              f"{motor.zero_torque_speed / (2 * math.pi):.2f} rev/s")
+    profile_name = (f"doublets of {args.amplitude:g} N*m" if args.profile == "doublets"
+                    else f"step of {' '.join(f'{v:g}' for v in args.torque)} N*m for "
+                         f"{args.torque_time:g} s")
+    caption = (f"zero g, {profile_name}, input {args.input}, {wheels}, {motors}"
+               f"{', bearing friction' if args.bearing_friction else ''}: x0 = "
+               + " ".join(f"{v:g}" for v in args.x0))
     model, data = free_floating_model(wheel_inertia=sim_wheel)
     sdi = stem.with_name(f"{args.label}_sdi.png")
     references, matlab_csvs = [], []
@@ -560,9 +594,7 @@ def main() -> None:
         write_matlab_csv(matlab_csvs[-1], t_ref, ref, result["t"], result["sim"],
                          result["model"])
     if not references:
-        references.append(Reference(result["t"], result["model"], "Model (4.15)",
-                                    f"RK45 (rtol 1e-10), sampled at "
-                                    f"{sample_rate_label(result['t'])}"))
+        references.append(Reference(result["t"], result["model"], "Eq. (4.15)", "RK45"))
     plot_sdi(sdi, result["t"], result["sim"], references, tau=result["tau"],
              sim_info=mujoco_solver_label(model))
 
@@ -580,7 +612,7 @@ def main() -> None:
     for name in ("sim", "model"):
         h = momentum_world(result[name], cube)
         print(f"|H| {name}: start {h[0]:.6g}, end {h[-1]:.6g} N*m*s")
-    print(stem.with_suffix(".csv"))
+    print(stem.with_name(f"{args.label}.csv"))
     for path, (t_ref, ref) in zip(args.matlab or (), matlab):
         at = lambda x: np.column_stack([np.interp(t_ref, result["t"], x[:, i]) for i in range(10)])
         for name, states in (("MuJoCo", result["sim"]), ("(4.15)", result["model"])):
