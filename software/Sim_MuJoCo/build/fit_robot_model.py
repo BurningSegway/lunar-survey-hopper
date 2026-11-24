@@ -6,7 +6,8 @@ is JUMP_SPRING_COUNT JUMP_SPRINGs in parallel; the robot weighs ROBOT_MASS
 (the cube and the springs). This script writes them into the MJCF, so the
 simulated plant is the report's model:
 
-- each wheel: J_w,i about its spin axis, J_w,i/2 across it (a thin disc);
+- each wheel: its mass (SENSOR_CUBE.wheel_mass, a placeholder), J_w,i about
+  its spin axis, J_w,i/2 across it (a thin disc);
 - jump_joint: the springs' combined stiffness; wound to full compression
   with the foot at the bottom of the cube, released to the springs' free
   length (the joint's range is the stroke), then wound back; a third of the
@@ -73,8 +74,9 @@ def _set_wheels(xml: str) -> str:
         diagonal[axis] = SENSOR_CUBE.wheel_inertia
         xml = _replace(
             xml,
-            rf'(<body name="{name}"[^>]*>\s*<inertial [^>]*diaginertia=")[^"]*',
-            " ".join(f"{v:.7g}" for v in diagonal),
+            rf'(<body name="{name}"[^>]*>\s*)<inertial [^>]*/>',
+            f'<inertial pos="0 0 0" mass="{SENSOR_CUBE.wheel_mass:.7g}" diaginertia="'
+            + " ".join(f"{v:.7g}" for v in diagonal) + '"/>',
             f"inertial for wheel {name!r}",
         )
     return xml

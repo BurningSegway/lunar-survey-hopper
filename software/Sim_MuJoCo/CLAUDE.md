@@ -298,11 +298,12 @@ above the ground (starting in it, the firm foot ejects the robot).
   plot was dropped (user: test it on the robot). Only the zero-g
   comparison's `--motor-limits` uses it (default ideal, user's choice); the full sim still has the made-up 20 rev/s / 1.95 N*m
   limits (`ReactionWheelTuning`) and the MJCF's +-20 N*m.
-- Wheel mass placeholder (user's request to note it): each wheel's
-  `<inertial mass="0.2">` in the MJCF is made up (the inertias are the
-  report's J_w,i, the disc geom is only visual); replace it with the real
-  wheel mass or remove it so it is not mistaken for a design value. The fit
-  script takes the rest from the base, so total mass and J_c are unaffected.
+- Wheel mass placeholder: `SENSOR_CUBE.wheel_mass` (0.2 kg, made up) in
+  `cube_model.py`, written to the MJCF by the fit script (user's choice,
+  2026-11-24: a named placeholder until the real mass is known; MuJoCo
+  rejects 0 for a moving body). It moves the CoM ~6 mm along +x, +y, +z
+  (wheels 0.125 m off-centre), so the real value changes the take-off push;
+  total mass and J_c are unaffected.
 - Lidar cut-off range: change `LIVOX_MID360.max_range` from 40 m to 100 m
   (user's request, not done yet). 40 m is the datasheet's typical range at
   10 % reflectivity (about regolith's); 100 m is where the sensor cuts off.

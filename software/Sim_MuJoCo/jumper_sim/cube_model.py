@@ -38,11 +38,14 @@ class SensorCube:
     of mass in the body frame, with the wheels locked to it (the gyrostat's
     H = J_c*w + J_w*Omega counts the wheels' spin on top of that).
     ``wheel_inertia`` is J_w,i, each wheel about its spin axis.
+    ``mass`` is the whole cube's, the wheels included; ``wheel_mass`` is the
+    share of it at each wheel's centre (it places the centre of mass).
     """
 
     body_inertia: tuple[float, float, float]  # J_c,x, J_c,y, J_c,z [kg*m^2]
     wheel_inertia: float  # J_w,i [kg*m^2]
     mass: float  # [kg]
+    wheel_mass: float  # each wheel [kg]
 
     @property
     def j_c(self) -> np.ndarray:
@@ -62,13 +65,17 @@ class SensorCube:
 # The final cube design, from CAD (inertias given in g*mm^2 -> 1e-9 kg*m^2).
 # J_w,i is the CAD 4.422e6 g*mm^2 rounded to 0.0044 kg*m^2, the value the
 # user's fixed Simulink model uses (user's choice).
-# The mass is a placeholder until the design's is known.
+# The masses are placeholders until the design's are known: the cube's 3.3 kg
+# and each wheel's 0.2 kg (made up, not a design value). The wheels sit
+# 0.125 m off-centre, so their mass moves the centre of mass (~6 mm along +x,
+# +y, +z with 0.2 kg); the total mass and J_c do not depend on it.
 # build/Jumping_Robot.xml is fitted to these values by build/fit_robot_model.py;
 # rerun it after changing them.
 SENSOR_CUBE = SensorCube(
     body_inertia=(70660000e-9, 70670000e-9, 73330000e-9),
     wheel_inertia=0.0044,
     mass=3.3,
+    wheel_mass=0.2,
 )
 
 

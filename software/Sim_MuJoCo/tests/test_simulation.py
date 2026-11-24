@@ -81,6 +81,9 @@ class SimulationTests(unittest.TestCase):
         np.testing.assert_allclose(inertia.rigid_body, SENSOR_CUBE.j_c, atol=1e-7)
         np.testing.assert_allclose(inertia.wheel_spin, (SENSOR_CUBE.wheel_inertia,) * 3)
         self.assertAlmostEqual(inertia.mass, ROBOT_MASS)
+        for wheel in ids.wheel_joints:
+            self.assertAlmostEqual(self.model.body_mass[self.model.jnt_bodyid[wheel]],
+                                   SENSOR_CUBE.wheel_mass)
         joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "jump_joint")
         self.assertAlmostEqual(
             float(self.model.jnt_stiffness[joint]), JUMP_SPRING_COUNT * JUMP_SPRING.stiffness
