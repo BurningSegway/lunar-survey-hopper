@@ -298,7 +298,7 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 | Phase | Starts when | What happens |
 |---|---|---|
 | GROUND | still (~1 g, body rate < 0.2 rad/s) for 0.5 s after landing | leaning towards the target (next section); wheels spin down |
-| TAKEOFF | jump command (`Space`) | legs held as they are; after lift-off the lift-off attitude is held |
+| TAKEOFF | jump command (`Space`) | legs held as they are; once control starts (still in TAKEOFF), the attitude at the jump command is held: the last one before the push turned the body, with the lean towards the target |
 | ASCENT | airborne and 0.5 m above the standing height | the robot's bottom tracks the target, heading held; lidar scans |
 | DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on for half the ascent's time; then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
 | LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or ground contact | the landing plane keeps updating until impact; legs straight |

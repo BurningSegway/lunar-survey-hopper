@@ -150,7 +150,12 @@ class FlightReference:
 
     def start_flight(self, attitude: Quaternion, position: np.ndarray, heading: float,
                      track: bool) -> None:
-        """Called at lift-off; ``track`` is True for flights started by a jump."""
+        """Called at lift-off; ``track`` is True for flights started by a jump.
+
+        ``attitude`` is held in TAKEOFF and is where the reference starts
+        from: on a jump the attitude at the jump command (before the push
+        turned the body), on a bounce the attitude at lift-off.
+        """
         self.commanded = tuple(float(v) for v in attitude)
         self.tracking = track
         self.ascent_time = 0.0
@@ -169,7 +174,7 @@ class FlightReference:
         elif phase is FlightPhase.DESCENT:
             self.descent_time += dt
         if phase is FlightPhase.TAKEOFF:
-            return self.commanded  # hold the lift-off attitude until clear of the ground
+            return self.commanded  # hold the start_flight attitude until clear of the ground
         yaw = yaw_reference
         if self.tracking_target(phase):
             desired = look_at_quaternion(sensor_position, self.active_target, yaw,

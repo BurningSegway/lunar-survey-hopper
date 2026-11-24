@@ -150,6 +150,36 @@ class SimulationTests(unittest.TestCase):
         self.assertGreater(speed, 0.5 * ideal)
         self.assertLess(speed, 0.75 * ideal)
 
+    def test_takeoff_holds_the_attitude_from_before_the_jump(self) -> None:
+        # Leaning towards the target, then jumping: the push turns the body,
+        # but the flight starts from (and TAKEOFF holds) the attitude at the
+        # jump command.
+        simulation = JumperSimulation(self.model, self.data, "lqr", track_target=(10.0, 5.0),
+                                      lidar=replace(LIVOX_MID360, point_fraction=0.01))
+        while self.data.time < 4.0:
+            simulation.step()
+        qa = self.model.jnt_qposadr[simulation.ids.root_joint]
+        before = self.data.qpos[qa + 3 : qa + 7].copy()
+        started = []
+        start_flight = simulation.flight_reference.start_flight
+
+        def record(attitude, *args):
+            started.append((np.array(attitude), self.data.qpos[qa + 3 : qa + 7].copy()))
+            start_flight(attitude, *args)
+
+        simulation.flight_reference.start_flight = record
+        simulation.handle_key("space")
+        while not started and self.data.time < 5.0:
+            simulation.step()
+        held, at_start = started[0]
+        np.testing.assert_allclose(held, before)
+        angle = lambda a, b: math.degrees(2.0 * math.acos(min(1.0, abs(float(a @ b)))))
+        self.assertGreater(angle(at_start, before), 1.0)  # the push turned the body
+        reference = simulation.flight_reference.update(
+            FlightPhase.TAKEOFF, np.zeros(3), 0.0, lambda yaw: (1.0, 0.0, 0.0, 0.0), 0.001
+        )
+        np.testing.assert_allclose(np.array(reference), before, atol=0.01)
+
     def test_friction_tuning_matches_model_wheel_damping(self) -> None:
         for joint_id in self.simulation.ids.wheel_joints:
             self.assertAlmostEqual(

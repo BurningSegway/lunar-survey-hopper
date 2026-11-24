@@ -306,6 +306,7 @@ class JumperSimulation:
                 FlightReferenceConfig(), track_target, self._ground_height,
             )
         self._jump_command = False  # given since the last phase update
+        self._jump_attitude: tuple[float, float, float, float] | None = None  # at the jump command
         self._near_at_descent = 0  # near-touchdown fits before this descent
         self.flight_events: list[str] = []
         # LQR + hop reference: on the ground, lean the body axis towards the
@@ -415,6 +416,7 @@ class JumperSimulation:
         self.estimated_airborne = self.ground_contact.airborne
         self.trajectory.reset()
         self._jump_command = False
+        self._jump_attitude = None
         self._near_at_descent = 0
         self._close_scan()  # keep what the run collected; the file stays as saved
         self._lidar_next = 0.0  # time starts again from 0
@@ -439,6 +441,10 @@ class JumperSimulation:
             self.landing_reference.reset(float(self.data.time))
         body = self.model.jnt_bodyid[self.ids.root_joint]
         self.trajectory.begin(self.data.xpos[body])  # from rest at the launch point
+        # The last attitude before the push (incl. the jump aim's lean): TAKEOFF
+        # holds it once control starts, before the push has turned the body.
+        qa = self.model.jnt_qposadr[self.ids.root_joint]
+        self._jump_attitude = tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7])
         self._jump_command = True  # GROUND -> TAKEOFF
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
@@ -645,7 +651,8 @@ class JumperSimulation:
                 # A jump, not a bounce.
                 track = self.phase is FlightPhase.TAKEOFF
                 self.flight_reference.start_flight(
-                    tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
+                    self._jump_attitude if track and self._jump_attitude is not None
+                    else tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
                     self.data.qpos[qa : qa + 3].copy(),
                     self.yaw_reference,
                     track,
