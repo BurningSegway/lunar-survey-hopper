@@ -36,8 +36,15 @@ DEFAULT_UDP_PORT = 47269   # telemetry_server.py --udp-port
 
 class DashboardSender:
     def __init__(self, host: str, port: int = DEFAULT_UDP_PORT):
-        self.addr = (socket.gethostbyname(host), port)   # resolve once, not per frame
+        print(f"Dashboard: resolving {host}", flush=True)
+        try:
+            ip = socket.gethostbyname(host)   # resolve once, not per frame
+        except OSError as e:
+            sys.exit(f"Dashboard: cannot resolve '{host}' ({e}). Use the Pi's IP address instead, "
+                     f"e.g. --dashboard 192.168.1.42 (on the Pi: hostname -I)")
+        self.addr = (ip, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        print(f"Dashboard: sending to {ip}:{port} (UDP)", flush=True)
 
     def send(self, **values: float):
         lines = [f">{name}:{float(v):.6f}" for name, v in values.items()
@@ -47,31 +54,38 @@ class DashboardSender:
 
     def log(self, text: str):
         """Console line in the dashboard ("[udp <this ip>] text")."""
-        print(text)
-        self.sock.sendto(text.encode(), self.addr)
+        print(text, flush=True)
+        try:
+            self.sock.sendto(text.encode(), self.addr)
+        except OSError as e:
+            print(f"Dashboard: send failed ({e})", flush=True)
 
 
 # --------------------------------------------------------------------------- #
 # Vicon DataStream SDK
 # --------------------------------------------------------------------------- #
 def run_vicon(dash: DashboardSender, server: str, subject: str | None, segment: str | None, max_rate: float):
+    print("Vicon: loading the DataStream SDK (vicon_dssdk)", flush=True)
     try:
         from vicon_dssdk import ViconDataStream
-    except ImportError:
-        sys.exit("vicon_dssdk not found: install the Vicon DataStream SDK Python package "
-                 "(pip install <DataStream SDK>/Python), or use --fake to test without Vicon")
+    except ImportError as e:
+        sys.exit(f"vicon_dssdk could not be imported ({e}): install the Vicon DataStream SDK Python "
+                 "package (pip install <DataStream SDK>/Python), or use --fake to test without Vicon")
 
     min_dt = 1.0 / max_rate if max_rate > 0 else 0.0
     while True:  # (re)connect loop
         client = ViconDataStream.Client()
         dash.log(f"Vicon: connecting to {server}")
+        attempts = 0
         while True:
             try:
                 client.Connect(server)
                 if client.IsConnected():
                     break
-            except ViconDataStream.DataStreamException:
-                pass
+            except ViconDataStream.DataStreamException as e:
+                attempts += 1
+                if attempts % 5 == 1:
+                    print(f"Vicon: cannot connect to {server} ({e}), retrying...", flush=True)
             time.sleep(1.0)
         client.EnableSegmentData()
         try:  # lowest latency: the server pushes every frame
@@ -128,6 +142,7 @@ def run_vicon(dash: DashboardSender, server: str, subject: str | None, segment: 
                               ViconOccluded=0, ViconLatencyMs=latency_ms)
         except ViconDataStream.DataStreamException as e:
             dash.log(f"Vicon: connection lost ({e}), reconnecting")
+        print("Vicon: disconnected, reconnecting", flush=True)
         try:
             client.Disconnect()
         except Exception:
@@ -165,6 +180,7 @@ def main():
     ap.add_argument("--fake", action="store_true", help="send a fake hop instead of reading Vicon")
     args = ap.parse_args()
 
+    print(f"vicon_to_dashboard: Python {sys.version.split()[0]} ({sys.executable})", flush=True)
     dash = DashboardSender(args.dashboard, args.udp_port)
     try:
         if args.fake:
@@ -175,5 +191,35 @@ def main():
         dash.log("Vicon: stream stopped")
 
 
+def _own_console_window() -> bool:
+    """True when this process got its own console window (e.g. double-clicked on
+    Windows), which closes as soon as the script exits and hides any error."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 2)(), 2) <= 1
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    main()
+    import faulthandler
+    faulthandler.enable()   # print where it died if the Vicon SDK's DLL crashes the process
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            if isinstance(e.code, str):
+                print(e.code, file=sys.stderr)
+            else:
+                print(f"exited with code {e.code}", file=sys.stderr)
+        if _own_console_window():
+            input("\nPress Enter to close...")
+        raise SystemExit(0 if e.code in (None, 0) else 1)
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        if _own_console_window():
+            input("\nPress Enter to close...")
+        raise SystemExit(1)
