@@ -46,11 +46,30 @@ class DashboardSender:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         print(f"Dashboard: sending to {ip}:{port} (UDP)", flush=True)
 
+        self.sent, self.errors, self.last_report = 0, 0, time.time()
+
     def send(self, **values: float):
         lines = [f">{name}:{float(v):.6f}" for name, v in values.items()
                  if v is not None and math.isfinite(float(v))]
         if lines:
-            self.sock.sendto("\n".join(lines).encode(), self.addr)
+            try:
+                self.sock.sendto("\n".join(lines).encode(), self.addr)
+                self.sent += 1
+            except OSError as e:
+                if self.errors == 0:
+                    print(f"Dashboard: send to {self.addr[0]}:{self.addr[1]} failed ({e})", flush=True)
+                self.errors += 1
+        self.report()
+
+    def report(self, every_s: float = 5.0):
+        """Terminal status every few seconds, so a silent stream is visible."""
+        now = time.time()
+        if now - self.last_report >= every_s:
+            dt = now - self.last_report
+            print(f"Dashboard: {self.sent} frames sent to {self.addr[0]}:{self.addr[1]} "
+                  f"in the last {dt:.0f} s ({self.sent / dt:.0f} Hz)"
+                  + (f", {self.errors} send errors" if self.errors else ""), flush=True)
+            self.sent, self.errors, self.last_report = 0, 0, now
 
     def log(self, text: str):
         """Console line in the dashboard ("[udp <this ip>] text")."""
@@ -94,7 +113,7 @@ def run_vicon(dash: DashboardSender, server: str, subject: str | None, segment: 
             pass
         dash.log(f"Vicon: connected to {server}")
 
-        subj, seg, last_sent, was_occluded = None, None, 0.0, None
+        subj, seg, last_sent, was_occluded, no_subject_msg = None, None, 0.0, None, 0.0
         try:
             while client.IsConnected():
                 try:
@@ -107,6 +126,9 @@ def run_vicon(dash: DashboardSender, server: str, subject: str | None, segment: 
                 if subj is None:  # pick the subject / segment once they appear
                     names = client.GetSubjectNames()
                     if not names:
+                        if time.time() - no_subject_msg > 5.0:
+                            dash.log("Vicon: no subjects in the stream yet (is the object enabled/tracked in Tracker?)")
+                            no_subject_msg = time.time()
                         continue
                     if subject and subject not in names:
                         dash.log(f"Vicon: subject '{subject}' not found, available: {', '.join(names)}")
