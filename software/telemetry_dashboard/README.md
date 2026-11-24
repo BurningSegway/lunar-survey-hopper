@@ -45,6 +45,7 @@ dashboard first.
 | `--record-dir DIR` | `./recordings` | where CSV recordings are written |
 | `--udp-port 47269` | 47269 | UDP input for other machines, e.g. Vicon (`0` = off), see below |
 | `--udp-host 0.0.0.0` | all interfaces | UDP bind address |
+| `--udp-hello HOST[:PORT]` | off | send a hello every second to the Vicon PC (port 47270), so it can reply through a NAT router; use with `vicon_to_dashboard.py --listen` |
 | `--demo` | off | fake LQR-like data plus a repeating hop (burn + ballistic channels) and fake Vicon data, for trying the UI without hardware |
 | `--demo-no-vicon` | off | with `--demo`: leave out the fake Vicon data |
 

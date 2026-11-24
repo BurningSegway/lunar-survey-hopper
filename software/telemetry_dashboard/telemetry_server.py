@@ -764,6 +764,9 @@ def make_handler(hub: Hub, control: ChannelControl):
 # --------------------------------------------------------------------------- #
 # Network input (e.g. Vicon ground truth from another machine)
 # --------------------------------------------------------------------------- #
+DEFAULT_HELLO_PORT = 47270   # vicon_to_dashboard.py --listen
+
+
 class UdpInput:
     """Receives Teleplot lines over UDP, e.g. from the Vicon script on another machine.
 
@@ -777,8 +780,10 @@ class UdpInput:
     """
 
     SILENT_S = 2.0
+    HELLO_S = 1.0
+    HELLO_MSG = b"#hello telemetry_dashboard"
 
-    def __init__(self, hub: Hub, host: str, port: int):
+    def __init__(self, hub: Hub, host: str, port: int, hello: str | None = None):
         import socket
         self.hub = hub
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -787,10 +792,41 @@ class UdpInput:
         self.port = port
         self.sender: str | None = None
         self.last_rx = 0.0
+        # "Hello" target (host, port): for a sender that cannot reach this machine
+        # (e.g. the Pi is behind a NAT router), this side sends a small datagram
+        # every second from the listening socket. The sender replies to where the
+        # hello came from, which the NAT lets back in, and the hellos keep that open.
+        self.hello: tuple[str, int] | None = None
+        self.hello_ip: str | None = None
+        self.last_hello = 0.0
+        self.hello_err = False
+        if hello:
+            h, _, p = hello.rpartition(":") if ":" in hello else (hello, "", "")
+            self.hello = (h, int(p) if p else DEFAULT_HELLO_PORT)
+
+    def send_hello(self):
+        import socket
+        now = time.time()
+        if not self.hello or now - self.last_hello < self.HELLO_S:
+            return
+        self.last_hello = now
+        try:
+            if self.hello_ip is None:   # resolve until it works, then keep it
+                self.hello_ip = socket.gethostbyname(self.hello[0])
+                self.hub.add_line(f"[bridge] udp hello to {self.hello_ip}:{self.hello[1]} every {self.HELLO_S:g} s")
+            self.sock.sendto(self.HELLO_MSG, (self.hello_ip, self.hello[1]))
+            if self.hello_err:
+                self.hub.add_line("[bridge] udp hello: sending again")
+                self.hello_err = False
+        except OSError as e:
+            if not self.hello_err:
+                self.hub.add_line(f"[bridge] udp hello to {self.hello[0]}:{self.hello[1]} failed: {e}")
+                self.hello_err = True
 
     def run(self):
         self.hub.set_status(udp=f"listening :{self.port}")
         while True:
+            self.send_hello()
             try:
                 data, (ip, _) = self.sock.recvfrom(65535)
             except OSError:  # timeout (or a transient error): check for silence
@@ -833,6 +869,10 @@ def main():
     ap.add_argument("--udp-port", type=int, default=47269,
                     help="UDP port for Teleplot lines from other machines, e.g. Vicon (0 = off)")
     ap.add_argument("--udp-host", default="0.0.0.0", help="UDP bind address (default: all interfaces)")
+    ap.add_argument("--udp-hello", metavar="HOST[:PORT]",
+                    help="send a hello every second to this sender (e.g. the Vicon PC) so it can reply through a "
+                         f"NAT router that blocks incoming traffic (sender: vicon_to_dashboard.py --listen; "
+                         f"default port {DEFAULT_HELLO_PORT})")
     args = ap.parse_args()
 
     if serial is None and not args.demo:
@@ -846,7 +886,7 @@ def main():
     threading.Thread(target=source.run, daemon=True).start()
     if args.udp_port:
         try:
-            udp = UdpInput(hub, args.udp_host, args.udp_port)
+            udp = UdpInput(hub, args.udp_host, args.udp_port, args.udp_hello)
         except OSError as e:
             sys.exit(f"cannot listen on UDP {args.udp_host}:{args.udp_port}: {e}  (use --udp-port N or 0 to disable)")
         threading.Thread(target=udp.run, daemon=True).start()

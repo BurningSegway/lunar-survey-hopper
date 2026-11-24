@@ -21,6 +21,12 @@ Requirements: Python 3.8+ and the Vicon DataStream SDK Python package
 
     python vicon_to_dashboard.py --dashboard raspberrypi.local --subject hopper
     python vicon_to_dashboard.py --dashboard raspberrypi.local --fake      # no Vicon needed
+
+If the Pi is behind a NAT router (it can reach this PC, but not the other way round),
+let the Pi start the conversation instead:
+
+    on the Pi:        python3 telemetry_server.py --udp-hello <this PC's IP>
+    on the Vicon PC:  python vicon_to_dashboard.py --listen --subject hopper
 """
 
 from __future__ import annotations
@@ -31,53 +37,116 @@ import socket
 import sys
 import time
 
-DEFAULT_UDP_PORT = 47269   # telemetry_server.py --udp-port
+DEFAULT_UDP_PORT = 47269      # telemetry_server.py --udp-port
+DEFAULT_LISTEN_PORT = 47270   # telemetry_server.py --udp-hello <this PC>[:port]
 
 
 class DashboardSender:
-    def __init__(self, host: str, port: int = DEFAULT_UDP_PORT):
-        print(f"Dashboard: resolving {host}", flush=True)
-        try:
-            ip = socket.gethostbyname(host)   # resolve once, not per frame
-        except OSError as e:
-            sys.exit(f"Dashboard: cannot resolve '{host}' ({e}). Use the Pi's IP address instead, "
-                     f"e.g. --dashboard 192.168.1.42 (on the Pi: hostname -I)")
-        self.addr = (ip, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        print(f"Dashboard: sending to {ip}:{port} (UDP)", flush=True)
+    """Sends Teleplot lines to telemetry_server.py over UDP.
 
+    Two ways to find the dashboard:
+      * host given (--dashboard): send straight to host:port.
+      * listen_port given (--listen): wait for the dashboard's "hello" datagrams
+        (telemetry_server.py --udp-hello <this PC>) and send to wherever they come
+        from. Use this when the Pi is behind a NAT router: the Pi can reach this PC,
+        but not the other way round. Replies to the hello's source address get back
+        through the router, and the hellos (every second) keep that path open.
+    """
+
+    def __init__(self, host: str | None, port: int = DEFAULT_UDP_PORT, listen_port: int | None = None):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addr: tuple[str, int] | None = None
+        self.listening = listen_port is not None
+        if self.listening:
+            if sys.platform == "win32":   # don't let an ICMP "port unreachable" break recvfrom on Windows
+                try:
+                    self.sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+                except (AttributeError, OSError):
+                    pass
+            try:
+                self.sock.bind(("0.0.0.0", listen_port))
+            except OSError as e:
+                sys.exit(f"Dashboard: cannot listen on UDP port {listen_port} ({e})")
+            self.sock.setblocking(False)
+            print(f"Dashboard: waiting for the dashboard's hello on UDP port {listen_port} "
+                  f"(start telemetry_server.py with --udp-hello <this PC's IP>). "
+                  f"Allow UDP {listen_port} in Windows Firewall if nothing arrives.", flush=True)
+        else:
+            print(f"Dashboard: resolving {host}", flush=True)
+            try:
+                ip = socket.gethostbyname(host)   # resolve once, not per frame
+            except OSError as e:
+                sys.exit(f"Dashboard: cannot resolve '{host}' ({e}). Use the Pi's IP address instead, "
+                         f"e.g. --dashboard 192.168.1.42 (on the Pi: hostname -I)")
+            self.addr = (ip, port)
+            print(f"Dashboard: sending to {ip}:{port} (UDP)", flush=True)
         self.sent, self.errors, self.last_report = 0, 0, time.time()
+        self.last_hello = 0.0
+
+    def poll(self):
+        """Listen mode: read pending hellos and (re)target their sender."""
+        if not self.listening:
+            return
+        while True:
+            try:
+                data, src = self.sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            if not data.startswith(b"#hello"):
+                continue
+            self.last_hello = time.time()
+            if src != self.addr:
+                first = self.addr is None
+                self.addr = src
+                print(f"Dashboard: hello from {src[0]}:{src[1]}, "
+                      f"{'sending' if first else 'now sending'} there", flush=True)
+
+    def _sendto(self, payload: bytes) -> bool:
+        self.poll()
+        if self.addr is None:
+            return False
+        try:
+            self.sock.sendto(payload, self.addr)
+            return True
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError as e:
+            if self.errors == 0:
+                print(f"Dashboard: send to {self.addr[0]}:{self.addr[1]} failed ({e})", flush=True)
+            self.errors += 1
+            return False
 
     def send(self, **values: float):
         lines = [f">{name}:{float(v):.6f}" for name, v in values.items()
                  if v is not None and math.isfinite(float(v))]
-        if lines:
-            try:
-                self.sock.sendto("\n".join(lines).encode(), self.addr)
-                self.sent += 1
-            except OSError as e:
-                if self.errors == 0:
-                    print(f"Dashboard: send to {self.addr[0]}:{self.addr[1]} failed ({e})", flush=True)
-                self.errors += 1
+        if lines and self._sendto("\n".join(lines).encode()):
+            self.sent += 1
         self.report()
 
     def report(self, every_s: float = 5.0):
         """Terminal status every few seconds, so a silent stream is visible."""
         now = time.time()
-        if now - self.last_report >= every_s:
-            dt = now - self.last_report
-            print(f"Dashboard: {self.sent} frames sent to {self.addr[0]}:{self.addr[1]} "
-                  f"in the last {dt:.0f} s ({self.sent / dt:.0f} Hz)"
-                  + (f", {self.errors} send errors" if self.errors else ""), flush=True)
-            self.sent, self.errors, self.last_report = 0, 0, now
+        if now - self.last_report < every_s:
+            return
+        dt = now - self.last_report
+        if self.addr is None:
+            msg = "Dashboard: no hello received yet, not sending (is telemetry_server.py running with --udp-hello?)"
+        else:
+            msg = (f"Dashboard: {self.sent} frames sent to {self.addr[0]}:{self.addr[1]} "
+                   f"in the last {dt:.0f} s ({self.sent / dt:.0f} Hz)")
+            if self.errors:
+                msg += f", {self.errors} send errors"
+            if self.listening and now - self.last_hello > 5.0:
+                msg += f", no hello for {now - self.last_hello:.0f} s (dashboard stopped?)"
+        print(msg, flush=True)
+        self.sent, self.errors, self.last_report = 0, 0, now
 
     def log(self, text: str):
         """Console line in the dashboard ("[udp <this ip>] text")."""
         print(text, flush=True)
-        try:
-            self.sock.sendto(text.encode(), self.addr)
-        except OSError as e:
-            print(f"Dashboard: send failed ({e})", flush=True)
+        self._sendto(text.encode())
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +261,11 @@ def run_fake(dash: DashboardSender, rate_hz: float):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dashboard", required=True, help="host running telemetry_server.py, e.g. raspberrypi.local")
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--dashboard", help="host running telemetry_server.py, e.g. raspberrypi.local")
+    where.add_argument("--listen", type=int, nargs="?", const=DEFAULT_LISTEN_PORT, metavar="PORT",
+                       help="Pi behind a NAT router: wait for telemetry_server.py --udp-hello <this PC> on this "
+                            f"UDP port (default {DEFAULT_LISTEN_PORT}) and send to wherever the hellos come from")
     ap.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help="telemetry_server.py --udp-port")
     ap.add_argument("--vicon", default="localhost:801", help="Vicon DataStream server host:port")
     ap.add_argument("--subject", help="Vicon subject (object) name; default: the first one streamed")
@@ -203,7 +276,7 @@ def main():
     args = ap.parse_args()
 
     print(f"vicon_to_dashboard: Python {sys.version.split()[0]} ({sys.executable})", flush=True)
-    dash = DashboardSender(args.dashboard, args.udp_port)
+    dash = DashboardSender(args.dashboard, args.udp_port, args.listen)
     try:
         if args.fake:
             run_fake(dash, args.max_rate or 100.0)

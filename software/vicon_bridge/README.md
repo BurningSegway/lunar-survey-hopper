@@ -26,7 +26,8 @@ python vicon_to_dashboard.py --dashboard raspberrypi.local --subject hopper
 
 | option | default | |
 |---|---|---|
-| `--dashboard HOST` | (required) | the Pi running `telemetry_server.py` |
+| `--dashboard HOST` | (this or `--listen`) | the Pi running `telemetry_server.py` |
+| `--listen [PORT]` | 47270 | Pi behind a NAT router: wait for the Pi's hello and reply to it (see below) |
 | `--udp-port N` | 47269 | must match `telemetry_server.py --udp-port` |
 | `--vicon HOST:PORT` | `localhost:801` | Vicon DataStream server |
 | `--subject NAME` | first subject | Vicon object to stream |
@@ -40,6 +41,24 @@ To just check the Vicon stream without the dashboard, `vicon_print.py` prints th
 
 The script reconnects automatically if the Vicon server restarts. Status messages (connected, subject picked,
 occluded / tracked again) appear in the dashboard console as `[udp <ip>] Vicon: ...`.
+
+### Pi behind a NAT router
+
+If the Pi sits behind its own router whose WAN side is on the Vicon network, the Pi can reach the Vicon PC
+but the Vicon PC cannot reach the Pi, so `--dashboard` gets nothing through. Let the Pi start the conversation:
+
+```bash
+# on the Pi
+python3 telemetry_server.py --udp-hello <Vicon PC IP>
+# on the Vicon PC
+py -3.12 vicon_to_dashboard.py --listen --subject hopper
+```
+
+The server sends a small `#hello` datagram every second from its UDP port to the Vicon PC (port 47270). The
+script sends its frames back to wherever the hellos come from, which the router lets through, and the hellos keep
+that path open. Windows Firewall on the Vicon PC must allow incoming UDP 47270 (allow Python when Windows asks,
+or as admin: `netsh advfirewall firewall add rule name="Vicon bridge" dir=in action=allow protocol=UDP localport=47270`).
+The script prints every 5 s how many frames it sent and where, or that no hello has arrived yet.
 
 ## What is sent (one UDP datagram per Vicon frame)
 
