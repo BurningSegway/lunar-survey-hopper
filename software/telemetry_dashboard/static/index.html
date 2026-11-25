@@ -854,14 +854,21 @@ function trajectoryAt(t) {
 // world frame (Z up), ViconQw..Qz the subject's orientation (not plotted here).
 // Aligned to the trajectory frame by subtracting the Vicon position at launch and
 // rotating about Z by the heading offset: p_ENU = Rz(offset) · (p_vicon − p_vicon(launch)).
+// The launch time tL comes from the Teensy's serial data, which can reach the Pi later
+// than the Vicon frames; at that Pi time the hopper may already be rising in the Vicon
+// data. So the origin is the last Vicon frame before tL where the hopper was at rest.
 let viconYaw = 0;   // heading offset [deg], set in the trajectory view, saved in the layout
+const VICON_REST_WINDOW_S = 0.15;   // "at rest": moved less than VICON_REST_TOL_M over this window
+const VICON_REST_TOL_M = 0.005;
+const VICON_REST_SEARCH_S = 2.0;    // look back at most this far before tL
 
 function viconPath(tL, tEnd) {
   const [vx, vy, vz] = ["ViconX", "ViconY", "ViconZ"].map(n => series.get(n));
   if (!vx || !vy || !vz || !vx.t.length || !vy.t.length || !vz.t.length) return null;
-  const i0 = upperBound(vx.t, tL) - 1;          // last Vicon frame at or before the launch
-  if (i0 < 0 || tL - vx.t[i0] > 0.25) return null;
+  const iL = upperBound(vx.t, tL) - 1;          // last Vicon frame at or before the launch
+  if (iL < 0 || tL - vx.t[iL] > 0.25) return null;
   const at = k => [vx.v[k], valueAt(vy, vx.t[k]), valueAt(vz, vx.t[k])];
+  const i0 = viconRestBefore(vx.t, at, iL);
   const o = at(i0), a = viconYaw * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
   const i1 = upperBound(vx.t, tEnd), stride = Math.max(1, Math.ceil((i1 - i0) / 1500));
   const pts = [];
@@ -870,6 +877,25 @@ function viconPath(tL, tEnd) {
     pts.push([c * d[0] - s * d[1], s * d[0] + c * d[1], d[2]]);
   }
   return pts.length > 1 ? pts : null;
+}
+
+// Last frame k <= iL (within VICON_REST_SEARCH_S) whose position stayed within
+// VICON_REST_TOL_M of every frame in the VICON_REST_WINDOW_S before it. Falls back to iL
+// (the frame at the Teensy launch time) if no resting frame is found, e.g. data gaps.
+function viconRestBefore(t, at, iL) {
+  for (let k = iL; k >= 0 && t[iL] - t[k] <= VICON_REST_SEARCH_S; k--) {
+    if (k < iL && t[k + 1] - t[k] > 0.25) break;   // gap (occluded / no data): stop searching
+    const pk = at(k);
+    let rest = false;
+    for (let j = k - 1; j >= 0; j--) {
+      if (t[k] - t[j] > VICON_REST_WINDOW_S) { rest = true; break; }   // whole window checked
+      if (t[j + 1] - t[j] > 0.25) break;                               // gap inside the window
+      const pj = at(j);
+      if (Math.hypot(pj[0] - pk[0], pj[1] - pk[1], pj[2] - pk[2]) > VICON_REST_TOL_M) break;
+    }
+    if (rest) return k;
+  }
+  return iL;
 }
 
 // Heading offset that makes the Vicon subject's heading match the IMU heading at time t.

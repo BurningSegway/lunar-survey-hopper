@@ -78,7 +78,11 @@ The trajectory estimate is in ENU with the launch point as origin. The dashboard
 
     p_ENU = Rz(offset) · (p_vicon − p_vicon(launch))
 
-* **Origin:** the Vicon position at the launch, which is the first sample of the burn.
+* **Origin:** the Vicon position where the hopper was last at rest before the launch (the first sample of the
+  burn): the last frame that moved less than 5 mm over the 0.15 s before it, searched up to 2 s back. The launch
+  time comes from the Teensy's serial data, which can reach the Pi later than the Vicon frames, so the Vicon
+  frame at exactly that Pi time may already be in the air. If no resting frame is found, the frame at the launch
+  time is used.
 * **Heading offset:** the **Vicon hdg** field in the Trajectory view (degrees, saved in the browser). **from attitude**
   sets it so the Vicon object's heading matches the IMU heading at the current (or paused) moment. Use it with the hopper
   standing level and the Vicon object's x axis defined along the IMU x axis. You can also type in a known value.
