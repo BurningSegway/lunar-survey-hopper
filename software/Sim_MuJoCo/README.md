@@ -305,8 +305,8 @@ i.e. the ground's push, in units of the local g):
 
 - **Lift-off (jump)**: the push is seen (|f| >= 1.25 g), then the first
   sample with |f| < 0.5 g is the cutoff (the ground no longer pushes). Control
-  starts on that sample, with no delay: the same sample the trajectory
-  tracker latches its arc on, ~40 ms after the jump command. From the jump
+  starts on that sample, with no delay: the trajectory tracker's cutoff,
+  ~40 ms after the jump command (it latches its arc 60 ms later). From the jump
   command until then the wheel torques are zero (no momentum bleed through
   the push).
 - **Landing**: an impact (|f| > 1.25 g) in DESCENT or LANDING stops attitude
@@ -526,7 +526,7 @@ MeshLab and Open3D read it.
   `jumper_sim.pointcloud.read_touchdowns`), and the console shows
   `[SCAN] Jump n touched down at (x, y, z).`
 - The trajectory tracker's predicted paths (the jump's arc and each
-  bounce's, sampled every 20 ms from the cutoff to where the arc ended) are
+  bounce's, sampled every 20 ms from its latch to where the arc ended) are
   written as each one ends to `target_scan.arcs.json`, each with the
   robot's actual (true) base path over the same time
   (`[{"jump": n, "points": [[x, y, z], ...], "actual": [[x, y, z], ...]}, ...]`;
@@ -581,15 +581,18 @@ counts too:
    comes within 0.3 m of the mapped ground: the predicted landing spot. The
    arc is the firmware's trajectory tracker (`jumper_sim/trajectory.py`): from
    the jump command the IMU's linear acceleration (specific force rotated to
-   the world, gravity added back) is Euler-integrated from rest, and when the
-   push-off ends (specific force < 0.5 g after > 1.25 g) the position and
-   velocity are latched; from then on only gravity acts, so the arc is fixed
-   until touchdown ends it. The spot only moves if the mapped ground along
+   the world, gravity added back) is Euler-integrated from rest. The push-off
+   ends at the cutoff (specific force < 0.5 g after > 1.25 g), but the foot
+   and springs keep pushing the body for a while after it (~3 g on the Moon
+   within ~10 ms of lift-off), so integration goes on for 60 ms
+   (`FREE_FALL_DELAY`, the same delay the contact estimate waits before a
+   bounce counts) and only then are the position and velocity latched; from
+   then on only gravity acts, so the arc is fixed until touchdown ends it. The spot only moves if the mapped ground along
    the arc does. The tracker then runs again for the bounce: on every step
    in ground contact it restarts from the arc's position and velocity there,
-   integrates through the impact, and latches the bounce's arc on the first
-   step off the ground (so a dip below 0.5 g while still sliding or rocking
-   is thrown away again). Bounces are fitted along their own arc with the
+   integrates through the impact, and latches the bounce's arc 60 ms after
+   its cutoff (so an arc latched after a dip below 0.5 g while still sliding
+   or rocking is thrown away again). Bounces are fitted along their own arc with the
    jump's map. Settling on the ground ends it; with no arc there are no fits;
 3. up to 1000 of the jump's points (an even subsample) within 0.5 m of that
    spot are fitted to the area-averaged ground plane, with outlier
@@ -656,14 +659,14 @@ bunny = within 0.3 m of the target, above the ground; landing disc = within
 | **Mid-360S (side, current)** | **603-674k** | 166 / 102 / 47 | 6.1-6.5k | 2345-2932 m^2 |
 
 - The arc comes from the simulated IMU (the body's velocity change per
-  step), as on the robot. On a hop it latches 40 ms after the release with
-  v0 within 0.02 m/s of the true velocity and stays within 1.3 cm (Earth)
-  / 13 cm (Moon, 7.6 s of flight) of the true base path. The bounces'
-  arcs (headless hop, every bounce until it settles) latch with v0 within
-  0.04 m/s and stay within 1.5 cm / 11 cm (Earth, 2 bounces) and 15-16 cm
-  (Moon, 3 bounces, accumulated since the jump) of the true path. The
-  benchmark and tests that throw or drop the robot latch their known start
-  state instead.
+  step), as on the robot. On a hop it latches 100 ms after the release
+  (60 ms after the cutoff). Arc vs true base path (2026-11-25, six hops to
+  targets (10, 5), (-6, 12), (15, 0), mean): Moon jump 6.4 cm at the apex,
+  11.3 cm at touchdown (latched at the cutoff it was 24 / 50 cm: the arc
+  missed the push after it and came out low), Moon bounces 16 cm (61);
+  Earth jump 2.9 cm (6.8). The error is nearly all vertical (horizontal
+  1-7 cm). The benchmark and tests that throw or drop the robot latch their
+  known start state instead.
 - `jumper_sim/trajectory.py`: the trajectory tracker;
   `jumper_sim/landing_reference.py`: ground map, landing prediction, plane
   fit, landing plane and reference attitude; both written to run unchanged
@@ -671,7 +674,7 @@ bunny = within 0.3 m of the target, above the ground; landing disc = within
 - `jumper_sim/visualization.py`: the viewer overlay.
 - Tuning: `LandingReferenceConfig` (disc radius, max points, fit period,
   touchdown clearance, max tilt, max fit noise, near-touchdown rules);
-  `TrajectoryConfig` (launch and cutoff specific force).
+  `TrajectoryConfig` (launch and cutoff specific force, latch delay).
 
 ## Terrain
 

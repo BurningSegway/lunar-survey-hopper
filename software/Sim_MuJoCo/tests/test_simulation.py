@@ -35,6 +35,7 @@ from jumper_sim.cube_model import (
 )
 from jumper_sim.ray_casting import TERRAIN_GEOM_GROUP, HeightfieldRayCaster
 from jumper_sim.flight_phase import FlightPhase
+from jumper_sim.ground_contact import FREE_FALL_DELAY
 from jumper_sim.pointcloud import PointCloudRecorder, read_arcs, read_ply, read_touchdowns
 from jumper_sim.telemetry import UdpTelemetry
 from jumper_sim.lidar import LIVOX_MID360
@@ -579,8 +580,10 @@ class SimulationTests(unittest.TestCase):
             simulation.step()
             if lift_off is None and simulation.estimated_airborne:
                 lift_off = float(self.data.time)
-                # On the cutoff sample, no longer touching (true lift-off).
-                self.assertTrue(simulation.trajectory.ballistic)
+                # On the cutoff sample, no longer touching (true lift-off);
+                # the arc is latched FREE_FALL_DELAY later.
+                self.assertTrue(simulation.trajectory.cut_off)
+                self.assertFalse(simulation.trajectory.ballistic)
                 self.assertFalse(touching)
                 self.assertFalse(simulation.robot_touches_terrain())
                 self.assertAlmostEqual(simulation.trajectory.cutoff_time + self.model.opt.timestep,
@@ -621,7 +624,7 @@ class SimulationTests(unittest.TestCase):
                 self.assertEqual(max(map(abs, push_torques)), 0.0)
                 # Control starts on the cutoff sample, still in TAKEOFF.
                 self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
-                self.assertTrue(simulation.trajectory.ballistic)
+                self.assertTrue(simulation.trajectory.cut_off)
                 self.assertAlmostEqual(simulation.trajectory.cutoff_time + self.model.opt.timestep,
                                        float(self.data.time), places=6)
                 self.assertIs(simulation.phase, FlightPhase.TAKEOFF)
@@ -661,11 +664,12 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(simulation.trajectory.integrating)
         while not simulation.trajectory.ballistic and self.data.time < 2.5:
             simulation.step()
-        # The IMU-integrated push-off gives the true velocity and position.
+        # Latched FREE_FALL_DELAY after the cutoff: the IMU-integrated push-off
+        # (with the foot's push after the cutoff) gives the true velocity and position.
         tracker = simulation.trajectory
-        np.testing.assert_allclose(tracker.launch_velocity, self.data.qvel[:3], atol=0.05)
-        self.assertLess(np.linalg.norm(tracker.cutoff_position - self.data.xpos[body]), 0.03)
-        self.assertTrue(simulation.in_contact)  # latched before the flight debounce
+        self.assertAlmostEqual(tracker.arc_time, tracker.cutoff_time + FREE_FALL_DELAY, places=6)
+        np.testing.assert_allclose(tracker.arc_velocity, self.data.qvel[:3], atol=0.05)
+        self.assertLess(np.linalg.norm(tracker.arc_position - self.data.xpos[body]), 0.03)
         worst = 0.0
         while tracker.ballistic and self.data.time < 5.0:
             simulation.step()
@@ -674,11 +678,11 @@ class SimulationTests(unittest.TestCase):
                 worst = max(worst, float(np.linalg.norm(position - self.data.xpos[body])))
         self.assertTrue(simulation.in_contact)  # ended at touchdown
         self.assertLess(worst, 0.05)  # the fixed arc stays on the hop (measured 0.013 m)
-        # It runs again for the bounce: latched as the robot leaves the ground.
+        # It runs again for the bounce: latched FREE_FALL_DELAY after it leaves the ground.
         while not tracker.ballistic and self.data.time < 5.0:
             simulation.step()
         self.assertTrue(tracker.ballistic)
-        np.testing.assert_allclose(tracker.launch_velocity, self.data.qvel[:3], atol=0.05)
+        np.testing.assert_allclose(tracker.arc_velocity, self.data.qvel[:3], atol=0.05)
         worst = 0.0
         while tracker.ballistic and self.data.time < 5.0:
             simulation.step()

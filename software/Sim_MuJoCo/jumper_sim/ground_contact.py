@@ -17,8 +17,9 @@ before this sample):
 * Jump (TAKEOFF): the push is seen as |f| >= ``launch_force``; the first
   later sample with |f| < ``free_fall_force`` is the cutoff -- the ground no
   longer pushes -- and the robot is airborne from that sample on, with no
-  delay. These are the trajectory tracker's latch thresholds, so control
-  starts on the sample the arc is latched.
+  delay. These are the trajectory tracker's cutoff thresholds, so control
+  starts on its cutoff sample (the tracker latches its arc
+  ``FREE_FALL_DELAY`` later).
 * Landing (DESCENT or LANDING): an impact, |f| > ``impact_force``, ends the
   flight. Not in TAKEOFF or ASCENT: the spring's wind-back 0.4 s after the
   release reads up to ~1250 g in flight.
@@ -44,12 +45,21 @@ import numpy as np
 from .flight_phase import FlightPhase
 
 
+# How long the IMU waits after the ground's push ends before it trusts the
+# flight: a bounce counts as airborne after this long below
+# ``free_fall_force`` without a break, and the trajectory tracker latches
+# its arc this long after the cutoff (the foot and springs keep pushing the
+# body for a while after it). One constant for both (user's choice,
+# 2026-11-25).
+FREE_FALL_DELAY = 0.06  # s
+
+
 @dataclass(frozen=True)
 class GroundContactConfig:
     launch_force: float = 1.25  # g: the jump's push has started
     free_fall_force: float = 0.5  # g: below this nothing pushes on the robot
     impact_force: float = 1.25  # g: a landing impact
-    bounce_free_fall_time: float = 0.06  # s of free fall before a bounce counts
+    bounce_free_fall_time: float = FREE_FALL_DELAY  # s of free fall before a bounce counts
 
 
 class GroundContactEstimator:

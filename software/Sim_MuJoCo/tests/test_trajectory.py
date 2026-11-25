@@ -3,7 +3,8 @@ import unittest
 
 import numpy as np
 
-from jumper_sim.trajectory import TrajectoryTracker
+from jumper_sim.ground_contact import FREE_FALL_DELAY, GroundContactConfig
+from jumper_sim.trajectory import TrajectoryConfig, TrajectoryTracker
 
 G = 1.62
 GRAVITY = np.array([0.0, 0.0, -G])
@@ -18,7 +19,8 @@ def yaw_quaternion(yaw):
 class TrajectoryTrackerTests(unittest.TestCase):
     def launch(self, tracker, push_world, push_time, quaternion=LEVEL, start=(1.0, 2.0, 0.5)):
         """Rest, a constant push (world-frame linear acceleration), then free
-        flight; returns the true velocity and position at the end of the push."""
+        flight up to the latch; returns its time and the true velocity and
+        position then."""
         r = np.array([[1 - 2 * quaternion[3] ** 2, -2 * quaternion[0] * quaternion[3], 0.0],
                       [2 * quaternion[0] * quaternion[3], 1 - 2 * quaternion[3] ** 2, 0.0],
                       [0.0, 0.0, 1.0]])  # yaw-only rotation, body -> world
@@ -28,11 +30,15 @@ class TrajectoryTrackerTests(unittest.TestCase):
         for _ in range(round(push_time / DT)):
             time += DT
             tracker.update(time, r.T @ (push - GRAVITY), quaternion, GRAVITY, DT)
-        for _ in range(3):  # free flight: the accelerometer reads ~0
-            time += DT
+        for _ in range(round(1.5 * tracker.config.latch_delay / DT) + 3):
+            if tracker.ballistic:
+                break
+            time += DT  # free flight: the accelerometer reads ~0
             tracker.update(time, np.zeros(3), quaternion, GRAVITY, DT)
-        velocity = push * push_time
-        position = np.asarray(start) + 0.5 * push * push_time**2
+        flight = time - push_time
+        velocity = push * push_time + GRAVITY * flight
+        position = (np.asarray(start) + 0.5 * push * push_time**2 + push * push_time * flight
+                    + 0.5 * GRAVITY * flight**2)
         return time, velocity, position
 
     def test_latches_the_push_off_velocity_and_flies_a_fixed_arc(self) -> None:
@@ -44,16 +50,45 @@ class TrajectoryTrackerTests(unittest.TestCase):
                 self.assertTrue(tracker.ballistic)
                 self.assertFalse(tracker.integrating)
                 # Forward Euler lags the true values by one sample's step.
-                np.testing.assert_allclose(tracker.launch_velocity, velocity, rtol=0.02)
-                np.testing.assert_allclose(tracker.cutoff_position, position, atol=0.01)
+                np.testing.assert_allclose(tracker.arc_velocity, velocity, rtol=0.02)
+                np.testing.assert_allclose(tracker.arc_position, position, atol=0.01)
                 self.assertAlmostEqual(tracker.gravity, G)
-                # The arc: ballistic from the cutoff, and the IMU no longer counts.
+                # Latched FREE_FALL_DELAY after the cutoff (the first free sample).
+                self.assertAlmostEqual(tracker.cutoff_time, 0.1 + DT)
+                self.assertAlmostEqual(tracker.arc_time, tracker.cutoff_time + FREE_FALL_DELAY)
+                self.assertAlmostEqual(tracker.arc_time, time)
+                # The arc: ballistic from the latch, and the IMU no longer counts.
                 tracker.update(time + DT, np.array([50.0, 0.0, 0.0]), LEVEL, GRAVITY, DT)
                 t = 2.0
-                p, v = tracker.state(tracker.cutoff_time + t)
+                p, v = tracker.state(tracker.arc_time + t)
                 np.testing.assert_allclose(
-                    p, tracker.cutoff_position + tracker.launch_velocity * t - (0, 0, 0.5 * G * t * t))
-                np.testing.assert_allclose(v, tracker.launch_velocity - (0, 0, G * t))
+                    p, tracker.arc_position + tracker.arc_velocity * t - (0, 0, 0.5 * G * t * t))
+                np.testing.assert_allclose(v, tracker.arc_velocity - (0, 0, G * t))
+
+    def test_the_push_after_the_cutoff_is_in_the_arc(self) -> None:
+        # The foot and springs push the body for a while after the cutoff:
+        # the arc is latched FREE_FALL_DELAY later, with that push in it.
+        self.assertEqual(TrajectoryConfig().latch_delay, FREE_FALL_DELAY)
+        self.assertEqual(GroundContactConfig().bounce_free_fall_time, FREE_FALL_DELAY)
+        results = {}
+        for delay in (0.0, FREE_FALL_DELAY):
+            tracker = TrajectoryTracker(TrajectoryConfig(latch_delay=delay))
+            tracker.begin((0.0, 0.0, 0.0))
+            time = 0.0
+            # push 50 ms, free 10 ms, a 3 g push for 10 ms, then free flight
+            for force in [30.0 * G] * 50 + [0.0] * 10 + [3.0 * G] * 10 + [0.0] * 100:
+                time += DT
+                tracker.update(time, np.array([0.0, 0.0, force]), LEVEL, GRAVITY, DT)
+                if tracker.ballistic:
+                    break
+            self.assertTrue(tracker.ballistic)
+            self.assertAlmostEqual(tracker.cutoff_time, 0.051)
+            self.assertAlmostEqual(tracker.arc_time, 0.051 + delay)
+            # The arc's velocity carried back to the cutoff.
+            results[delay] = tracker.arc_velocity[2] + G * (tracker.arc_time - 0.051)
+        true_at_cutoff = 29.0 * G * 0.05 + 2.0 * G * 0.01  # with the late push
+        self.assertAlmostEqual(results[FREE_FALL_DELAY], true_at_cutoff, delta=0.05 * G)
+        self.assertLess(results[0.0], true_at_cutoff - 1.5 * G * 0.01)  # misses it
 
     def test_standing_still_does_not_latch(self) -> None:
         tracker = TrajectoryTracker()
@@ -89,10 +124,15 @@ class TrajectoryTrackerTests(unittest.TestCase):
             time += DT
             tracker.update(time, push - GRAVITY, LEVEL, GRAVITY, DT)
         self.assertFalse(tracker.ballistic)
-        # ... and the first sample off the ground latches the bounce's arc.
-        tracker.update(time + DT, np.zeros(3), LEVEL, GRAVITY, DT)
-        self.assertTrue(tracker.ballistic)
-        np.testing.assert_allclose(tracker.launch_velocity, (1.0, 0.0, G), atol=0.05)
+        # ... the first sample off the ground is its cutoff, and the bounce's
+        # arc is latched FREE_FALL_DELAY later.
+        cutoff = time + DT
+        while not tracker.ballistic and time < 2.0:
+            time += DT
+            tracker.update(time, np.zeros(3), LEVEL, GRAVITY, DT)
+        self.assertAlmostEqual(tracker.cutoff_time, cutoff)
+        self.assertAlmostEqual(tracker.arc_time, cutoff + FREE_FALL_DELAY)
+        np.testing.assert_allclose(tracker.arc_velocity, (1.0, 0.0, G - G * FREE_FALL_DELAY), atol=0.05)
 
     def test_path_samples_the_arc_up_to_its_end(self) -> None:
         tracker = TrajectoryTracker()

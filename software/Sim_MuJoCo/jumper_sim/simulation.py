@@ -168,7 +168,7 @@ class LidarLandingReference:
     def __init__(self, point_sigma: float,
                  config: LandingReferenceConfig = LandingReferenceConfig()) -> None:
         self.map = GroundMap(config.map_cell, config.map_corridor)
-        self._arc_time: float | None = None  # cutoff time of the map's track
+        self._arc_time: float | None = None  # latch time of the map's track
         self.plane = LandingPlane(config)
         self.config = config
         self._point_sigma = point_sigma
@@ -182,11 +182,11 @@ class LidarLandingReference:
         self._next_fit = time
         self.visual = None
 
-    def set_arc(self, cutoff_time: float, position, velocity) -> None:
-        """The tracker's current arc (from its cutoff): the map bins the
+    def set_arc(self, arc_time: float, position, velocity) -> None:
+        """The tracker's current arc (from its latch): the map bins the
         points along its ground track. A new arc (a bounce's) is passed on."""
-        if cutoff_time != self._arc_time:
-            self._arc_time = cutoff_time
+        if arc_time != self._arc_time:
+            self._arc_time = arc_time
             self.map.set_track(position, velocity)
 
     def add_points(self, points: np.ndarray) -> None:
@@ -318,12 +318,12 @@ class JumperSimulation:
         # sensor): gates attitude control and starts the flight reference.
         self.ground_contact = GroundContactEstimator()
         self.estimated_airborne = self.ground_contact.airborne
-        # The hop's ballistic arc from the IMU (latched at propulsion cutoff):
+        # The hop's ballistic arc from the IMU (latched 60 ms after propulsion cutoff):
         # the landing spot is predicted along it.
         self.trajectory = TrajectoryTracker()
         # The true base path along the current arc, for the point cloud plot.
         self._actual_path: list[np.ndarray] = []
-        self._actual_cutoff: float | None = None
+        self._actual_arc: float | None = None
         self._actual_next = 0.0
         self.flight_reference: FlightReference | None = None
         if flight_reference and self.landing_reference is not None and self.contact_gating:
@@ -619,8 +619,8 @@ class JumperSimulation:
         self._sample_actual_path()
         if self.landing_reference is not None and self.trajectory.ballistic:
             tracker = self.trajectory
-            self.landing_reference.set_arc(tracker.cutoff_time, tracker.cutoff_position,
-                                           tracker.launch_velocity)
+            self.landing_reference.set_arc(tracker.arc_time, tracker.arc_position,
+                                           tracker.arc_velocity)
         if not self.in_contact:
             self._lidar_step()
         if self.landing_reference is not None:
@@ -746,8 +746,8 @@ class JumperSimulation:
         if self.target_scan is None or not tracker.ballistic:
             return
         time = float(self.data.time)
-        if self._actual_cutoff != tracker.cutoff_time:  # a new arc
-            self._actual_cutoff = tracker.cutoff_time
+        if self._actual_arc != tracker.arc_time:  # a new arc
+            self._actual_arc = tracker.arc_time
             self._actual_path = []
             self._actual_next = time
         if time >= self._actual_next - 1e-9:  # on the prediction's 20 ms grid
@@ -762,10 +762,10 @@ class JumperSimulation:
         tracker = self.trajectory
         time = float(self.data.time)
         if (self.target_scan is None or not tracker.ballistic
-                or time - tracker.cutoff_time < MIN_ARC_TIME):
+                or time - tracker.arc_time < MIN_ARC_TIME):
             return
         body = self.model.jnt_bodyid[self.ids.root_joint]
-        actual = (self._actual_path if self._actual_cutoff == tracker.cutoff_time else [])
+        actual = (self._actual_path if self._actual_arc == tracker.arc_time else [])
         actual = [*actual, self.data.xpos[body].copy()]  # up to the touchdown
         try:
             self.target_scan.add_arc(tracker.path(time, PATH_PERIOD), actual)

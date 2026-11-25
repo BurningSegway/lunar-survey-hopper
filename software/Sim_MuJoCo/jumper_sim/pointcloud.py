@@ -12,7 +12,7 @@ to the cloud (:func:`touchdown_path`: ``[{"jump": n, "position": [x, y, z]},
 so the landing spots are easy to find in the cloud. The predicted paths go
 in another (:func:`arcs_path`: ``[{"jump": n, "points": [[x, y, z], ...],
 "actual": [[x, y, z], ...]}, ...]``): every ballistic arc the trajectory
-tracker latched during the jump and its bounces, sampled from its cutoff to
+tracker latched during the jump and its bounces, sampled from its latch to
 where it ended (touchdown), with the robot's actual (true) base path over
 the same time, written as each one ends.
 

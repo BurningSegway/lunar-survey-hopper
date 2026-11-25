@@ -9,19 +9,26 @@ Euler (previous sample's velocity and acceleration):
     p[k] = p[k-1] + v[k-1] * dt
     v[k] = v[k-1] + a[k-1] * dt
 
-At propulsion cutoff (the specific force drops below ``cutoff_force`` g after
-the push-off exceeded ``launch_force`` g) p and v are latched (p_c, v0) and
-integration stops: from then on only gravity acts, so the whole flight is the
-fixed ballistic arc
+The propulsion cutoff is the first sample on which the specific force drops
+below ``cutoff_force`` g after the push-off exceeded ``launch_force`` g. The
+foot and springs keep pushing the body for a while after it (on the Moon
+~3 g within ~10 ms of lift-off), so integration goes on for ``latch_delay``
+(``FREE_FALL_DELAY``, 60 ms, the contact estimate's bounce delay) and only
+then are p and v latched (p_a, v0 at t_a) and integration stops: from then
+on only gravity acts, so the rest of the flight is the fixed ballistic arc
 
-    p(t) = p_c + v0 t - [0, 0, g/2] t^2,   t = time since cutoff.
+    p(t) = p_a + v0 (t - t_a) - [0, 0, g/2] (t - t_a)^2.
+
+Latching at the cutoff put the arc ~50 cm low at a Moon jump's touchdown
+(the error is nearly all vertical); 60 ms later it is ~10 cm (measured over
+six hops, see CLAUDE.md).
 
 Touchdown ends it, and the tracker runs again for the bounce: on every
 sample the robot touches the ground, integration restarts from the arc's
-position and velocity there (so an arc latched by a dip below the cutoff
+position and velocity there (so an arc latched after a dip below the cutoff
 while still sliding or rocking on the ground is thrown away again), and the
-bounce's arc is latched on the first sample off the ground (the impact
-counts as the push-off). If the robot stays down, nothing latches (it reads
+bounce's arc is latched ``latch_delay`` after its cutoff (the impact counts
+as the push-off). If the robot stays down, nothing latches (it reads
 ~1 g) and settling on the ground resets it. There is no reason to expect a
 trajectory to change in flight, so nothing updates an arc once latched. Pure numpy; in the simulator the IMU is the
 body's velocity change per step (see JumperSimulation._update_flight_phase).
@@ -33,6 +40,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .ground_contact import FREE_FALL_DELAY
 from .landing_reference import quaternion_to_matrix
 
 
@@ -40,6 +48,7 @@ from .landing_reference import quaternion_to_matrix
 class TrajectoryConfig:
     launch_force: float = 1.25  # g: the push-off has started
     cutoff_force: float = 0.5  # g: the push-off has ended (free flight reads ~0)
+    latch_delay: float = FREE_FALL_DELAY  # s from the cutoff to the latch
 
 
 class TrajectoryTracker:
@@ -55,9 +64,12 @@ class TrajectoryTracker:
         self.velocity = np.zeros(3)
         self._acceleration = np.zeros(3)
         self._launched = False
-        self.cutoff_time = 0.0
-        self.cutoff_position = np.zeros(3)
-        self.launch_velocity = np.zeros(3)
+        self.cut_off = False  # the push-off has ended; the latch follows
+        self.cutoff_time = 0.0  # the cutoff sample
+        # The arc: from arc_position, arc_velocity at arc_time (the latch).
+        self.arc_time = 0.0
+        self.arc_position = np.zeros(3)
+        self.arc_velocity = np.zeros(3)
         self.gravity = 0.0
 
     def begin(self, position, velocity=(0.0, 0.0, 0.0)) -> None:
@@ -80,19 +92,23 @@ class TrajectoryTracker:
         self._acceleration = f_world + gravity_vector
         g = float(np.linalg.norm(gravity_vector))
         force = float(np.linalg.norm(specific_force_body))
-        if force >= self.config.launch_force * g:
-            self._launched = True
-        elif self._launched and force < self.config.cutoff_force * g:
+        if not self.cut_off:
+            if force >= self.config.launch_force * g:
+                self._launched = True
+            elif self._launched and force < self.config.cutoff_force * g:
+                self.cut_off = True
+                self.cutoff_time = time
+        if self.cut_off and time - self.cutoff_time >= self.config.latch_delay - 1e-9:
             self.latch(time, self.position, self.velocity, g)
 
     def latch(self, time: float, position, velocity, gravity: float) -> None:
-        """Cutoff: fix the ballistic arc (also for a robot thrown or dropped
-        in a test, whose state is known)."""
+        """Fix the ballistic arc (``latch_delay`` after the cutoff; also for a
+        robot thrown or dropped in a test, whose state is known)."""
         self.integrating = False
         self.ballistic = True
-        self.cutoff_time = time
-        self.cutoff_position = np.asarray(position, float).copy()
-        self.launch_velocity = np.asarray(velocity, float).copy()
+        self.arc_time = time
+        self.arc_position = np.asarray(position, float).copy()
+        self.arc_velocity = np.asarray(velocity, float).copy()
         self.gravity = gravity
 
     def end(self) -> None:
@@ -111,16 +127,16 @@ class TrajectoryTracker:
         self._launched = True  # the impact is the bounce's push-off
 
     def path(self, end_time: float, period: float = 0.02) -> np.ndarray:
-        """Positions on the arc from the cutoff to ``end_time`` (N x 3)."""
-        duration = max(0.0, end_time - self.cutoff_time)
+        """Positions on the arc from its latch to ``end_time`` (N x 3)."""
+        duration = max(0.0, end_time - self.arc_time)
         times = np.append(np.arange(0.0, duration, period), duration)
         down = np.array([0.0, 0.0, 0.5 * self.gravity])
-        return (self.cutoff_position + np.outer(times, self.launch_velocity)
+        return (self.arc_position + np.outer(times, self.arc_velocity)
                 - np.outer(times * times, down))
 
     def state(self, time: float) -> tuple[np.ndarray, np.ndarray]:
         """(position, velocity) on the arc at ``time`` (only while ballistic)."""
-        t = time - self.cutoff_time
+        t = time - self.arc_time
         down = np.array([0.0, 0.0, self.gravity])
-        return (self.cutoff_position + self.launch_velocity * t - 0.5 * down * t * t,
-                self.launch_velocity - down * t)
+        return (self.arc_position + self.arc_velocity * t - 0.5 * down * t * t,
+                self.arc_velocity - down * t)

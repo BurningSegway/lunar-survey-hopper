@@ -70,7 +70,7 @@ Model tests need the generated `build/terrain_height.bin`
 | `ray_casting.py` | Exact fast heightfield ray caster (matches `mj_multiRay`; skips 8x8-cell blocks the ray passes above their highest vertex, block looked up at the skipped segment's middle: ~5x fewer march steps, 2.4-3x faster; its cost is set by the number of march steps, i.e. ray length, more than by ray count) and a mesh ray caster for objects on it (einsum, not `@`: OpenBLAS threading made it 2-3x slower); site/geom names. The RealSense D435 depth camera that used to live here was removed (lidar only) |
 | `landing_reference.py` | `GroundMap` of the jump's lidar points (0.5 m grid, emptied at each jump; only cells within `map_corridor` = 4 m (user's choice, margin: reads are within ~1.5 m) of the arc's ground track are binned, the rest wait unbinned in 8 m tiles and are binned at the first read after a new (bounce) arc, from the tiles near it only (`set_track`, fed by `LidarLandingReference.set_arc`; a settling robot latches many short arcs, binning at each latch froze the loop for 2 s); reads identical to binning all, tested; airborne viewer loop 37 -> 58 fps; integer cell keys `i * _CELL_RADIX + j`), ballistic landing-spot prediction along the tracker's arc (base within 0.3 m of the mapped ground), area-weighted plane fit of <= 1000 points within 0.5 m of the spot, calibrated uncertainty (noise vs. roughness), `LandingPlane` = the newest fit (ignored if its noise sigma > 3 deg; the Kalman filter was removed, user's choice); keeps updating until impact (user's choice; `freeze_near_touchdown` restores the old freeze), its near-touchdown rule starts LANDING. Benchmarks/tests throw the robot onto a spot (starting in ASCENT with the IMU vertical velocity set and the arc latched from the start state) |
 | `ground_contact.py` | `GroundContactEstimator`: airborne or not from the IMU's specific force alone (in units of local g): airborne at the jump's cutoff (>= 1.25 g, then < 0.5 g, the tracker's thresholds) in TAKEOFF, no delay; an impact (> 1.25 g) ends it in DESCENT/LANDING only (the spring wind-back reads ~1250 g in the ascent); bounces after < 0.5 g for 60 ms unbroken. Gates attitude control (see Open items) |
-| `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; latches p, v0 when the specific force drops < 0.5 g after > 1.25 g (cutoff, ~40 ms after release); then a fixed ballistic arc until touchdown; `touchdown` (every contact step) restarts integration from the arc's state there, so each bounce's arc latches on its first step off the ground (user's request); `latch` for thrown/dropped starts; `path` samples an arc. No arc, no landing fits. Arcs >= 60 ms of tracked jumps go to `<name>.arcs.json` with the true base path sampled on the same 20 ms grid (`_record_arc`, `_sample_actual_path`) |
+| `trajectory.py` | `TrajectoryTracker`, the firmware's tracker (main, `teensy-lqr-stabilizer` "trajectory estimation"): from the jump command, Euler-integrates the IMU's world linear acceleration from rest; cutoff (`cutoff_time`, `cut_off`) when the specific force drops < 0.5 g after > 1.25 g (~40 ms after release), keeps integrating and latches p, v0 (`arc_time`, `arc_position`, `arc_velocity`) `latch_delay` = `FREE_FALL_DELAY` (60 ms, `ground_contact.py`, shared with the bounce delay; user's choice) later; then a fixed ballistic arc until touchdown; `touchdown` (every contact step) restarts integration from the arc's state there, so each bounce's arc latches 60 ms after its cutoff (user's request); `latch` for thrown/dropped starts; `path` samples an arc. No arc, no landing fits. Arcs >= 60 ms of tracked jumps go to `<name>.arcs.json` with the true base path sampled on the same 20 ms grid (`_record_arc`, `_sample_actual_path`) |
 | `jump_aim.py` | On the ground, lean the body axis towards the track target (3 deg near, 8 deg at >= 30 m), closed loop on IMU tilt via a leg-shortening plane (integrator, only while still, held during release, reset at touchdown, legs capped at 10 cm, off on ground > 20 deg); motors `tilt_fl/fr/bl/br` |
 | (target, tipped) | `simulation.py`: bunny `target_object` placed on the terrain at `--track-target` (offset from `mesh_pos`; parked 100 m down otherwise), seen by `MeshRayCaster` in the terrain caster's `objects` (`JumperSimulation._terrain`); tipped (> 60 deg in GROUND) pulls all legs in, and Space then refuses to jump: R resets (user's choice; the in-air recovery, `recovery.py`, was removed). Righting on the ground is NOT possible (tested: wheel push, wheel spin-brake, wheel rock, leg kick incl. 1000 N push) |
 | `pointcloud.py` | Lidar point cloud: every point of each tracked jump, lift-off to touchdown (per-point `range`), binary PLY at `pointclouds/target_scan.ply`, emptied at program start, rewritten at each touchdown (~21 MB per full-rate hop); touchdowns in `<name>.touchdowns.json`, predicted paths (jump + bounces) in `<name>.arcs.json` |
@@ -222,30 +222,19 @@ above the ground (starting in it, the firm foot ejects the robot).
   - Stationary -> GROUND: the existing stillness rule (|f| - g < 0.5 m/s^2,
     rate < 0.2 rad/s for 0.5 s) without the contact condition.
   Measure each change (take-off wheel speeds, tracking, landing benchmark).
-- Freeze the arc later than the cutoff (user: "should definitely be
-  changed", 2026-11-25; not done yet). Today `TrajectoryTracker.update`
-  latches p, v0 on the first sample < 0.5 g after > 1.25 g. After that the
-  foot and springs keep pushing the body up for a while (in-flight |f| is
-  ~3 g on the Moon within ~10 ms of lift-off, median 0.12 g over the first
-  0.4 s), so the arc comes out too low. Keep integrating for a delay after
-  the cutoff and latch then. Measured offline (2026-11-25: six tracked hops,
-  targets (10, 5), (-6, 12), (15, 0), Moon and Earth, IMU log replayed through
-  the tracker with the latch moved; error = arc vs true base path, cm, mean
-  over 3 hops): Moon jump touchdown 50 (0 ms) / 35 (10) / 21 (20) / 5 (40) /
-  11 (60) / 10 (100) / 24 (250), apex 24 -> 3 (40 ms) / 6 (60 ms); Moon
-  bounces (6) touchdown 61 -> 7 (40 ms) / 16 (60 ms); Earth jump touchdown
-  6.8 -> 2.9 cm (60 ms), its bounce 12 -> 2 cm. The error is nearly all
-  vertical (horizontal 3-7 cm throughout); worse again beyond ~150 ms. 40 vs
-  60 ms is within the scatter of 3 hops. 60 ms is the controller's bounce
-  delay (`GroundContactConfig.bounce_free_fall_time`), so one constant could
-  cover both; on jumps the controller itself starts at the cutoff. Costs
-  nothing for the landing fits (they start at the apex). Implement as a
-  `TrajectoryConfig` delay (bounces too: `touchdown` restarts integration,
-  the latch then waits the same delay), test it, re-measure with the landing
-  and contact benchmarks, and update the `trajectory.py` docstring, README
-  and the Layout row. On the robot the size of that post-cutoff push depends
-  on the real foot and springs (and the +-10 g clipping), so re-check the
-  delay there.
+- Freeze the arc later than the cutoff: done (2026-11-25). The tracker
+  latches `FREE_FALL_DELAY` (60 ms, one constant with the contact
+  estimate's `bounce_free_fall_time`, user's choice) after the cutoff, for
+  jumps and bounces; the cutoff stays the first sample < 0.5 g and is not
+  re-armed by the post-cutoff push (~3 g). Measured in the sim (six hops,
+  targets (10, 5), (-6, 12), (15, 0), mean, arc vs true base path):
+  Moon jump apex 24.3 -> 6.4 cm, touchdown 50.0 -> 11.3 cm; Moon bounces
+  (6) touchdown 60.7 -> 16.4 cm; Earth jump touchdown 6.8 -> 2.9 cm
+  (matches the offline replay). Landing benchmark identical (it latches its
+  own start state); contact benchmark: first touchdowns unchanged, spawn
+  hop (gated) 0.82 -> 0.45 deg. On the robot the size of the post-cutoff
+  push depends on the real foot and springs (and the +-10 g clipping), so
+  re-check the delay there.
 - Tip catch at landing (user's idea, ON HOLD: don't implement yet). After
   impact, if the robot is about to topple over a leg edge, spend the wheels'
   full momentum to stop it. Its own law (an inverted pendulum about the
