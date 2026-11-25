@@ -50,10 +50,19 @@ JUMP_CYCLE_DURATION = 3.0
 # Holds the foot against the wound stop: 25 % above the jump springs' force
 # at full compression; keep within the wind_up_motor ctrlrange in the MJCF.
 JUMP_WINDUP_FORCE = -1.25 * JUMP_SPRING_COUNT * JUMP_SPRING.max_force
-# Contact gating: the robot counts as airborne again only after this long
-# without terrain contact, so rocking on the legs or a skid reads as one
-# contact phase. Real bounces in Moon gravity last >= ~0.1 s.
+# Simulator contact (phases, lidar, the tracker's restarts; attitude control
+# is gated on the IMU estimate instead): the robot counts as airborne again
+# only after this long without terrain contact, so rocking on the legs or a
+# skid reads as one contact phase. Real bounces in Moon gravity last >= ~0.1 s.
 FLIGHT_DEBOUNCE = 0.06
+# The IMU's ground contact estimate skips the samples before this time after
+# a start or reset (the tracker and the hop phases still get them): the wound foot
+# settles onto its stop then (the soft joint limit builds up its force over a
+# few steps) and jolts the base, 26-31 g on the Moon for 2 samples, > 1.25 g
+# up to 4 ms, < 0.1 g by 10 ms; the contact estimate would read it as a
+# landing impact (the sim starts in DESCENT). A sim artefact, not physics the
+# robot sees (user's choice, 2026-11-25, over settling the start state).
+IMU_START_SETTLE_TIME = 0.01
 # Predicted paths shorter than this are not plotted (not a flight).
 MIN_ARC_TIME = FLIGHT_DEBOUNCE
 PATH_PERIOD = 0.02  # s between samples of the plotted paths
@@ -277,8 +286,10 @@ class JumperSimulation:
             self.landing_reference = LidarLandingReference(self.lidar.spec.range_sigma)
         self._robot_geoms = _robot_geom_mask(model, self.ids.root_joint)
         self._terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM)
-        # Attitude control in flight, wheel momentum bleed-off in contact
-        # (replaces the stationary-for-a-while rest trigger).
+        # Attitude control while the IMU estimate says airborne, wheel
+        # momentum bleed-off otherwise (replaces the stationary-for-a-while
+        # rest trigger). ``in_contact`` is the simulator's contact, which
+        # still drives the phases, the lidar and the tracker's restarts.
         self.contact_gating = contact_gating
         self.in_contact = False
         self._time_without_contact = math.inf
@@ -289,8 +300,7 @@ class JumperSimulation:
         self.flight_phase = FlightPhaseDetector()
         self._previous_velocity: np.ndarray | None = None
         # Ground contact from the IMU alone (the robot has no contact
-        # sensor). Shadow mode for now: tracked next to the simulator's
-        # contact, which still gates.
+        # sensor): gates attitude control and starts the flight reference.
         self.ground_contact = GroundContactEstimator()
         self.estimated_airborne = self.ground_contact.airborne
         # The hop's ballistic arc from the IMU (latched at propulsion cutoff):
@@ -376,7 +386,7 @@ class JumperSimulation:
             if self.wheel_control_mode is WheelControlMode.DISABLED:
                 self.wheel_control_mode = WheelControlMode.STABILIZING
                 self._stationary_duration = 0.0
-                if self.contact_gating and self.in_contact:
+                if self.contact_gating and not self.estimated_airborne:
                     self._enter_contact_mode()
                 return "[CONTROLLER] Attitude stabilization enabled."
         elif key == "x":
@@ -445,6 +455,10 @@ class JumperSimulation:
         # holds it once control starts, before the push has turned the body.
         qa = self.model.jnt_qposadr[self.ids.root_joint]
         self._jump_attitude = tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7])
+        if self.contact_gating:
+            # No wheel momentum bleed through the push: the wheel torques are
+            # zero from here until attitude control starts at the cutoff.
+            self.wheel_rest_controller.cancel()
         self._jump_command = True  # GROUND -> TAKEOFF
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
@@ -568,7 +582,7 @@ class JumperSimulation:
         (target tracking on the way up, level then landing plane on the way
         down). Otherwise: landing plane tilt + yaw reference.
         """
-        if self.flight_reference is not None and not self.in_contact:
+        if self.flight_reference is not None and self.estimated_airborne:
             return self.flight_reference.commanded
         if self.landing_reference is not None:
             return self.landing_reference.reference_quaternion(self.yaw_reference)
@@ -609,7 +623,7 @@ class JumperSimulation:
             if (self.flight_reference is not None and accepted == 0
                     and self.landing_reference.plane.accepted > 0):
                 self.flight_events.append("[FLIGHT] Landing spot seen: aligning with its plane.")
-        if self.flight_reference is not None and not self.in_contact:
+        if self.flight_reference is not None and self.estimated_airborne:
             self.flight_reference.update(
                 phase,
                 self.data.site_xpos[self._lidar_site],
@@ -635,8 +649,6 @@ class JumperSimulation:
             if not self.in_contact:
                 self.in_contact = True
                 self.contact_phases += 1
-                if self.contact_gating:
-                    self._enter_contact_mode()
                 if self._awaiting_touchdown:
                     self._awaiting_touchdown = False
                     self._record_touchdown()
@@ -644,19 +656,10 @@ class JumperSimulation:
         self._time_without_contact += float(self.model.opt.timestep)
         if self.in_contact and self._time_without_contact >= FLIGHT_DEBOUNCE:
             self.in_contact = False
-            if self.contact_gating:
-                self._enter_flight_mode()
             if self.flight_reference is not None:
-                qa = self.model.jnt_qposadr[self.ids.root_joint]
-                # A jump, not a bounce.
+                # A jump, not a bounce: its scan starts (attitude control
+                # started earlier, at the IMU's cutoff).
                 track = self.phase is FlightPhase.TAKEOFF
-                self.flight_reference.start_flight(
-                    self._jump_attitude if track and self._jump_attitude is not None
-                    else tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
-                    self.data.qpos[qa : qa + 3].copy(),
-                    self.yaw_reference,
-                    track,
-                )
                 if track and self.target_scan is not None:
                     self.target_scan.start_jump()
                     self._scan_open = True
@@ -821,8 +824,12 @@ class JumperSimulation:
         specific_force = quaternion_to_matrix(quaternion).T @ (acceleration - self.model.opt.gravity)
         self.trajectory.update(float(self.data.time), specific_force, quaternion,
                                self.model.opt.gravity, dt)
-        self.estimated_airborne = self.ground_contact.update(
-            specific_force, gravity_magnitude(self.model.opt.gravity), dt, before)
+        if float(self.data.time) >= IMU_START_SETTLE_TIME - 1e-9:  # past the start-up jolt
+            self._set_airborne(
+                self.ground_contact.update(
+                    specific_force, gravity_magnitude(self.model.opt.gravity), dt, before),
+                track=before is FlightPhase.TAKEOFF,
+            )
         touchdown_near = (
             self.landing_reference is not None
             and self.landing_reference.plane.near_touchdown > self._near_at_descent
@@ -839,9 +846,37 @@ class JumperSimulation:
             self._enter_phase(phase)
         return phase
 
+    def _set_airborne(self, airborne: bool, track: bool = False) -> None:
+        """The IMU's contact estimate: attitude control from its lift-off
+        (a jump's cutoff, or a bounce) to its impact, the wheel bleed after."""
+        was_airborne = self.estimated_airborne
+        self.estimated_airborne = airborne
+        if airborne and not was_airborne:
+            self._lift_off(track)
+        elif was_airborne and not airborne and self.contact_gating:
+            self._enter_contact_mode()
+
+    def _lift_off(self, track: bool) -> None:
+        """Attitude control starts. ``track``: a jump, not a bounce."""
+        if self.contact_gating:
+            self._enter_flight_mode()
+        if self.flight_reference is None:
+            return
+        qa = self.model.jnt_qposadr[self.ids.root_joint]
+        self.flight_reference.start_flight(
+            self._jump_attitude if track and self._jump_attitude is not None
+            else tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
+            self.data.qpos[qa : qa + 3].copy(),
+            self.yaw_reference,
+            track,
+        )
+
     def _enter_phase(self, phase: FlightPhase) -> None:
         if phase is FlightPhase.GROUND:
             self.trajectory.reset()  # e.g. a jump that never left the ground
+            if (self.contact_gating and not self.estimated_airborne
+                    and not self.wheel_rest_controller.active):
+                self._enter_contact_mode()  # a jump that did not happen: bleed again
         if phase is FlightPhase.DESCENT and self.landing_reference is not None:
             # Only a near-touchdown fit from this descent on counts.
             self._near_at_descent = self.landing_reference.plane.near_touchdown
@@ -953,7 +988,7 @@ class JumperSimulation:
             ):
                 wheel_speed = float(self.data.qvel[self.model.jnt_dofadr[joint_id]])
                 attitude_command = -body_torque
-                if self.contact_gating and self.in_contact:
+                if self.contact_gating and not self.estimated_airborne:
                     attitude_command = 0.0  # gated: only the rest torque acts
                 elif self.compensate_wheel_friction:
                     attitude_command += wheel_friction_compensation(

@@ -28,6 +28,10 @@ before this sample):
   (measured over hops and drops: 60 ms catches every bounce > 0.1 s, 60 ms
   median after the true lift-off).
 
+It gates attitude control in JumperSimulation (on from lift-off to impact,
+wheel momentum bleed otherwise); the hop phases still use the simulator's
+contact for now.
+
 Pure numpy, meant to run unchanged on the robot from real IMU samples.
 """
 

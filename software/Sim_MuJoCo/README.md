@@ -282,14 +282,39 @@ against 3.0 deg (3.0) for the LQR, which is softer but integrates.
 
 ## Contact gating
 
-The controller only controls attitude in flight. From the first step any part of the
-robot touches the terrain it is "in contact": attitude control stops, the
-integrator resets and the wheel-rest ramp bleeds the wheels' momentum into
-the ground (this replaces the stationary-for-1-s rest trigger).
-It is airborne again after 60 ms without contact (`FLIGHT_DEBOUNCE`), so
-rocking on the legs or skidding is one contact phase; at lift-off the controller
-resumes with a fresh integrator and the current heading as yaw reference.
-Disable with `JumperSimulation(..., contact_gating=False)`.
+The controller only controls attitude in flight, and "in flight" comes from
+the IMU alone, as it must on the robot (it has no contact sensor):
+`GroundContactEstimator` in `jumper_sim/ground_contact.py` reads the
+accelerometer's specific force |f| (every force on the robot except gravity,
+i.e. the ground's push, in units of the local g):
+
+- **Lift-off (jump)**: the push is seen (|f| >= 1.25 g), then the first
+  sample with |f| < 0.5 g is the cutoff (the ground no longer pushes). Control
+  starts on that sample, with no delay: the same sample the trajectory
+  tracker latches its arc on, ~40 ms after the jump command. From the jump
+  command until then the wheel torques are zero (no momentum bleed through
+  the push).
+- **Landing**: an impact (|f| > 1.25 g) in DESCENT or LANDING stops attitude
+  control, resets the integrator and the wheel-rest ramp bleeds the wheels'
+  momentum into the ground (this replaces the stationary-for-1-s rest
+  trigger). Not in TAKEOFF or ASCENT: the spring's wind-back 0.4 s after the
+  release reads up to ~1250 g in flight.
+- **Bounces**: airborne again after |f| < 0.5 g for 60 ms without a break
+  (rocking or sliding on the ground dips below 0.5 g too, mostly for < 20 ms).
+
+The estimate ignores the first 10 ms after a start or reset
+(`IMU_START_SETTLE_TIME`): the wound foot settling onto its stop jolts the
+base (~30 g for 2 samples on the Moon), which would read as an impact. A
+known limit of the IMU alone: a robot toppling over a leg edge is partly in
+free fall, and after 60 ms below 0.5 g control switches on while it is
+still touching.
+
+At each lift-off the controller starts with a fresh integrator and the current
+heading as yaw reference. The simulator's own contact (`in_contact`, airborne
+again after 60 ms without contact, `FLIGHT_DEBOUNCE`) still drives the hop
+phases, the lidar, the scan and the tracker's restarts; moving those to the
+IMU too is the next step. Disable gating with
+`JumperSimulation(..., contact_gating=False)`.
 
 ## Hop phases and attitude reference
 
@@ -310,8 +335,8 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 - Leaving the ground without a jump (pushed, rolled off a rim) is DESCENT.
 - The program starts in DESCENT (the robot may be in the air) and settles to
   GROUND; so does a reset (`R`).
-- Attitude control itself is still switched by ground contact (next section
-  up): off from touchdown, on 60 ms after lift-off.
+- Attitude control itself is switched by the IMU's contact estimate (next
+  section up): on at the jump's cutoff (still in TAKEOFF), off at the impact.
 
 The vertical velocity is integrated from the accelerometer (free flight reads
 ~0 g on the way up and down, so the sign of the integrated velocity, not the

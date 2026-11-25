@@ -324,7 +324,6 @@ class SimulationTests(unittest.TestCase):
         for _ in range(int(1.2 * FLIGHT_DEBOUNCE / self.model.opt.timestep)):
             simulation._update_contact_phase(False)
         self.assertFalse(simulation.in_contact)
-        self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
         self.assertEqual(simulation.contact_phases, 1)
 
     def test_lift_off_holds_current_heading(self) -> None:
@@ -332,15 +331,14 @@ class SimulationTests(unittest.TestCase):
         yaw = 0.7
         self.data.qpos[3:7] = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         mujoco.mj_forward(self.model, self.data)
-        simulation._update_contact_phase(True)
-        for _ in range(int(1.5 * FLIGHT_DEBOUNCE / self.model.opt.timestep)):
-            simulation._update_contact_phase(False)
+        simulation._set_airborne(False)  # the IMU's contact estimate
+        simulation._set_airborne(True)
         self.assertAlmostEqual(simulation.yaw_reference, yaw, places=9)
 
     def test_disabled_wheels_stay_disabled_through_contact_changes(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr")
         simulation.handle_key("x")
-        simulation._update_contact_phase(True)
+        simulation._set_airborne(False)
         self.assertIs(simulation.wheel_control_mode, WheelControlMode.DISABLED)
         simulation.handle_key("c")
         self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
@@ -596,6 +594,61 @@ class SimulationTests(unittest.TestCase):
         self.assertIsNotNone(lift_off)
         self.assertIsNotNone(touchdown)
         self.assertGreater(touchdown - lift_off, 1.0)  # the whole hop (~1.26 s)
+
+    def test_attitude_control_runs_from_the_imu_cutoff_to_the_impact(self) -> None:
+        # Gated on the IMU's estimate, not the simulator's contact: wheel
+        # torques zero through the push (no bleed), control from the cutoff
+        # sample (60 ms before the contact debounce ends), off at the impact.
+        for gravity in (MOON_GRAVITY, EARTH_GRAVITY):
+            with self.subTest(gravity=gravity):
+                self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+                self.data = mujoco.MjData(self.model)
+                simulation = JumperSimulation(self.model, self.data, "lqr", gravity=gravity)
+                for joint_id, speed in zip(simulation.ids.wheel_joints, (3.0, -2.0, 1.0)):
+                    self.data.qvel[self.model.jnt_dofadr[joint_id]] = speed
+                while self.data.time < 1.0:
+                    simulation.step()
+                self.assertIs(simulation.wheel_control_mode, WheelControlMode.RESTING)
+                simulation.handle_key("space")
+                push_torques = []
+                while self.data.time < 1.5:
+                    simulation.step()
+                    if simulation.estimated_airborne:
+                        break
+                    push_torques.extend(float(self.data.ctrl[a]) for a in simulation.ids.wheel_actuators)
+                self.assertTrue(push_torques)
+                self.assertEqual(max(map(abs, push_torques)), 0.0)
+                # Control starts on the cutoff sample, still in TAKEOFF.
+                self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
+                self.assertTrue(simulation.trajectory.ballistic)
+                self.assertAlmostEqual(simulation.trajectory.cutoff_time + self.model.opt.timestep,
+                                       float(self.data.time), places=6)
+                self.assertIs(simulation.phase, FlightPhase.TAKEOFF)
+                self.assertTrue(simulation.in_contact)  # the debounce has not ended yet
+                touched = False
+                while simulation.estimated_airborne and self.data.time < 12.0:
+                    touched = touched or simulation.robot_touches_terrain()
+                    simulation.step()
+                    self.assertIs(simulation.wheel_control_mode,
+                                  WheelControlMode.STABILIZING if simulation.estimated_airborne
+                                  else WheelControlMode.RESTING)
+                self.assertFalse(simulation.estimated_airborne)
+                self.assertTrue(touched or simulation.robot_touches_terrain())  # off at the impact
+
+    def test_start_up_jolt_does_not_read_as_an_impact(self) -> None:
+        # The wound foot settling onto its stop jolts the base (~30 g) in the
+        # first steps after a start or reset: started in free flight, attitude
+        # control must stay on throughout.
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        for _ in range(2):
+            self.data.qpos[2] = 50.0
+            self.data.qvel[2] = 3.0
+            mujoco.mj_forward(self.model, self.data)
+            for _ in range(200):
+                simulation.step()
+                self.assertTrue(simulation.estimated_airborne)
+                self.assertIs(simulation.wheel_control_mode, WheelControlMode.STABILIZING)
+            simulation.reset()
 
     def test_jump_latches_the_imu_arc_at_cutoff_and_again_for_the_bounce(self) -> None:
         simulation = JumperSimulation(self.model, self.data, "lqr", gravity=EARTH_GRAVITY)
