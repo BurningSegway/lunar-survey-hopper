@@ -628,9 +628,14 @@ def limit_wheel_command(
     joint_id: int,
     command: float,
     tuning: ReactionWheelTuning,
+    time_step: float | None = None,
 ) -> float:
+    """Clip a wheel torque to the motor limit, and to what keeps the wheel
+    below its speed limit while the torque is held for ``time_step`` (the
+    control period; default the physics step)."""
     wheel_velocity = float(data.qvel[model.jnt_dofadr[joint_id]])
-    time_step = float(model.opt.timestep)
+    if time_step is None:
+        time_step = float(model.opt.timestep)
     effective_inertia = wheel_effective_inertia(tuning)
     max_motor_torque = effective_inertia * tuning.max_wheel_acceleration
     limited_command = max(-max_motor_torque, min(max_motor_torque, command))

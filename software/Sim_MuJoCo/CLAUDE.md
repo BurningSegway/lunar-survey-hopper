@@ -64,7 +64,7 @@ Model tests need the generated `build/terrain_height.bin`
 |---|---|
 | `cube_model.py` | Report ch. 4: `SENSOR_CUBE` (CAD J_c, J_w,i, mass), `JUMP_SPRING` x4, `ROBOT_MASS`; gyrostat `dynamics` f(x, u) (scalar-last quaternion), `jacobians` (4.18-4.19), `linearize` (reduced A_r, B_r at Omega_hat), `controllability_matrix`, `wheel_accelerations`. Input u = wheel motor torque tau: (J_c - J_w) w_dot = -tau - S(w) H (user's choice; replaced Omega_dot). `WheelMotor`/`WHEEL_MOTOR`: the bench-measured wheel motor (torque limit 0.43 N*m placeholder, torque falling with speed above 5.13 rev/s to 0 at 18.34 rev/s while speeding up, no lag), used only by the zero-g comparison's `--motor-limits` (its default is ideal motors, user's choice: the report figures compare the models without actuator dynamics). `report_dynamics` is (4.15) as written (10 states, its tau = J_w Omega_dot, J_c^-1), `motor_torque` converts; `model_comparison/compare.py` checks MuJoCo against it in zero g (bearing friction off, foot settled into its limit first) |
 | `controller.py` | PID and the report's LQR (ch. 5) as the script's LQI: u = tau = -K_bar [q_err_vec, w - w_ref, x_I] (torque straight to the motors, clipped at the motor limit), `augment`, `tracking_feedforward`, CARE by matrix sign function, Bryson's rule + anti-windup via `LqrLimits`, fixed gain at Omega_hat = 0 (optional rescheduling at measured wheel speeds); `reference_rate`, bearing-friction feedforward, wheel limits, wheel-rest ramp, `robot_inertia` (at qpos0 = the flight pose) |
-| `simulation.py` | `JumperSimulation`: one control step + `mj_step`; contact gating on the IMU estimate (`estimated_airborne`, `_set_airborne`: attitude control from its lift-off to its impact, wheel momentum bleed otherwise, wheel torques zero from the jump command to the cutoff; the estimate skips the first 10 ms after a start/reset, `IMU_START_SETTLE_TIME`); sim contact `in_contact` (60 ms flight debounce) still drives phases, lidar, scan, tracker restarts; jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
+| `simulation.py` | `JumperSimulation`: one physics step (`mj_step`, 1 ms) with the attitude controller every 10th (100 Hz, torques held); contact gating on the IMU estimate (`estimated_airborne`, `_set_airborne`: attitude control from its lift-off to its impact, wheel momentum bleed otherwise, wheel torques zero from the jump command to the cutoff; the estimate skips the first 10 ms after a start/reset, `IMU_START_SETTLE_TIME`); sim contact `in_contact` (60 ms flight debounce) still drives phases, lidar, scan, tracker restarts; jump sequence; wires lidar, flight phase, hop reference and scanning together; `LidarLandingReference` (lidar batches -> ground map, fits every 50 ms) |
 | `flight_phase.py` | Hop phase state machine GROUND / TAKEOFF / ASCENT / DESCENT / LANDING (jump command, 0.5 m above stance from integrated IMU vertical velocity, apex, touchdown near (landing plane's near-touchdown rule) or contact, still 0.5 s); all behaviours key off it. Starts in DESCENT |
 | `flight_reference.py` | Hop reference: TAKEOFF holds the attitude `start_flight` gets, on a jump the one at the jump command (`_jump_attitude` in `simulation.py`, before the push turned the body; user's request, 2026-11-24; measured with control starting 8 ms after lift-off, emulating the cutoff: the old hold was the attitude at control start, 1.1-1.4 deg off the pre-jump one; since the IMU gate (2026-11-25) control starts at the cutoff, in TAKEOFF, so the hold is used), on a bounce the lift-off attitude; on a jump's ascent body -z points at a settable world target, tilt cap 60 deg, and on into the descent for half the ascent's time (user's stand-in for a landing-spot criterion); then back to level, then the landing plane, updated until impact. Heading: the yaw reference (lift-off heading) throughout (face-travel went with the AS-DT1; `--spin` was removed for now, user's choice). Slew limit 180 deg/s |
 | `ray_casting.py` | Exact fast heightfield ray caster (matches `mj_multiRay`; skips 8x8-cell blocks the ray passes above their highest vertex, block looked up at the skipped segment's middle: ~5x fewer march steps, 2.4-3x faster; its cost is set by the number of march steps, i.e. ray length, more than by ray count) and a mesh ray caster for objects on it (einsum, not `@`: OpenBLAS threading made it 2-3x slower); site/geom names. The RealSense D435 depth camera that used to live here was removed (lidar only) |
@@ -295,25 +295,28 @@ above the ground (starting in it, the firm foot ejects the robot).
   ground). Clipping does not affect the timing: the cutoff (a drop below
   0.5 g) and the impact spike detect the same when clipped. Also still open:
   latency and an attitude estimator (the sim uses the true attitude).
-- Control rate: 100 Hz (user's decision, not done yet). The control law is
-  designed for it and the robot runs it at 100 Hz, but the sim computes a
-  new wheel torque every 1 ms physics step (1 kHz): `JumperSimulation.step`
-  calls `compute_torque` with `model.opt.timestep`. Change it to update the
-  attitude controller (and its attitude/rate/wheel-speed reads) every 10
-  physics steps and hold the torque in between (zero-order hold, as the
-  ODrive's torque setpoint does); keep physics at 1 ms. Everything that
-  takes `model.opt.timestep` as the controller's period must take the
-  control period instead: the LQI/PID integrators, `reference_rate`'s
-  finite difference, `WheelRestController` (its deceleration step), and
-  `limit_wheel_command`'s speed-headroom check (it assumes the command lasts
-  1 ms; held for 10 ms a wheel can pass the speed limit). Check whether the
-  user's script designs the gain in continuous time (now: CARE, `lqr`) or
-  discretised at 0.01 s (`c2d`/`dlqr`); match it, and the gain test with it.
-  Decide separately (with the user) the rate of the IMU-side parts
-  (trajectory tracker, phase detection: the MTi-610 gives 400 Hz-2 kHz).
-  Measure 100 Hz vs 1 kHz on all three benchmarks. Note `RW_PID.cpp`'s
-  `pumpEvents` delays each loop 10 ms on the MCP2515, so the robot cannot
-  run faster than ~100 Hz with it.
+- Control rate: 100 Hz done (2026-11-25, `CONTROL_PERIOD`,
+  `control_period=`): the wheel block of `_apply_controls` runs every 10th
+  physics step (1 ms physics kept) and the torque is held (ZOH); the
+  integrators, `reference_rate`, `WheelRestController` and
+  `limit_wheel_command` (new `time_step` argument) take the control
+  period; the jump command zeroes the held wheel torque at once (no bleed
+  through the push). Gain kept continuous (the script's printed gains are
+  the CARE solution; `dlqr` at 0.01 s gives 744 / 123 / 692, 3-4 % lower;
+  fastest closed-loop pole 3.7 rad/s, the ZOH loop's largest |z| 0.984).
+  `control_period=0.001` reproduces the 1 kHz code exactly (checked on
+  the contact and lqr benchmarks). Measured 1 kHz -> 100 Hz on the CPU
+  caster (the GPU was unavailable): lqr the same (IAE -1..+2 %); landing
+  median 0.39 -> 0.46, p90 0.99 -> 1.43 deg (3 m better, 6/10 m worse,
+  two 6 m hops 0.9 -> 2.3 and 1.0 -> 1.8 deg); contact (gated) touchdown
+  median 0.36 -> 0.33 deg, tip-overs 2 -> 0; ungated wheels now stop at
+  19.53 rev/s (97.7 %, just under the benchmark's 98 % "saturated"
+  threshold, so its sat% reads 0). Take-off: apex errors and wheel speeds
+  within 0.6 deg / 0.15 rev/s. Still to decide with the user: the rate of
+  the IMU-side parts (tracker, contact estimate, phases; the MTi-610 gives
+  400 Hz-2 kHz) and of the hop reference (`flight_reference.update`), all
+  still every 1 ms step. Note `RW_PID.cpp`'s `pumpEvents` delays each
+  loop 10 ms on the MCP2515, so the robot cannot run faster than ~100 Hz.
 - Wheels in the sim vs the robot (for the port): the wheels are propagated
   by MuJoCo only (hinge joints driven by ideal torque motors, viscous
   bearing friction = joint damping 0.01 N*m*s/rad, gyroscopic coupling from

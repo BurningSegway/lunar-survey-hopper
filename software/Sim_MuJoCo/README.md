@@ -241,6 +241,21 @@ function, no dependencies).
   wheel speeds move 2 rad/s, so it matches the momentum the wheels hold. The
   torque goes to the motors as it is (ODrive torque mode), clipped to the
   motor limit, plus the bearing-friction feedforward.
+- **Rate: 100 Hz**, as on the robot (`CONTROL_PERIOD`,
+  `JumperSimulation(control_period=...)`), on MuJoCo's 1 ms physics: every
+  10th step the controller reads the attitude, rates and wheel speeds and
+  sets new wheel torques, which are held until the next update (zero-order
+  hold, as the ODrive's torque setpoint). The integrators, the reference-rate
+  difference, the wheel-rest ramp and the speed-limit check (a torque held
+  10 ms must not take a wheel past 20 rev/s) use the 10 ms period. The gain
+  stays the script's continuous-time `lqr` design (its printed gains match
+  the continuous Riccati solution; `dlqr` at 0.01 s would give 3-4 % lower
+  gains): the closed loop is slow next to 100 Hz (fastest pole 3.7 rad/s).
+  The IMU side (trajectory tracker, contact estimate, phases) and the hop
+  reference still run every 1 ms step. Measured against 1 kHz (CPU caster,
+  2026-11-25): free flight the same (IAE within 2 %); landing benchmark
+  median 0.39 -> 0.46 deg, p90 0.99 -> 1.43; contact benchmark (gated)
+  touchdown median 0.36 -> 0.33 deg, no tip-overs (2 at 1 kHz).
 
 **Simulated plant.** `build/fit_robot_model.py` writes `SENSOR_CUBE` and the
 springs into `build/Jumping_Robot.xml`: wheel inertias, the base's mass and

@@ -11,6 +11,7 @@ import mujoco
 import numpy as np
 
 from jumper_sim.simulation import (
+    CONTROL_PERIOD,
     EARTH_GRAVITY,
     FLIGHT_DEBOUNCE,
     JUMP_WINDUP_FORCE,
@@ -920,11 +921,38 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(command, expected)
 
+        # Held for the 10 ms control period, the wheel may gain only that much.
+        held = limit_wheel_command(self.model, self.data, joint_id, 100.0, tuning, CONTROL_PERIOD)
+        self.assertAlmostEqual(held, wheel_effective_inertia(tuning) * speed_headroom / CONTROL_PERIOD)
+
         self.data.qvel[dof_id] = tuning.max_wheel_velocity
         self.assertEqual(
             limit_wheel_command(self.model, self.data, joint_id, 100.0, tuning),
             0.0,
         )
+
+    def test_attitude_control_runs_at_the_control_period_with_held_torques(self) -> None:
+        # 100 Hz control on 1 ms physics: new wheel torques every 10th step
+        # (reading the state of that step), held in between.
+        simulation = JumperSimulation(self.model, self.data, "lqr")
+        self.assertAlmostEqual(simulation.control_period, CONTROL_PERIOD)
+        self.assertAlmostEqual(CONTROL_PERIOD, 0.01)
+        self.data.qpos[2] = 50.0
+        self.data.qpos[3:7] = (math.cos(0.1), math.sin(0.1), 0.0, 0.0)  # 11.5 deg off level
+        self.data.qvel[3:6] = (0.3, -0.2, 0.1)
+        mujoco.mj_forward(self.model, self.data)
+        torques = []
+        for _ in range(100):
+            simulation.step()
+            torques.append([float(self.data.ctrl[a]) for a in simulation.ids.wheel_actuators])
+        torques = np.array(torques)
+        steps = round(CONTROL_PERIOD / self.model.opt.timestep)
+        changed = [k for k in range(1, len(torques)) if np.any(torques[k] != torques[k - 1])]
+        self.assertTrue(changed)
+        self.assertTrue(all(k % steps == 0 for k in changed))
+        self.assertGreater(np.abs(torques).max(), 0.0)
+        with self.assertRaises(ValueError):
+            JumperSimulation(self.model, self.data, "lqr", control_period=0.0025)
 
     def test_reset_clears_jump_and_disabled_state(self) -> None:
         self.simulation.handle_key("space")

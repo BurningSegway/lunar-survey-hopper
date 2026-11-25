@@ -45,6 +45,12 @@ from .trajectory import TrajectoryTracker
 
 EARTH_GRAVITY = 9.81
 MOON_GRAVITY = 1.62
+# The attitude controller's period (user's decision: the robot runs it at
+# 100 Hz; `RW_PID.cpp`'s CAN pump delays each loop ~10 ms). Physics stays at
+# the model's 1 ms; the controller reads attitude, rates and wheel speeds
+# every CONTROL_PERIOD and the wheel torques are held in between
+# (zero-order hold, as the ODrive's torque setpoint).
+CONTROL_PERIOD = 0.01
 JUMP_RELEASE_DURATION = 0.4
 JUMP_CYCLE_DURATION = 3.0
 # Holds the foot against the wound stop: 25 % above the jump springs' force
@@ -237,9 +243,18 @@ class JumperSimulation:
         target_scan: PointCloudRecorder | None = None,
         gravity: float = MOON_GRAVITY,
         lidar: LidarSpec | None = None,
+        control_period: float = CONTROL_PERIOD,
     ) -> None:
         self.model = model
         self.data = data
+        timestep = float(model.opt.timestep)
+        steps = round(control_period / timestep)
+        if steps < 1 or abs(steps * timestep - control_period) > 1e-9:
+            raise ValueError(f"control period {control_period} s is not a multiple of "
+                             f"the physics step {timestep} s")
+        self.control_period = steps * timestep
+        self._control_steps = steps
+        self._steps_to_control = 0  # physics steps until the next control update
         self.ids = find_model_ids(model)
         self.tuning = tuning
         self.default_gravity = gravity
@@ -421,6 +436,7 @@ class JumperSimulation:
         self._time_without_contact = math.inf
         self.contact_phases = 0
         self.flight_phase.reset()
+        self._steps_to_control = 0
         self._previous_velocity = None
         self.ground_contact.reset()
         self.estimated_airborne = self.ground_contact.airborne
@@ -459,6 +475,8 @@ class JumperSimulation:
             # No wheel momentum bleed through the push: the wheel torques are
             # zero from here until attitude control starts at the cutoff.
             self.wheel_rest_controller.cancel()
+            for actuator_id in self.ids.wheel_actuators:
+                self.data.ctrl[actuator_id] = 0.0  # not the held bleed torque
         self._jump_command = True  # GROUND -> TAKEOFF
 
     def set_track_target(self, target: tuple[float, float] | None) -> None:
@@ -952,7 +970,14 @@ class JumperSimulation:
                 self.wheel_control_mode = WheelControlMode.STABILIZING
 
     def _apply_controls(self) -> None:
-        if self.wheel_control_mode is not WheelControlMode.DISABLED:
+        control_update = self._steps_to_control == 0
+        self._steps_to_control = (self._steps_to_control - 1) % self._control_steps
+        if self.wheel_control_mode is WheelControlMode.DISABLED:
+            self._previous_reference = None
+            for actuator_id in self.ids.wheel_actuators:
+                self.data.ctrl[actuator_id] = 0.0
+        elif control_update:
+            period = self.control_period
             # Both controllers work on the body-frame quaternion error to the
             # reference attitude, which lines up with the gyro rates and wheel
             # axes at any attitude.
@@ -966,17 +991,13 @@ class JumperSimulation:
                 # so a turning reference (target tracking) is followed without lag.
                 rates = rates - reference_rate(
                     self._previous_reference, reference, attitude,
-                    float(self.model.opt.timestep), REFERENCE_RATE_FEEDFORWARD_LIMIT,
+                    period, REFERENCE_RATE_FEEDFORWARD_LIMIT,
                 )
             self._previous_reference = reference
             sensor = SensorData(*quaternion_error(attitude, reference), *(float(v) for v in rates))
             wheel_speeds = self.read_wheel_speeds()
-            torques = self.controller.compute_torque(
-                sensor, wheel_speeds, float(self.model.opt.timestep)
-            )
-            rest_torques = self.wheel_rest_controller.compute_motor_torques(
-                wheel_speeds, float(self.model.opt.timestep)
-            )
+            torques = self.controller.compute_torque(sensor, wheel_speeds, period)
+            rest_torques = self.wheel_rest_controller.compute_motor_torques(wheel_speeds, period)
             body_torques = (torques.tau_x, torques.tau_y, torques.tau_z)
             rest_values = (rest_torques.x, rest_torques.y, rest_torques.z)
             for actuator_id, joint_id, body_torque, rest_torque in zip(
@@ -998,12 +1019,9 @@ class JumperSimulation:
                     attitude_command, rest_torque, self.tuning
                 )
                 self.data.ctrl[actuator_id] = limit_wheel_command(
-                    self.model, self.data, joint_id, command, self.tuning
+                    self.model, self.data, joint_id, command, self.tuning, period
                 )
-        else:
-            self._previous_reference = None
-            for actuator_id in self.ids.wheel_actuators:
-                self.data.ctrl[actuator_id] = 0.0
+        # Between control updates the wheel torques are held.
 
         # Leg force = spring stiffness x shortening (open loop); tipped over:
         # pull every leg in to the end of its stroke.
