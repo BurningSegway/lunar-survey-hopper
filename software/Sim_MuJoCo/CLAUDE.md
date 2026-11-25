@@ -222,6 +222,30 @@ above the ground (starting in it, the firm foot ejects the robot).
   - Stationary -> GROUND: the existing stillness rule (|f| - g < 0.5 m/s^2,
     rate < 0.2 rad/s for 0.5 s) without the contact condition.
   Measure each change (take-off wheel speeds, tracking, landing benchmark).
+- Freeze the arc later than the cutoff (user: "should definitely be
+  changed", 2026-11-25; not done yet). Today `TrajectoryTracker.update`
+  latches p, v0 on the first sample < 0.5 g after > 1.25 g. After that the
+  foot and springs keep pushing the body up for a while (in-flight |f| is
+  ~3 g on the Moon within ~10 ms of lift-off, median 0.12 g over the first
+  0.4 s), so the arc comes out too low. Keep integrating for a delay after
+  the cutoff and latch then. Measured offline (2026-11-25: six tracked hops,
+  targets (10, 5), (-6, 12), (15, 0), Moon and Earth, IMU log replayed through
+  the tracker with the latch moved; error = arc vs true base path, cm, mean
+  over 3 hops): Moon jump touchdown 50 (0 ms) / 35 (10) / 21 (20) / 5 (40) /
+  11 (60) / 10 (100) / 24 (250), apex 24 -> 3 (40 ms) / 6 (60 ms); Moon
+  bounces (6) touchdown 61 -> 7 (40 ms) / 16 (60 ms); Earth jump touchdown
+  6.8 -> 2.9 cm (60 ms), its bounce 12 -> 2 cm. The error is nearly all
+  vertical (horizontal 3-7 cm throughout); worse again beyond ~150 ms. 40 vs
+  60 ms is within the scatter of 3 hops. 60 ms is the controller's bounce
+  delay (`GroundContactConfig.bounce_free_fall_time`), so one constant could
+  cover both; on jumps the controller itself starts at the cutoff. Costs
+  nothing for the landing fits (they start at the apex). Implement as a
+  `TrajectoryConfig` delay (bounces too: `touchdown` restarts integration,
+  the latch then waits the same delay), test it, re-measure with the landing
+  and contact benchmarks, and update the `trajectory.py` docstring, README
+  and the Layout row. On the robot the size of that post-cutoff push depends
+  on the real foot and springs (and the +-10 g clipping), so re-check the
+  delay there.
 - Tip catch at landing (user's idea, ON HOLD: don't implement yet). After
   impact, if the robot is about to topple over a leg edge, spend the wheels'
   full momentum to stop it. Its own law (an inverted pendulum about the
