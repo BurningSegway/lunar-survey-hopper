@@ -325,10 +325,15 @@ free fall, and after 60 ms below 0.5 g control switches on while it is
 still touching.
 
 At each lift-off the controller starts with a fresh integrator and the current
-heading as yaw reference. The simulator's own contact (`in_contact`, airborne
-again after 60 ms without contact, `FLIGHT_DEBOUNCE`) still drives the hop
-phases, the lidar, the scan and the tracker's restarts; moving those to the
-IMU too is the next step. Disable gating with
+heading as yaw reference. The same estimate is all the robot knows about
+ground contact: it also drives the hop phases (next section), the trajectory
+tracker's restarts, the lidar (scans while airborne), the target scan and the
+landing fits (up to the impact). Once the phases see the robot standing still
+(GROUND), a flight the estimate still holds ends (a landing too soft to read
+as an impact). The simulator's own contact (`in_contact`, airborne again
+after 60 ms without contact, `FLIGHT_DEBOUNCE`) is kept only as ground truth
+for tests and benchmarks; a test runs a hop with it blinded and gets exactly
+the same result. Disable gating with
 `JumperSimulation(..., contact_gating=False)`.
 
 ## Hop phases and attitude reference
@@ -339,10 +344,10 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 | Phase | Starts when | What happens |
 |---|---|---|
 | GROUND | still (~1 g, body rate < 0.2 rad/s) for 0.5 s after landing | leaning towards the target (next section); wheels spin down |
-| TAKEOFF | jump command (`Space`) | legs held as they are; once control starts (still in TAKEOFF), the attitude at the jump command is held: the last one before the push turned the body, with the lean towards the target |
-| ASCENT | airborne and 0.5 m above the standing height | the robot's bottom tracks the target, heading held; lidar scans |
+| TAKEOFF | jump command (`Space`) | legs held as they are through the push, straight from the IMU's lift-off (the cutoff); once control starts there (still in TAKEOFF), the attitude at the jump command is held: the last one before the push turned the body, with the lean towards the target |
+| ASCENT | airborne (IMU) and 0.5 m above the standing height | the robot's bottom tracks the target, heading held; lidar scans |
 | DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on for half the ascent's time; then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
-| LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or ground contact | the landing plane keeps updating until impact; legs straight |
+| LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or the IMU's impact | the landing plane keeps updating until impact; legs straight |
 
 - A hop that peaks below 0.5 m skips ASCENT; a jump that does not leave the
   ground returns to GROUND after 0.5 s.
@@ -356,7 +361,7 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 The vertical velocity is integrated from the accelerometer (free flight reads
 ~0 g on the way up and down, so the sign of the integrated velocity, not the
 acceleration itself, marks the apex), and reset whenever the robot stands
-still. Ground contact still comes from the simulator. Phase changes are
+still. Ground contact is the IMU's estimate (previous section). Phase changes are
 printed to the console (`[PHASE] ...`, `[FLIGHT] ...`).
 
 Attitude reference per phase (`jumper_sim/flight_reference.py`): in ASCENT,
@@ -589,7 +594,8 @@ counts too:
    bounce counts) and only then are the position and velocity latched; from
    then on only gravity acts, so the arc is fixed until touchdown ends it. The spot only moves if the mapped ground along
    the arc does. The tracker then runs again for the bounce: on every step
-   in ground contact it restarts from the arc's position and velocity there,
+   the IMU's estimate has the robot on the ground it restarts from the arc's
+   position and velocity there,
    integrates through the impact, and latches the bounce's arc 60 ms after
    its cutoff (so an arc latched after a dip below 0.5 g while still sliding
    or rocking is thrown away again). Bounces are fitted along their own arc with the

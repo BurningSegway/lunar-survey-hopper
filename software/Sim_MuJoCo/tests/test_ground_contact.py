@@ -32,6 +32,16 @@ class GroundContactTests(unittest.TestCase):
         self.assertFalse(self.feed(estimator, 0.6, FlightPhase.TAKEOFF))  # still pushing a little
         self.assertTrue(self.feed(estimator, 0.2, FlightPhase.TAKEOFF))  # the cutoff: no delay
 
+    def test_standing_still_ends_a_missed_landing(self) -> None:
+        # A touchdown too soft to read as an impact: once the phases see the
+        # robot standing (GROUND), the flight ends; pushed off, it bounces.
+        estimator = GroundContactEstimator()
+        self.assertTrue(self.feed(estimator, 1.0, FlightPhase.LANDING, 500))
+        self.assertFalse(self.feed(estimator, 1.0, FlightPhase.GROUND))
+        self.assertFalse(self.feed(estimator, 1.0, FlightPhase.GROUND, 500))
+        self.assertFalse(self.feed(estimator, 0.0, FlightPhase.GROUND, 59))
+        self.assertTrue(self.feed(estimator, 0.0, FlightPhase.GROUND))
+
     def test_free_fall_before_the_push_is_not_a_lift_off(self) -> None:
         estimator = self.standing()
         self.assertFalse(self.feed(estimator, 0.1, FlightPhase.TAKEOFF, 5))

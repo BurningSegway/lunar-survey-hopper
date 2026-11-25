@@ -303,8 +303,8 @@ class JumperSimulation:
         self._terrain_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TERRAIN_GEOM)
         # Attitude control while the IMU estimate says airborne, wheel
         # momentum bleed-off otherwise (replaces the stationary-for-a-while
-        # rest trigger). ``in_contact`` is the simulator's contact, which
-        # still drives the phases, the lidar and the tracker's restarts.
+        # rest trigger). ``in_contact`` is the simulator's contact: ground
+        # truth for tests and benchmarks, nothing the robot does uses it.
         self.contact_gating = contact_gating
         self.in_contact = False
         self._time_without_contact = math.inf
@@ -608,28 +608,29 @@ class JumperSimulation:
         return (math.cos(half), 0.0, 0.0, math.sin(half))
 
     def step(self) -> None:
+        # The simulator's contact: ground truth for tests and benchmarks only.
         self._update_contact_phase(self.robot_touches_terrain())
-        if self.in_contact:
-            body = self.model.jnt_bodyid[self.ids.root_joint]
-            self.last_ground_z = float(self.data.xpos[body][2])
         if not self.contact_gating:
-            # With gating the wheel mode follows the contact phase instead.
+            # With gating the wheel mode follows the IMU's contact estimate instead.
             self._update_wheel_rest_state()
         phase = self._update_flight_phase()
+        if not self.estimated_airborne:
+            body = self.model.jnt_bodyid[self.ids.root_joint]
+            self.last_ground_z = float(self.data.xpos[body][2])
         self._sample_actual_path()
         if self.landing_reference is not None and self.trajectory.ballistic:
             tracker = self.trajectory
             self.landing_reference.set_arc(tracker.arc_time, tracker.arc_position,
                                            tracker.arc_velocity)
-        if not self.in_contact:
+        if self.estimated_airborne:
             self._lidar_step()
         if self.landing_reference is not None:
             # Without the hop reference: fit the ground whenever airborne.
             # With it: only on the way down (the jump's points so far include
             # the ascent's), until the moment of impact.
-            # Only along an arc: a hop's, or a bounce's (latched as it
-            # leaves the ground).
-            fit = not self.in_contact and self.trajectory.ballistic and (
+            # Only along an arc: a hop's, or a bounce's (latched 60 ms
+            # after it leaves the ground).
+            fit = self.estimated_airborne and self.trajectory.ballistic and (
                 phase in (FlightPhase.DESCENT, FlightPhase.LANDING)
                 or self.flight_reference is None
             )
@@ -651,38 +652,24 @@ class JumperSimulation:
             )
         self._update_tipped()
         self._update_jump_aim()
-        if self._scan_open and self.in_contact:
+        if self._scan_open and not self.estimated_airborne:
             self._close_scan()  # touchdown
         self._apply_controls()
         mujoco.mj_step(self.model, self.data)
 
     def _update_contact_phase(self, touching: bool) -> None:
-        """Contact starts on the first touching step; flight needs a quiet spell."""
+        """The simulator's contact (ground truth only; nothing the robot does
+        uses it): contact starts on the first touching step, flight needs a
+        quiet spell."""
         if touching:
             self._time_without_contact = 0.0
-            # The arc ends; the tracker runs again for a bounce (restarted on
-            # every touching step, so it latches as the robot leaves).
-            self._record_arc()
-            self.trajectory.touchdown(float(self.data.time))
             if not self.in_contact:
                 self.in_contact = True
                 self.contact_phases += 1
-                if self._awaiting_touchdown:
-                    self._awaiting_touchdown = False
-                    self._record_touchdown()
             return
         self._time_without_contact += float(self.model.opt.timestep)
         if self.in_contact and self._time_without_contact >= FLIGHT_DEBOUNCE:
             self.in_contact = False
-            if self.flight_reference is not None:
-                # A jump, not a bounce: its scan starts (attitude control
-                # started earlier, at the IMU's cutoff).
-                track = self.phase is FlightPhase.TAKEOFF
-                if track and self.target_scan is not None:
-                    self.target_scan.start_jump()
-                    self._scan_open = True
-                    self._awaiting_touchdown = True
-                    self._scan_points_before = self.target_scan.point_count
 
     def _update_tipped(self) -> None:
         """Tipped over on the ground: pull the legs in as far as they go.
@@ -709,8 +696,13 @@ class JumperSimulation:
         phase = self.phase
         if self.jump_aim is None or target is None:
             return
-        if self.tipped or phase not in (FlightPhase.GROUND, FlightPhase.TAKEOFF):
-            # Straight legs from lift-off until the robot has settled again.
+        if (self.tipped or phase not in (FlightPhase.GROUND, FlightPhase.TAKEOFF)
+                or self.estimated_airborne):
+            # Straight legs from lift-off (the IMU's cutoff, still in TAKEOFF)
+            # until the robot has settled again. At the cutoff, so the legs'
+            # rebound falls inside the 60 ms the tracker integrates before it
+            # latches the arc (released at ASCENT, 0.5 m up, the Moon jump's
+            # arc was 14.6 cm off at touchdown instead of 11.2; user's choice).
             self.jump_aim.reset()
             self.leg_shortening = self.jump_aim.shortening
             self._aim_announced = False
@@ -840,21 +832,27 @@ class JumperSimulation:
         )
         self._previous_velocity = velocity
         specific_force = quaternion_to_matrix(quaternion).T @ (acceleration - self.model.opt.gravity)
-        self.trajectory.update(float(self.data.time), specific_force, quaternion,
-                               self.model.opt.gravity, dt)
-        if float(self.data.time) >= IMU_START_SETTLE_TIME - 1e-9:  # past the start-up jolt
+        time = float(self.data.time)
+        if time >= IMU_START_SETTLE_TIME - 1e-9:  # past the start-up jolt
             self._set_airborne(
                 self.ground_contact.update(
                     specific_force, gravity_magnitude(self.model.opt.gravity), dt, before),
                 track=before is FlightPhase.TAKEOFF,
             )
+        if not self.estimated_airborne:
+            # On the ground (IMU): the arc ends and the tracker runs again
+            # for a bounce, restarted on every such sample before it is
+            # integrated (so the impact is the bounce's push-off).
+            self._record_arc()
+            self.trajectory.touchdown(time)
+        self.trajectory.update(time, specific_force, quaternion, self.model.opt.gravity, dt)
         touchdown_near = (
             self.landing_reference is not None
             and self.landing_reference.plane.near_touchdown > self._near_at_descent
         )
         phase = self.flight_phase.update(
             specific_force, quaternion, gravity_magnitude(self.model.opt.gravity),
-            float(self.model.opt.timestep), self.in_contact,
+            float(self.model.opt.timestep), not self.estimated_airborne,
             body_rate=self.data.qvel[dof + 3 : dof + 6],
             jump=self._jump_command,
             touchdown_near=touchdown_near,
@@ -871,11 +869,12 @@ class JumperSimulation:
         self.estimated_airborne = airborne
         if airborne and not was_airborne:
             self._lift_off(track)
-        elif was_airborne and not airborne and self.contact_gating:
-            self._enter_contact_mode()
+        elif was_airborne and not airborne:
+            self._touch_down()
 
     def _lift_off(self, track: bool) -> None:
-        """Attitude control starts. ``track``: a jump, not a bounce."""
+        """Attitude control starts. ``track``: a jump, not a bounce (its
+        target is tracked and its scan starts)."""
         if self.contact_gating:
             self._enter_flight_mode()
         if self.flight_reference is None:
@@ -888,6 +887,20 @@ class JumperSimulation:
             self.yaw_reference,
             track,
         )
+        if track and self.target_scan is not None:
+            self.target_scan.start_jump()
+            self._scan_open = True
+            self._awaiting_touchdown = True
+            self._scan_points_before = self.target_scan.point_count
+
+    def _touch_down(self) -> None:
+        """The IMU's impact (or the robot seen standing): attitude control
+        stops, the wheels bleed; a scanned jump's touchdown is stored."""
+        if self.contact_gating:
+            self._enter_contact_mode()
+        if self._awaiting_touchdown:
+            self._awaiting_touchdown = False
+            self._record_touchdown()
 
     def _enter_phase(self, phase: FlightPhase) -> None:
         if phase is FlightPhase.GROUND:
@@ -914,7 +927,7 @@ class JumperSimulation:
                     if self.flight_reference.tracking
                     else "[FLIGHT] Descent: levelling until the landing spot is seen."),
                 FlightPhase.LANDING: "[PHASE] Landing: touchdown close."
-                if not self.in_contact else "[PHASE] Landing: ground contact.",
+                if self.estimated_airborne else "[PHASE] Landing: ground contact.",
             }[phase]
         self.flight_events.append(message)
 

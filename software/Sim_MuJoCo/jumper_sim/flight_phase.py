@@ -14,7 +14,9 @@ for. Transitions:
 * DESCENT -> LANDING: touchdown is near (the landing-plane filter's rule:
   plane < 1 m below or < 0.3 s away), or ground contact as a backup.
 * LANDING -> GROUND: standing still (accelerometer ~1 g, low body rate) for
-  ``settle_time``. Bounces stay in LANDING.
+  ``settle_time``, whatever the contact input says (in free flight the
+  accelerometer reads ~0, so ~1 g means the ground carries the robot).
+  Bounces stay in LANDING.
 * GROUND -> DESCENT: airborne without a jump (pushed off, rolled over a rim).
 The detector starts in DESCENT: at start-up the robot may be in the air.
 
@@ -32,8 +34,9 @@ Whenever the robot is standing still on the ground (accelerometer reading ~1 g
 for a short while), the estimate is reset to zero so integration drift cannot
 build up between hops.
 
-Ground contact still comes from the simulator; the rest is pure numpy and
-meant to run unchanged on the robot from real IMU samples. (In the simulator
+``in_contact`` is the IMU's ground contact estimate (ground_contact.py); the
+whole module is pure numpy and meant to run unchanged on the robot from real
+IMU samples. (In the simulator
 the accelerometer is synthesised from the body's velocity change per step;
 see JumperSimulation._update_flight_phase.)
 """
@@ -129,9 +132,8 @@ class FlightPhaseDetector:
         vz = self.estimator.update(specific_force_body, body_quaternion, gravity, dt, in_contact)
         force = float(np.linalg.norm(specific_force_body))
         rate = 0.0 if body_rate is None else float(np.linalg.norm(body_rate))
-        still = (
-            in_contact
-            and abs(force - gravity) < self.config.still_tolerance
+        still = (  # no contact condition: ~1 g is the ground carrying the robot
+            abs(force - gravity) < self.config.still_tolerance
             and rate < self.config.settle_rate
         )
         self._settled_for = self._settled_for + dt if still else 0.0

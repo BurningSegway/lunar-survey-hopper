@@ -23,15 +23,20 @@ before this sample):
 * Landing (DESCENT or LANDING): an impact, |f| > ``impact_force``, ends the
   flight. Not in TAKEOFF or ASCENT: the spring's wind-back 0.4 s after the
   release reads up to ~1250 g in flight.
+* Standing still: the hop phases reach GROUND on stillness (~1 g, low body
+  rate for 0.5 s); a flight the estimate still holds then ends (a landing
+  too soft to read as an impact).
 * Bounces (and leaving the ground without a jump): airborne again only after
   |f| < ``free_fall_force`` for ``bounce_free_fall_time`` without a break.
   Rocking or sliding on the ground also dips below it, mostly for < 20 ms
   (measured over hops and drops: 60 ms catches every bounce > 0.1 s, 60 ms
   median after the true lift-off).
 
-It gates attitude control in JumperSimulation (on from lift-off to impact,
-wheel momentum bleed otherwise); the hop phases still use the simulator's
-contact for now.
+JumperSimulation uses it wherever the robot needs to know whether it is
+off the ground: attitude control (on from lift-off to impact, wheel momentum
+bleed otherwise), the hop phases, the trajectory tracker's restarts, the
+lidar, the scan and the landing fits. The simulator's contact is kept only
+as ground truth for tests and benchmarks.
 
 Pure numpy, meant to run unchanged on the robot from real IMU samples.
 """
@@ -84,6 +89,8 @@ class GroundContactEstimator:
         self._free_fall_for = self._free_fall_for + dt if free_fall else 0.0
         if phase is not FlightPhase.TAKEOFF:
             self._launched = False
+        if self.airborne and phase is FlightPhase.GROUND:
+            self.airborne = False  # seen standing still: a missed landing
         if self.airborne:
             if (phase in (FlightPhase.DESCENT, FlightPhase.LANDING)
                     and force > config.impact_force):

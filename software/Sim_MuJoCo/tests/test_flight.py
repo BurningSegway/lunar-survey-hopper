@@ -68,6 +68,22 @@ class FlightPhaseTests(unittest.TestCase):
             detector.update(np.array([0.0, 0.0, G]), LEVEL, G, DT, True, body_rate=np.zeros(3))
         self.assertIs(detector.phase, FlightPhase.GROUND)
 
+    def test_standing_still_settles_whatever_the_contact_input(self) -> None:
+        # A landing the contact estimate missed: still ~1 g, no rotation.
+        detector = FlightPhaseDetector()
+        detector.phase = FlightPhase.LANDING
+        steps = 0
+        while detector.phase is FlightPhase.LANDING and steps < 1000:
+            detector.update(np.array([0.0, 0.0, G]), LEVEL, G, DT, False, body_rate=np.zeros(3))
+            steps += 1
+        self.assertIs(detector.phase, FlightPhase.GROUND)
+        self.assertAlmostEqual(steps * DT, detector.config.settle_time, delta=2 * DT)
+        # Free fall is never still.
+        detector.phase = FlightPhase.LANDING
+        for _ in range(2000):
+            detector.update(np.zeros(3), LEVEL, G, DT, False, body_rate=np.zeros(3))
+        self.assertIs(detector.phase, FlightPhase.LANDING)
+
     def test_rocking_robot_is_not_settled(self) -> None:
         detector = FlightPhaseDetector()
         for _ in range(2000):

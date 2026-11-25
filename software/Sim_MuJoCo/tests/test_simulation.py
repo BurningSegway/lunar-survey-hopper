@@ -512,7 +512,8 @@ class SimulationTests(unittest.TestCase):
         fit_phases = []
 
         def step(*args):
-            fit_phases.append((simulation.phase, simulation.in_contact))
+            fit_phases.append((simulation.phase, simulation.robot_touches_terrain(),
+                               simulation.estimated_airborne, float(self.data.time)))
             return original_step(*args)
 
         reference.step = step
@@ -523,8 +524,12 @@ class SimulationTests(unittest.TestCase):
         phases, errors, descent_errors = [], [], []
         scene = mujoco.MjvScene(self.model, maxgeom=10)
         sight_line = []  # (tracking, red line drawn) in the descent
+        imu_impacts = []
         while self.data.time < 6.0:
+            airborne = simulation.estimated_airborne
             simulation.step()
+            if airborne and not simulation.estimated_airborne:
+                imu_impacts.append(float(self.data.time))
             if not phases or phases[-1] is not simulation.phase:
                 phases.append(simulation.phase)
             error = simulation.flight_reference.axis_target_angle(
@@ -558,11 +563,15 @@ class SimulationTests(unittest.TestCase):
         self.assertIn((True, True), sight_line)
         self.assertIn((False, False), sight_line)
         self.assertTrue(all(tracking == line for tracking, line in sight_line))
-        # Fits on the way down, in LANDING too, up to the impact (not after).
+        # Fits on the way down, in LANDING too, up to the IMU's impact (not
+        # after): it reads the impact 0-6 ms after the true touch.
         self.assertTrue(fit_phases)
-        self.assertEqual({phase for phase, _ in fit_phases},
+        self.assertEqual({fit[0] for fit in fit_phases},
                          {FlightPhase.DESCENT, FlightPhase.LANDING})
-        self.assertNotIn(True, {contact for _, contact in fit_phases})
+        self.assertTrue(all(fit[2] for fit in fit_phases))
+        for _, touching, _, time in fit_phases:
+            if touching:
+                self.assertTrue(any(0.0 < impact - time <= 0.006 for impact in imu_impacts))
         self.assertGreater(simulation.landing_reference.plane.accepted, 0)
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))
@@ -638,6 +647,59 @@ class SimulationTests(unittest.TestCase):
                                   else WheelControlMode.RESTING)
                 self.assertFalse(simulation.estimated_airborne)
                 self.assertTrue(touched or simulation.robot_touches_terrain())  # off at the impact
+
+    def test_jump_aim_legs_straighten_at_the_imu_lift_off(self) -> None:
+        # Leaning towards the target, the legs hold their forces through the
+        # push and go straight at the cutoff (still in TAKEOFF), so their
+        # rebound is inside what the tracker integrates before its latch.
+        simulation = JumperSimulation(self.model, self.data, "lqr", track_target=(10.0, 5.0),
+                                      lidar=replace(LIVOX_MID360, point_fraction=0.01))
+        while self.data.time < 4.0:
+            simulation.step()
+        legs = lambda: [float(self.data.ctrl[a]) for a in simulation.ids.leg_actuators]
+        self.assertGreater(max(legs()), 0.0)
+        simulation.handle_key("space")
+        while not simulation.estimated_airborne and self.data.time < 4.5:
+            simulation.step()
+            if not simulation.estimated_airborne:
+                self.assertGreater(max(legs()), 0.0)  # held through the push
+        self.assertIs(simulation.phase, FlightPhase.TAKEOFF)
+        self.assertEqual(max(legs()), 0.0)
+        self.assertFalse(simulation.trajectory.ballistic)  # latched later
+
+    def test_nothing_the_robot_does_uses_the_simulator_contact(self) -> None:
+        # The robot has no contact sensor: with the simulator's contact query
+        # blind (never touching), a hop with its bounces, phases, scan and
+        # landing fits runs exactly the same.
+        runs = []
+        for blind in (False, True):
+            model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+            data = mujoco.MjData(model)
+            with tempfile.TemporaryDirectory() as folder:
+                recorder = PointCloudRecorder(Path(folder) / "scan.ply")
+                simulation = JumperSimulation(model, data, "lqr", gravity=EARTH_GRAVITY,
+                                              track_target=(2.0, 0.5), target_scan=recorder,
+                                              lidar=replace(LIVOX_MID360, point_fraction=0.01))
+                if blind:
+                    simulation.robot_touches_terrain = lambda: False
+                recorder.start_run()
+                states = []
+                while data.time < 5.0:
+                    if abs(data.time - 2.0) < 1e-9:
+                        simulation.handle_key("space")
+                    simulation.step()
+                    states.append((simulation.phase, simulation.estimated_airborne))
+                events = [e.replace(folder, "<folder>") for e in simulation.flight_events]
+                runs.append((data.qpos.copy(), states, events,
+                             recorder.point_count, simulation.landing_reference.plane.accepted))
+        (qpos, states, events, points, fits), blind_run = runs
+        np.testing.assert_array_equal(qpos, blind_run[0])
+        self.assertEqual(states, blind_run[1])
+        self.assertEqual(events, blind_run[2])
+        self.assertEqual((points, fits), blind_run[3:])
+        self.assertGreater(points, 0)
+        self.assertGreater(fits, 0)
+        self.assertIn(FlightPhase.GROUND, {phase for phase, _ in states[-100:]})
 
     def test_start_up_jolt_does_not_read_as_an_impact(self) -> None:
         # The wound foot settling onto its stop jolts the base (~30 g) in the

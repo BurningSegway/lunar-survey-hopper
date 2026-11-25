@@ -74,7 +74,7 @@ def draw_landing_plane(scene: mujoco.MjvScene, simulation: JumperSimulation,
             np.array([visual.radius, 0.002, 0.0]),
             visual.anchor + 0.003 * visual.measured_normal,
             frame_from_normal(visual.measured_normal).ravel(),
-            DISC_FLIGHT_RGBA if visual.used and not simulation.in_contact else DISC_HELD_RGBA,
+            DISC_FLIGHT_RGBA if visual.used and simulation.estimated_airborne else DISC_HELD_RGBA,
         )
     arrow = _add_geom(scene)
     if arrow is not None:
