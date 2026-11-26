@@ -346,7 +346,7 @@ acts in a phase it is not meant for. Code: `jumper_sim/flight_phase.py`.
 | GROUND | still (~1 g, body rate < 0.2 rad/s) for 0.5 s after landing | leaning towards the target (next section); wheels spin down |
 | TAKEOFF | jump command (`Space`) | legs held as they are through the push, straight from the IMU's lift-off (the cutoff); once control starts there (still in TAKEOFF), the attitude at the jump command is held: the last one before the push turned the body, with the lean towards the target |
 | ASCENT | airborne (IMU) and 0.5 m above the standing height | the robot's bottom tracks the target, heading held; lidar scans |
-| DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on for half the ascent's time; then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
+| DESCENT | apex (vertical velocity turns negative) | on a jump, target tracking goes on until the turn to the landing plane is due (below); then the reference goes back to level, then to the landing-plane fit at the predicted landing spot, still facing its travel; lidar scans |
 | LANDING | touchdown near (landing plane < 1 m below or < 0.3 s away), or the IMU's impact | the landing plane keeps updating until impact; legs straight |
 
 - A hop that peaks below 0.5 m skips ASCENT; a jump that does not leave the
@@ -368,15 +368,45 @@ Attitude reference per phase (`jumper_sim/flight_reference.py`): in ASCENT,
 on a jump, the robot's bottom (body -z, inside the lidar's field of view)
 is pointed at the track target and follows it as the robot
 moves (red sphere and line of
-sight in the viewer; tilt capped at 60 deg). It keeps tracking for the
-first half of the ascent's time (lift-off to apex) into the descent, since
-the descent takes about as long (a criterion from the predicted landing spot
-is planned instead); the red line of sight stays in the viewer for as long
-as the target is tracked. Then the reference moves back towards level, and as
-soon as the ground at the predicted landing spot has been fitted, to its
-plane ("Landing reference from the lidar"), which keeps updating through
-LANDING until the moment of impact. The reference slews at most 180 deg/s, so
-the controller never sees a reference step.
+sight in the viewer; tilt capped at 60 deg). It keeps tracking into the
+descent until the turn to the landing reference is due: until the time left
+to impact is no more than the time that turn takes,
+
+    t_turn = 0.59 s + 0.0039 s/deg * angle (+ turn_time_margin, default 0)
+
+where the angle is from the robot's current attitude to the landing
+reference. The formula is the flight LQR's measured turn time
+(`turn_rate_benchmark`, z axis, 10-80 deg reference steps both ways, time
+until within 2 deg, raised so no measured step was slower). The time to
+impact is the predicted landing spot's along the arc, or, before a spot is
+predicted, when the arc's base is back at its take-off standing height
+(`JumperSimulation.time_to_impact`). The console prints
+`[FLIGHT] Turning to the landing plane: <angle> deg, <time> s to impact.`;
+the red line of sight stays in the viewer for as long as the target is
+tracked. The landing reference is level until the ground at the predicted
+landing spot has been fitted, then its plane ("Landing reference from the
+lidar"), which keeps updating through LANDING until the moment of impact.
+The reference slews at most 180 deg/s, so the controller never sees a
+reference step.
+
+Measured (14 Moon hops to targets 5-27 m away, 2026-11-26), against the
+earlier rule (tracking for half the ascent's time into the descent):
+
+| | half the ascent's time | turn time, no margin | turn time + 0.15 s |
+|---|---|---|---|
+| target tracked after the apex | 2.04-2.30 s | 3.26-3.77 s | 3.10-3.63 s |
+| turn starts before impact | 1.99-2.26 s | 0.64-0.84 s | 0.76-0.98 s |
+| angle to turn | 7-57 deg | 17-70 deg | 14-67 deg |
+| hops within 2 deg before impact | 14 of 14 | 9 of 14 | 14 of 14 |
+| error at impact | 0.19-1.06 deg (median 0.48) | 1.13-3.00 (1.85) | 0.62-2.03 (1.26) |
+
+Without a margin the turn is just not finished on some hops: the impact
+comes 15-35 ms before the predicted touchdown (the spot is where the base is
+0.3 m above the mapped ground), and in flight the turn is a little slower
+than the benchmark's steps (the reference slews, the wheels hold momentum
+from the tracking). The landing benchmark (thrown hops, no target) is
+identical; the contact benchmark's gated spawn hop lands at 1.46 deg (was
+0.17).
 
 ### Leaning towards the target
 
@@ -736,6 +766,52 @@ Take-off spin is mostly below 2 rad/s (5.9 rad/s at one Earth spot).
   own loop with a stand-in viewer, no window): frames per second, worst
   frame and real-time factor on the ground, in the air and after
   touchdown. Drawing (the viewer's own thread) is not included.
+- `python -m benchmarks.turn_rate_benchmark --label NAME [--mode
+  controller|open-loop] [--axes x y z] [--gain design full] [--angles ...]
+  [--motor sim|bench] [--view]`: how fast the robot turns about one axis in
+  flight, on a straight-up Moon jump; default z only (the wheels are
+  identical). Another axis or step runs in the same jump while the arc
+  leaves time for it, else in a jump of its own. `--motor bench` adds the
+  bench-tested motor (`cube_model.WHEEL_MOTOR`) to the sim's limits;
+  `--view` plays it in the MuJoCo viewer in real time.
+  - `controller` (default): the LQR holds the attitude it jumped with; 1 s
+    after the cutoff its reference steps by an angle about the axis
+    (default 170, 90, 45, 30, 20, 10 deg; 170 deg stands for "many turns
+    away": the error quaternion takes the shorter way, so a reference
+    several turns away is the same as one under 180 deg), straight away
+    (no slew). Each step is watched for 1 s, held until the body settles,
+    and turned back the other way. Per step: the angle turned in the first
+    second, the time until the attitude stays within 5 and 2 deg,
+    overshoot, peak rate, wheel torque and speed, seconds per degree; and a
+    fit t = a + k * angle over the steps. `--gain design` is the flight
+    controller as it is (Bryson's 0.26 N*m / 60 deg/s; output clipped at
+    the motor's 1.94 N*m), `--gain full` the same LQI designed for the full
+    1.94 N*m (this test only); default both. Measured (z, 2026-11-26, the
+    two directions within 0.06 s):
+
+    | Gain | Time to within 5 deg | Time to within 2 deg | 10 / 45 / 90 / 170 deg to 2 deg |
+    |---|---|---|---|
+    | design | 0.40 s + 0.0034 s/deg (worst step 0.13 s off) | 0.40 s + 0.0083 s/deg (0.31 s off) | 0.50-0.56 / 0.73-0.75 / 0.83-0.87 / 1.94-1.95 s |
+    | full | 0.24 s + 0.0043 s/deg (0.10 s off) | 0.41 s + 0.0044 s/deg (0.11 s off) | 0.34-0.38 / 0.64-0.70 / 0.85-0.87 / 1.06-1.13 s |
+
+    The design gain uses the full motor torque on large errors anyway (its
+    attitude gain asks for 3.2 N*m at 170 deg), peaking at 282 deg/s; its
+    slow part is the last few degrees (170 deg: within 5 deg after 0.94 s,
+    within 2 deg only after 1.94 s). As one number per degree, the time to
+    within 2 deg over the angle ranges from 0.011 s/deg (170 deg) to
+    0.056 s/deg (10 deg), so it depends on the smallest angle it must cover.
+  - `open-loop`: no controller; 1 s after the cutoff the axis's wheel runs
+    at full torque for 1 s, back at full torque until it is at its starting
+    speed (the body at rest again), then the same the other way, which
+    brings the body back: each axis is spun both ways from rest. Reports
+    per direction the peak body rate, the starting acceleration, the
+    rest-to-rest angle and time; the slower direction's rate and
+    acceleration, the residual and the cross-axis rate, and bang-bang turn
+    times built from them. Measured (z, 2026-11-25; the two directions
+    within 1.5 %): sim limits (1.94 N*m, 20 rev/s) 431 deg/s peak, reached
+    after 0.43 s, 1505 deg/s^2 at the start (x and y 447 deg/s); bench motor
+    130 deg/s (the sim's bearing friction, 0.01 N*m*s/rad, holds its wheel
+    at 6 rev/s), 333 deg/s^2.
 Contact behaviour differs between MuJoCo versions (on 3.2.3 the jump spring
 launches the robot at ~5 m/s, on 3.16 at ~1 m/s), so run the contact and
 landing benchmarks on the pinned version.

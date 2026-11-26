@@ -10,8 +10,8 @@ Drawn into a ``mujoco.MjvScene`` (the passive viewer's ``user_scn``):
 * a green arrow along the filtered reference normal the controller aligns body z to;
 * small blue dots: a sample of the lidar points the fit used;
 * the lidar's tracking target (red sphere) while a hop is under way, with a
-  red line from the lidar to it while it is tracked (the ascent and the
-  first half of the ascent's time into the descent);
+  red line from the lidar to it while it is tracked (the ascent, and the
+  descent until the turn to the landing plane is due);
 * cyan dots: a sample of the point cloud collected so far (with scanning
   on), refreshed at each touchdown;
 * a text label above the robot: its height above where it last touched the

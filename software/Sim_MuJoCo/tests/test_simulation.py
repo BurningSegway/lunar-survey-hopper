@@ -523,8 +523,9 @@ class SimulationTests(unittest.TestCase):
         simulation.handle_key("space")
         phases, errors, descent_errors = [], [], []
         scene = mujoco.MjvScene(self.model, maxgeom=10)
-        sight_line = []  # (tracking, red line drawn) in the descent
+        sight_line = []  # (tracking, red line drawn) in flight
         imu_impacts = []
+        landing_turn = None  # (angle, time to impact) when the landing turn started
         while self.data.time < 6.0:
             airborne = simulation.estimated_airborne
             simulation.step()
@@ -534,12 +535,13 @@ class SimulationTests(unittest.TestCase):
                 phases.append(simulation.phase)
             error = simulation.flight_reference.axis_target_angle(
                 tuple(self.data.qpos[3:7]), self.data.site_xpos[simulation._lidar_site])
+            if landing_turn is None and simulation.flight_reference.landing_turn_start:
+                landing_turn = simulation.flight_reference.landing_turn_start  # (a bounce resets it)
             if simulation.phase is FlightPhase.ASCENT:
                 errors.append(error)
-            elif simulation.phase is FlightPhase.DESCENT:
-                ascent_time = simulation.flight_reference.ascent_time  # (a bounce resets it)
+            if simulation.phase in (FlightPhase.ASCENT, FlightPhase.DESCENT):
                 tracking = simulation.flight_reference.tracking_target(simulation.phase)
-                if tracking:
+                if tracking and simulation.phase is FlightPhase.DESCENT:
                     descent_errors.append(error)
                 scene.ngeom = 0
                 drawn = draw_flight_target(scene, simulation)
@@ -555,23 +557,33 @@ class SimulationTests(unittest.TestCase):
         # 0.2), PID 1.2 deg (6.4 deg in the descent; 7.5 deg at
         # the apex on the old 6 kg model).
         self.assertLess(math.degrees(errors[-1]), 5.0 if controller == "lqr" else 10.0)
-        # Still on target in the first half of the ascent's time going down.
-        self.assertAlmostEqual(len(descent_errors) * float(self.model.opt.timestep),
-                               0.5 * ascent_time, delta=0.01)
-        self.assertLess(math.degrees(max(descent_errors)), 5.0 if controller == "lqr" else 12.0)
+        # On target in the descent until the landing turn is due: it starts on
+        # the first sample on which the turn takes as long as the time left.
+        # (This short Earth hop falls ~0.58 s from its apex, less than the
+        # turn's 0.59 s base time: due at the apex, so no tracking going down.)
+        self.assertIsNotNone(landing_turn)
+        angle, left = landing_turn
+        turn = simulation.flight_reference.turn_time(angle)
+        self.assertLessEqual(left, turn)
+        self.assertGreater(left, turn - 0.01)
+        if descent_errors:
+            self.assertLess(math.degrees(max(descent_errors)), 5.0 if controller == "lqr" else 12.0)
         # The viewer's red line of sight stays exactly while the target is tracked.
         self.assertIn((True, True), sight_line)
         self.assertIn((False, False), sight_line)
         self.assertTrue(all(tracking == line for tracking, line in sight_line))
         # Fits on the way down, in LANDING too, up to the IMU's impact (not
-        # after): it reads the impact 0-6 ms after the true touch.
+        # after): it reads the jump's impact 0-6 ms after the true touch, a
+        # soft bounce touchdown's later (11 ms on this hop's second bounce;
+        # up to ~60 ms measured on soft touches).
         self.assertTrue(fit_phases)
         self.assertEqual({fit[0] for fit in fit_phases},
                          {FlightPhase.DESCENT, FlightPhase.LANDING})
         self.assertTrue(all(fit[2] for fit in fit_phases))
         for _, touching, _, time in fit_phases:
             if touching:
-                self.assertTrue(any(0.0 < impact - time <= 0.006 for impact in imu_impacts))
+                impact = min(i for i in imu_impacts if i > time)
+                self.assertLessEqual(impact - time, 0.006 if impact == imu_impacts[0] else 0.06)
         self.assertGreater(simulation.landing_reference.plane.accepted, 0)
         self.assertTrue(any("Ascent" in e for e in simulation.flight_events))
         self.assertTrue(any("Descent" in e for e in simulation.flight_events))

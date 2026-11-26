@@ -174,6 +174,7 @@ class LidarLandingReference:
         self._point_sigma = point_sigma
         self._next_fit = 0.0
         self.visual: LandingVisual | None = None
+        self.touchdown_time: float | None = None  # predicted, along the current arc
 
     def reset(self, time: float) -> None:
         self.plane.reset()
@@ -181,12 +182,14 @@ class LidarLandingReference:
         self._arc_time = None
         self._next_fit = time
         self.visual = None
+        self.touchdown_time = None
 
     def set_arc(self, arc_time: float, position, velocity) -> None:
         """The tracker's current arc (from its latch): the map bins the
         points along its ground track. A new arc (a bounce's) is passed on."""
         if arc_time != self._arc_time:
             self._arc_time = arc_time
+            self.touchdown_time = None  # the old arc's
             self.map.set_track(position, velocity)
 
     def add_points(self, points: np.ndarray) -> None:
@@ -204,7 +207,8 @@ class LidarLandingReference:
         if landing is None:
             self.plane.update(PlaneEstimate(False, timestamp=time))
             return
-        spot, _ = landing
+        spot, time_to_spot = landing
+        self.touchdown_time = time + time_to_spot
         points = self.map.points_near(spot, self.config.roi_radius, self.config.max_points)
         estimate = fit_ground_plane(points, spot, float(position[2]), self._point_sigma,
                                     time, self.config)
@@ -593,6 +597,22 @@ class JumperSimulation:
         )
         return bool(np.any(touching))
 
+    def time_to_impact(self) -> float | None:
+        """Predicted time [s] to touchdown: at the landing spot predicted along
+        the arc, or (no spot yet) when the arc's base is back at its take-off
+        standing height; None without an arc."""
+        now = float(self.data.time)
+        if self.landing_reference is not None and self.landing_reference.touchdown_time is not None:
+            return self.landing_reference.touchdown_time - now
+        tracker = self.trajectory
+        if not tracker.ballistic or self.last_ground_z is None or tracker.gravity <= 0.0:
+            return None
+        z0, vz, g = float(tracker.arc_position[2]), float(tracker.arc_velocity[2]), tracker.gravity
+        disc = vz * vz + 2.0 * g * (z0 - self.last_ground_z)
+        if disc < 0.0:
+            return None
+        return tracker.arc_time + (vz + math.sqrt(disc)) / g - now
+
     def reference_quaternion(self) -> tuple[float, float, float, float]:
         """Attitude the LQR regulates to.
 
@@ -643,13 +663,22 @@ class JumperSimulation:
                     and self.landing_reference.plane.accepted > 0):
                 self.flight_events.append("[FLIGHT] Landing spot seen: aligning with its plane.")
         if self.flight_reference is not None and self.estimated_airborne:
+            qa = self.model.jnt_qposadr[self.ids.root_joint]
+            turning = self.flight_reference.landing_turn
             self.flight_reference.update(
                 phase,
                 self.data.site_xpos[self._lidar_site],
                 self.yaw_reference,
                 self.landing_reference.reference_quaternion,
                 float(self.model.opt.timestep),
+                attitude=tuple(float(v) for v in self.data.qpos[qa + 3 : qa + 7]),
+                time_to_impact=self.time_to_impact(),
             )
+            if self.flight_reference.landing_turn and not turning:
+                angle, left = self.flight_reference.landing_turn_start
+                self.flight_events.append(
+                    f"[FLIGHT] Turning to the landing plane: {angle:.0f} deg, "
+                    f"{left:.2f} s to impact.")
         self._update_tipped()
         self._update_jump_aim()
         if self._scan_open and not self.estimated_airborne:
@@ -922,8 +951,8 @@ class JumperSimulation:
                 FlightPhase.TAKEOFF: "[PHASE] Take-off.",
                 FlightPhase.ASCENT: "[PHASE] Ascent.",
                 FlightPhase.DESCENT: (
-                    "[FLIGHT] Descent: tracking the target for half the ascent's time, "
-                    "then levelling until the landing spot is seen."
+                    "[FLIGHT] Descent: tracking the target until the turn to the "
+                    "landing plane is due."
                     if self.flight_reference.tracking
                     else "[FLIGHT] Descent: levelling until the landing spot is seen."),
                 FlightPhase.LANDING: "[PHASE] Landing: touchdown close."

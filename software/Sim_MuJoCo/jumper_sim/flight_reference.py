@@ -8,16 +8,17 @@
   as a ground position (x, y); the tracked point is ``aim_height`` above the
   ground there, so it is never in the air or buried. The required tilt is
   capped at ``max_track_tilt``; heading stays at the yaw reference.
-* DESCENT: tracking goes on for ``descent_track_fraction`` (half) of the
-  time from lift-off to apex -- the descent takes about as long as the ascent
-  (to be replaced by a criterion from the predicted landing spot). Then the
-  reference moves back towards level (the xy plane). As soon as
-  the ground at the predicted landing spot has been fitted, the landing-plane
-  reference from :class:`~jumper_sim.landing_reference.LandingPlane`
-  takes over -- it starts at "level" and only receives fits during
-  descent, so "level until the landing spot is seen, then its plane" falls
-  out of it directly. It keeps updating until the moment of impact
-  (LANDING too), so the robot keeps aligning with the ground to the end.
+* DESCENT: tracking goes on until the turn to the landing reference is
+  due: until the time left to impact is no more than the time the turn
+  takes, ``turn_time`` = ``turn_time_base`` + ``turn_time_per_degree`` x the
+  angle from the current attitude to the landing reference (measured with
+  the flight LQR, see the config). Then the reference turns to the
+  landing-plane reference from :class:`~jumper_sim.landing_reference.LandingPlane`
+  -- it starts at "level" and only receives fits during descent, so "level
+  until the landing spot is seen, then its plane" falls out of it directly.
+  It keeps updating until the moment of impact (LANDING too), so the robot
+  keeps aligning with the ground to the end. Without a time to impact, the
+  target is tracked until LANDING (touchdown near).
 * Heading in flight: the yaw reference (the lift-off heading) throughout.
 * The commanded reference never jumps: it slews towards the desired one at
   ``slew_rate`` (also at lift-off, starting from the attitude the robot left
@@ -50,8 +51,14 @@ class FlightReferenceConfig:
     # Tracked point above the ground at the target: the middle of the 0.3 m
     # target object.
     aim_height: float = 0.15  # m
-    # Keep tracking into the descent for this fraction of the ascent's time.
-    descent_track_fraction: float = 0.5
+    # Time to turn to the landing reference: base + per_degree * angle [deg].
+    # Measured with the flight LQR (benchmarks/turn_rate_benchmark, z axis,
+    # 10-80 deg reference steps both ways, time until within 2 deg; fitted
+    # line raised so no measured step is slower; 2026-11-26).
+    turn_time_base: float = 0.59  # s
+    turn_time_per_degree: float = 0.0039  # s/deg
+    # Extra time before the turn is due, for the time to impact's error.
+    turn_time_margin: float = 0.0  # s
     # Without a ground height, the ground is taken as the take-off ground.
     standing_height: float = 0.27  # m, body origin above the ground when standing
 
@@ -83,6 +90,12 @@ def look_at_quaternion(
             math.cos(max_tilt),
         ])
     return tilted_reference_quaternion(z_axis, yaw_reference)
+
+
+def attitude_angle(q1: Quaternion, q2: Quaternion) -> float:
+    """Angle [deg] of the rotation between two attitudes."""
+    dot = abs(float(np.dot(np.asarray(q1, float), np.asarray(q2, float))))
+    return math.degrees(2.0 * math.acos(min(1.0, dot)))
 
 
 def slew_quaternion(current: Quaternion, desired: Quaternion, max_angle: float) -> Quaternion:
@@ -128,8 +141,9 @@ class FlightReference:
         self.active_target: np.ndarray | None = None
         self.commanded: Quaternion = (1.0, 0.0, 0.0, 0.0)
         self.tracking = False
-        self.ascent_time = 0.0  # s, lift-off to apex
-        self.descent_time = 0.0  # s, since apex
+        self.landing_turn = False  # the turn to the landing reference has started
+        # (angle [deg], time to impact [s]) when it started
+        self.landing_turn_start: tuple[float, float] | None = None
 
     def set_target(self, target: tuple[float, float] | None) -> None:
         """Track ``aim_height`` above the ground at ``target`` (x, y)."""
@@ -158,29 +172,40 @@ class FlightReference:
         """
         self.commanded = tuple(float(v) for v in attitude)
         self.tracking = track
-        self.ascent_time = 0.0
-        self.descent_time = 0.0
+        self.landing_turn = False
+        self.landing_turn_start = None
         if track:
             self.active_target = (
                 self.target_setting.copy() if self.target_setting is not None
                 else self.aim_point(default_target(position, heading, self.config), position)
             )
 
+    def turn_time(self, angle_deg: float) -> float:
+        """Time [s] to turn by ``angle_deg`` and settle within 2 deg."""
+        return self.config.turn_time_base + self.config.turn_time_per_degree * angle_deg
+
     def update(self, phase: FlightPhase, sensor_position: np.ndarray, yaw_reference: float,
-               landing_reference: Callable[[float], Quaternion], dt: float) -> Quaternion:
-        """``landing_reference(yaw)``: the landing attitude with that heading."""
-        if phase in (FlightPhase.TAKEOFF, FlightPhase.ASCENT):
-            self.ascent_time += dt
-        elif phase is FlightPhase.DESCENT:
-            self.descent_time += dt
+               landing_reference: Callable[[float], Quaternion], dt: float,
+               attitude: Quaternion | None = None,
+               time_to_impact: float | None = None) -> Quaternion:
+        """``landing_reference(yaw)``: the landing attitude with that heading;
+        ``attitude``: the robot's; ``time_to_impact`` [s]: predicted (None:
+        not known yet)."""
         if phase is FlightPhase.TAKEOFF:
             return self.commanded  # hold the start_flight attitude until clear of the ground
         yaw = yaw_reference
+        landing = landing_reference(yaw)  # level until the landing spot is seen, then its plane
+        if (phase is FlightPhase.DESCENT and self.tracking and not self.landing_turn
+                and attitude is not None and time_to_impact is not None):
+            angle = attitude_angle(attitude, landing)
+            if time_to_impact <= self.turn_time(angle) + self.config.turn_time_margin:
+                self.landing_turn = True
+                self.landing_turn_start = (angle, time_to_impact)
         if self.tracking_target(phase):
             desired = look_at_quaternion(sensor_position, self.active_target, yaw,
                                          self.config.max_track_tilt)
-        else:  # DESCENT, LANDING
-            desired = landing_reference(yaw)  # level until the landing spot is seen, then its plane
+        else:  # DESCENT once the landing turn is due, LANDING
+            desired = landing
         self.commanded = slew_quaternion(self.commanded, desired, self.config.slew_rate * dt)
         return self.commanded
 
@@ -190,8 +215,7 @@ class FlightReference:
             return False
         if phase is FlightPhase.ASCENT:
             return True
-        return (phase is FlightPhase.DESCENT
-                and self.descent_time < self.config.descent_track_fraction * self.ascent_time)
+        return phase is FlightPhase.DESCENT and not self.landing_turn
 
     def axis_target_angle(self, attitude: Quaternion, sensor_position: np.ndarray) -> float:
         """Angle [rad] between body -z and the target direction."""

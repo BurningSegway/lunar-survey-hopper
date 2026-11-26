@@ -7,6 +7,7 @@ from jumper_sim.flight_phase import FlightPhase, FlightPhaseDetector, VerticalVe
 from jumper_sim.flight_reference import (
     FlightReference,
     FlightReferenceConfig,
+    attitude_angle,
     default_target,
     look_at_quaternion,
     slew_quaternion,
@@ -215,7 +216,8 @@ class FlightReferenceTests(unittest.TestCase):
         q = reference.update(FlightPhase.ASCENT, camera, 0.0, lambda yaw: LEVEL, DT)
         self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
         plane = (math.cos(0.05), math.sin(0.05), 0.0, 0.0)
-        q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
+        q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                             attitude=q, time_to_impact=0.0)  # the landing turn is due
         np.testing.assert_allclose(q, plane, atol=1e-12)
         # Flights not started by a jump (bounces) never track.
         reference.start_flight(LEVEL, np.zeros(3), 0.0, track=False)
@@ -223,26 +225,58 @@ class FlightReferenceTests(unittest.TestCase):
         np.testing.assert_allclose(q, LEVEL, atol=1e-12)
 
 
-    def test_tracking_continues_for_half_the_ascent_time_into_the_descent(self) -> None:
-        reference = FlightReference(FlightReferenceConfig(slew_rate=math.radians(1e6)),
-                                    target=(2.0, 0.0))
+    def test_target_tracked_until_the_landing_turn_is_due(self) -> None:
+        config = FlightReferenceConfig(slew_rate=math.radians(1e6))
+        reference = FlightReference(config, target=(2.0, 0.0))
         reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
         camera = np.array([0.0, 0.0, 2.0])
         plane = (math.cos(0.05), math.sin(0.05), 0.0, 0.0)
-        for phase, duration in ((FlightPhase.TAKEOFF, 0.2), (FlightPhase.ASCENT, 1.8)):
-            for _ in range(round(duration / DT)):
-                reference.update(phase, camera, 0.0, lambda yaw: plane, DT)
-        self.assertAlmostEqual(reference.ascent_time, 2.0)
-        # 2 s up: still on the target for 1 s of the descent ...
-        for _ in range(round(0.99 / DT)):
-            q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
-        self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
-        # ... then the landing reference.
-        for _ in range(round(0.02 / DT)):
-            q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT)
+        tracked = reference.update(FlightPhase.ASCENT, camera, 0.0, lambda yaw: plane, DT)
+        angle = attitude_angle(tracked, plane)
+        self.assertAlmostEqual(angle, 47.6, delta=0.1)  # 45 deg to the target, plane tilted 5.7 deg
+        turn = config.turn_time_base + config.turn_time_per_degree * angle
+        self.assertAlmostEqual(reference.turn_time(angle), turn)
+        # No time to impact yet, or more than the turn takes: still on the target.
+        for left in (None, 5.0, turn + 0.01):
+            q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                                 attitude=tracked, time_to_impact=left)
+            self.assertLess(reference.axis_target_angle(q, camera), 1e-6)
+            self.assertTrue(reference.tracking_target(FlightPhase.DESCENT))
+        # As soon as the turn takes as long as the time left: the landing reference.
+        q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                             attitude=tracked, time_to_impact=turn - 0.001)
         np.testing.assert_allclose(q, plane, atol=1e-12)
+        self.assertFalse(reference.tracking_target(FlightPhase.DESCENT))
+        self.assertAlmostEqual(reference.landing_turn_start[0], angle)
+        self.assertAlmostEqual(reference.landing_turn_start[1], turn - 0.001)
+        # It stays turned, even if a later prediction leaves more time.
+        q = reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                             attitude=tracked, time_to_impact=5.0)
+        np.testing.assert_allclose(q, plane, atol=1e-12)
+        # A smaller angle turns later: 0 deg needs only the base time.
+        reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
+        self.assertIsNone(reference.landing_turn_start)
+        reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                         attitude=plane, time_to_impact=config.turn_time_base + 0.001)
+        self.assertTrue(reference.tracking_target(FlightPhase.DESCENT))
+        reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: plane, DT,
+                         attitude=plane, time_to_impact=config.turn_time_base - 0.001)
+        self.assertFalse(reference.tracking_target(FlightPhase.DESCENT))
         # LANDING (touchdown near) never tracks.
         self.assertFalse(reference.tracking_target(FlightPhase.LANDING))
+
+    def test_turn_time_margin_starts_the_landing_turn_earlier(self) -> None:
+        config = FlightReferenceConfig(slew_rate=math.radians(1e6), turn_time_margin=0.15)
+        reference = FlightReference(config, target=(2.0, 0.0))
+        reference.start_flight(LEVEL, np.zeros(3), 0.0, track=True)
+        camera = np.array([0.0, 0.0, 2.0])
+        due = config.turn_time_base + 0.15  # attitude already on the plane: 0 deg
+        reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: LEVEL, DT,
+                         attitude=LEVEL, time_to_impact=due + 0.001)
+        self.assertTrue(reference.tracking_target(FlightPhase.DESCENT))
+        reference.update(FlightPhase.DESCENT, camera, 0.0, lambda yaw: LEVEL, DT,
+                         attitude=LEVEL, time_to_impact=due - 0.001)
+        self.assertFalse(reference.tracking_target(FlightPhase.DESCENT))
 
     def test_holds_the_lift_off_heading_in_flight(self) -> None:
         reference = FlightReference(FlightReferenceConfig(slew_rate=math.radians(1e6)),
